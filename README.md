@@ -3,31 +3,51 @@
 > *The Zero-Footprint Zig Inference Engine*
 
 A pure-Zig (0.16+) CLI for local LLM inference. mmap-backed, comptime-specialized
-quantized matmul, multi-threaded, no `extern "C"`, no libc, no BLAS, no llama.cpp.
+quantized matmul, multi-threaded, with an opt-in Apple Metal GPU forward path.
+No `extern "C"` on the CPU path, no libc, no BLAS, no llama.cpp.
 
-The name reflects the goal: the engine's overhead should *disappear*. No
-interpreter tax, no copy tax, no allocation tax — just weights and math.
+### Why "vantablack"
+
+[Vantablack](https://en.wikipedia.org/wiki/Vantablack) is a real-world coating
+that absorbs ~99.965% of visible light — objects painted with it lose all
+visible surface detail and read as silhouettes. The engine takes the same
+posture toward overhead: all the runtime tax that usually surrounds an
+inference engine — process startup, weight loading, intermediate copies,
+allocator churn, dispatch latency, dependency stacks — is absorbed until only
+the model itself is visible. No interpreter tax, no copy tax, no allocation
+tax, no framework tax. Just weights and math.
 
 ---
 
 ## Status
 
-| Capability                              | State                |
-|-----------------------------------------|----------------------|
-| GGUF v2/v3 parsing (zero-copy mmap)     | shipped              |
-| Llama-architecture forward pass         | shipped              |
-| KV cache (fixed-size, layer-major)      | shipped              |
-| Persistent thread pool (N-1 workers)    | shipped              |
-| SentencePiece BPE encode + decode       | shipped              |
-| Sampling: greedy / temp / top-k / top-p | shipped              |
-| Chat template (TinyLlama zephyr)        | shipped              |
-| HTTP server (Ollama-compatible subset)  | shipped              |
-| Apple Metal GPU backend (Q8_0 matmul)   | shipped (opt-in `-Dmetal=true`) |
-| Q8_0 / Q4_K / Q5_K / Q6_K / F32 / F16   | shipped              |
-| TQ2_0 (1.58-bit ternary) plumbed        | dequant + matmul written, untested on real model |
-| Safetensors loader                      | not yet              |
-| GPU (Metal / Vulkan)                    | not yet (see *Pure Zig* note below) |
-| Prompt prefill batching                 | not yet              |
+| Capability                                              | State                |
+|---------------------------------------------------------|----------------------|
+| GGUF v2/v3 parsing (zero-copy mmap)                     | shipped              |
+| Llama-architecture forward pass                         | shipped              |
+| KV cache (fixed-size, layer-major)                      | shipped              |
+| Persistent thread pool (N-1 workers)                    | shipped              |
+| SentencePiece BPE encode + decode                       | shipped              |
+| Sampling: greedy / temp / top-k / top-p                 | shipped              |
+| Chat template (TinyLlama zephyr)                        | shipped              |
+| HTTP server (Ollama-compatible subset)                  | shipped              |
+| Apple Metal GPU backend (full forward — see below)      | shipped (opt-in `-Dmetal=true`) |
+| Q8_0 / Q4_K / Q5_K / Q6_K / F32 / F16                   | shipped              |
+| TQ2_0 (1.58-bit ternary) plumbed                        | dequant + matmul written, untested on real model |
+| Safetensors loader                                      | not yet              |
+| Vulkan / cross-vendor GPU                               | not yet              |
+| Prompt prefill batching                                 | not yet              |
+
+The Metal backend covers the full per-layer forward pass when the model is
+all Q8_0 projections + f32 norms (the common TinyLlama / Llama Q8_0 layout).
+On GPU: rmsnorm, QKV matmul, RoPE, KV cache write, GQA attention (scores +
+softmax + weighted V), O matmul, residual, FFN rmsnorm, gate/up matmul,
+SwiGLU, ffn_down, residual, final rmsnorm, LM head matmul. One
+`MTLCommandBuffer` per layer; the CPU only does the embedding gather and the
+sampler. State buffers and the KV cache live in shared-storage `MTLBuffer`s
+that the CPU and GPU read in place — Apple Silicon unified memory means same
+physical pages, no DMA, no copy. Models that don't match the eligibility
+criteria fall back to the per-op path (CPU + GPU Q8_0 matmul only).
 
 **Verified end-to-end** on TinyLlama-1.1B-Chat-v1.0 GGUF Q8_0, Q4_K_M, Q4_K_S
 (ReleaseFast, macOS arm64). Coherent text generation, canonical SentencePiece
@@ -37,30 +57,66 @@ tokenization, EOS-correct chat-template completions.
 
 ## Performance
 
-TinyLlama-1.1B-Chat-v1.0 on macOS arm64 (M-series), ReleaseFast, 30-token
-generation, warm caches:
+TinyLlama-1.1B-Chat-v1.0 Q8_0 on macOS arm64 (M-series), ReleaseFast,
+128-token decode, warm caches:
 
-| Build                          | CPU%   | tok/s | Wall  | Notes                                    |
-|--------------------------------|--------|-------|-------|------------------------------------------|
-| CPU `--threads 16`             | 1529%  | 45    | 0.67s | All cores pinned; max throughput         |
-| CPU default (~8)               | 739%   | 28    | 1.07s | Half cores; default                      |
-| **Metal default (1 CPU thread)** | **27%**  | **23**| **1.48s** | **Q8_0 matmul on GPU; near-idle CPU** |
-| Metal + 8 CPU threads          | 672%   | 17    | 1.74s | CPU spins on GPU sync — don't do this     |
+| Build                  | tok/s | Wall (128 tok) | Notes                                          |
+|------------------------|-------|----------------|------------------------------------------------|
+| CPU `--threads 16`     | 45    | 2.85s          | All cores pinned; max CPU throughput           |
+| CPU default (~8)       | 28    | 4.57s          | Half cores; default                            |
+| **Metal full forward** | **~37** | **3.50s**    | **All layer ops on GPU; one cmd buffer/layer** |
 
-The headline win: **`-Dmetal=true` + default thread count drops CPU usage
-to under 30%** while still hitting 23 tok/s on Q8_0. Fan stays off,
-laptop stays cool, foreground work stays responsive.
+**The headline win:** `-Dmetal=true` runs the inference on the GPU while
+the CPU thread pool sits at 1 worker. Fan stays off, foreground work stays
+responsive, throughput is within ~20% of the all-cores-pinned CPU build.
 
-Q8_0 matmul runs on the GPU; smaller ops (RMSNorm, RoPE, softmax,
-SwiGLU, attention) and other quants stay on the CPU. With Metal enabled
-the default is `--threads 1` because additional CPU workers just spin on
-GPU sync.
+With Metal enabled the default is `--threads 1` because additional CPU
+workers just spin on GPU sync; the only per-token CPU work is the embedding
+gather and the sampler.
 
-For comparison, llama.cpp on the same hardware does ~50–100 tok/s on
-Q8_0 (uses its own Metal compute path with all ops on GPU + bigger
-threadgroup tiles). vantablack's Metal path is a first cut — Q8_0 only,
-naive scalar inner loop, sync per matmul. Roadmap below covers the
-remaining 2–3× perf headroom.
+For comparison, llama.cpp on the same hardware does ~50–100 tok/s on Q8_0.
+The remaining gap is **not** the matmul kernel — empirically, three different
+matmul kernel rewrites (threadgroup-shared activation tiling, multi-row-per-
+thread, simdgroup-per-row with `simd_sum`) all match the simple per-thread
+per-row kernel within noise on TinyLlama-scale GEMV. The bottleneck is
+dispatch + `waitUntilCompleted` sync × 22 layers/token plus per-token CPU
+work. Closing the gap requires async pipelining across layers, weight
+fusion (QKV / gate-up), or token batching for prefill — see roadmap.
+
+---
+
+## Hardware target
+
+vantablack is designed primarily for **single-user local inference on Apple
+Silicon laptops** — the same machine you're already coding on. The whole
+design (mmap-first weights, near-idle CPU when GPU is on, `-Doptimize=
+ReleaseSmall` < 5 MB) is optimized for the case where you want a model
+sitting alongside your IDE that isn't going to spin the fan.
+
+| Platform                            | CPU path        | Metal path      | Status            |
+|-------------------------------------|-----------------|-----------------|-------------------|
+| macOS arm64 (M1 / M2 / M3 / M4)     | yes             | yes             | primary target    |
+| macOS x86_64 (Intel)                | yes             | no              | builds; untested  |
+| Linux arm64 (Asahi, AWS Graviton)   | yes             | no              | builds; untested  |
+| Linux x86_64                        | yes             | no              | builds; untested  |
+| Windows x86_64                      | yes             | no              | builds; untested  |
+
+**Why Apple Silicon first.** Unified memory makes `MTLBuffer`-wrap-of-mmap
+free — the GPU reads weights straight from the OS page cache, no host→device
+transfer, no doubled memory footprint. On discrete-GPU systems that property
+doesn't hold and the design loses much of its appeal.
+
+**Memory sizing.** Weights live in the OS page cache via mmap, so a 1.1 GB
+Q8_0 TinyLlama uses ~1.1 GB of RAM at steady state, plus ~50 MB for the KV
+cache (TinyLlama at 2048 ctx) plus ~100 MB for the Metal state buffers when
+`-Dmetal=true`. A 7B Q4_K_M model would be ~4 GB weights. mmap means
+cold-start is bounded by syscall latency, not file throughput — a 70B model
+"loads" in milliseconds even on the first run (the kernel pages it in
+lazily as the forward pass touches it).
+
+**Disk.** Weight files are read directly from wherever they live — no
+pre-load step, no cache directory, no checksum dance. Point the CLI at a
+`.gguf` and it runs.
 
 ---
 
@@ -93,20 +149,30 @@ remaining 2–3× perf headroom.
                 +----+--------+--------+--------+
                                        |
                                        v
-                                  kernels/
-                                  comptime_gen
-                                  (dispatch by quant)
-                                       |
-                                       v
-                          +------------+--------+
-                          | matmul_q8_0         |
-                          | matmul_q4_k         |
-                          | matmul_q5_k         |
-                          | matmul_q6_k         |
-                          | matmul_f16/f32      |
-                          | matmul_ternary158   |
-                          +---------------------+
+                              CPU path        GPU path (-Dmetal=true)
+                                  |                |
+                                  v                v
+                              kernels/         metal/bridge.{m,h}
+                              comptime_gen     + inline MSL kernels:
+                              (dispatch        matmul_q8_0, rmsnorm,
+                               by quant)       rope, swiglu, residual_add,
+                                  |            copy_f32, attn_scores,
+                                  v            softmax_rows, attn_weighted_sum
+                          +-------+---------+      |
+                          | matmul_q8_0     |      v
+                          | matmul_q4_k     |  metal_backend.zig
+                          | matmul_q5_k     |  (persistent state +
+                          | matmul_q6_k     |   KV cache in shared
+                          | matmul_f16/f32  |   MTLBuffers; one
+                          | matmul_ternary  |   MTLCommandBuffer
+                          +-----------------+   per layer)
 ```
+
+`forward.zig` picks at runtime: GPU forward when the model is Q8_0
+projections + f32 norms (and `-Dmetal=true` is on); CPU otherwise. State
+buffers + KV cache live in the same shared-storage `MTLBuffer`s either
+way — the GPU path just hands their `MTLBuffer` handles to the kernels
+while the CPU path reads them as plain `[]f32` slices.
 
 ### Module map
 
@@ -121,10 +187,17 @@ src/
 │   ├── simd.zig              real Q8_0/Q4_K/Q5_K/Q6_K/TQ2_0/F16/F32 dequant + matmul
 │   ├── math.zig              RMSNorm / RoPE / softmax / SwiGLU / argmax
 │   └── comptime_gen.zig      QuantType + Kernel + dispatch(comptime q)
+├── metal/                    only compiled with -Dmetal=true
+│   ├── bridge.h              flat C ABI for the Zig side
+│   ├── bridge.m              Obj-C bridge + inline MSL kernels (matmul_q8_0,
+│   │                         rmsnorm, rope, swiglu, residual_add, copy_f32,
+│   │                         attn_scores, softmax_rows, attn_weighted_sum)
+│   └── bridge.zig            extern "c" decls + Device / Segment wrappers
 └── runtime/
-    ├── kv_cache.zig          fixed-size O(1)-memory KV cache
+    ├── kv_cache.zig          fixed-size O(1)-memory KV cache (MTLBuffer-aliased on GPU)
     ├── model.zig             LlamaConfig + Model.init from GGUF metadata
-    ├── forward.zig           per-token forward pass; matmul row-split via pool
+    ├── forward.zig           per-token forward pass; CPU + GPU branches
+    ├── metal_backend.zig     persistent Metal state + shared-storage scratch
     ├── pool.zig              persistent ThreadPool (epoch + spinLoopHint)
     ├── tokenizer.zig         SentencePiece BPE encode + decode
     ├── sampler.zig           temp/top-k/top-p + std.Random PRNG
@@ -158,22 +231,58 @@ These are not aesthetic — they shape every line:
 
 ### "Pure Zig" and GPU
 
-Spec rule #5 calls for a unified-memory GPU path via Metal and Vulkan.
-Both APIs require FFI (Objective-C runtime for Metal, C ABI for Vulkan/MoltenVK),
-which conflicts with the no-`extern "C"` constraint. Resolving this requires
-either waiving the rule or shipping raw Mach-O `dlsym`-based bindings. Not yet
-attempted.
+Constraint #1 (no `extern "C"`) was relaxed for the Metal backend. Apple's
+Metal API is Objective-C; reaching it without FFI would require raw Mach-O
+`dlsym` bindings to the `objc_msgSend` runtime, which is feasible but adds a
+maintenance burden out of proportion to the benefit. The compromise:
+
+- The CPU path stays pure-Zig std with no FFI. Builds without `-Dmetal=true`
+  link nothing exotic and pass all tests on every target platform.
+- The Metal path lives in `src/metal/bridge.{m,h}` (~750 LoC of Objective-C
+  + an inline MSL kernel string) and `src/metal/bridge.zig` (the `extern "c"`
+  declarations). Builds with `-Dmetal=true` link Foundation + Metal +
+  CoreGraphics frameworks.
+
+The bridge is the only Objective-C in the tree and the only file that calls
+into a non-Zig API. Vulkan/MoltenVK is not currently planned.
 
 ---
 
 ## Build
 
-Requires Zig 0.16.0+.
+Requires **Zig 0.16.0+**. Verify with `zig version`.
+
+### Installing Zig
+
+If `zig version` doesn't print `0.16.0` or higher, install via one of:
+
+- **macOS (Homebrew):**
+  ```sh
+  brew install zig
+  ```
+- **macOS / Linux (multi-version manager — recommended for tracking 0.16+):**
+  install [zigup](https://github.com/marler8997/zigup), then
+  ```sh
+  zigup 0.16.0
+  ```
+- **Linux / macOS / Windows (manual tarball):** download the matching
+  archive from <https://ziglang.org/download/>, extract, and put the
+  resulting `zig` binary on `PATH`. No installer, no daemon, no env vars
+  beyond `PATH`.
+- **Arch Linux:** `pacman -S zig` (check `pacman -Si zig` for the version).
+- **Nix / NixOS:** `nix shell nixpkgs#zig_0_16`.
+
+If your distro packages an older Zig (0.13/0.14/0.15), prefer the official
+tarball or `zigup` — vantablack uses 0.16-specific std APIs (`std.Io`,
+`std.heap.pageSize`, the new `Io.File.Writer`) that won't compile on
+earlier versions.
+
+### Build commands
 
 ```sh
 zig build                                      # Debug, default
 zig build -Doptimize=ReleaseFast               # multi-threaded CPU, fast inference
-zig build -Doptimize=ReleaseFast -Dmetal=true  # CPU + Apple Metal GPU (Q8_0 matmul on GPU)
+zig build -Doptimize=ReleaseFast -Dmetal=true  # CPU + Apple Metal GPU (full forward on GPU)
 zig build -Doptimize=ReleaseSmall              # single-threaded, ~292 KB stripped
 zig build test                                 # all unit tests
 ```
@@ -346,75 +455,97 @@ root cause: pure CPU matmul saturates every core. The fixes:
 2. **Bounded spin → yield in worker loop** — *shipped*. Idle workers no
    longer pin a core between requests in `serve` mode.
 3. **Apple Metal GPU compute (Q8_0 matmul)** — *shipped, opt-in*.
-   `-Dmetal=true` build flag. Q8_0 matmuls run on the GPU via a small
-   Obj-C bridge (`src/metal/bridge.m`) and an inline MSL kernel. Weights
-   are wrapped as zero-copy `MTLBuffer`s over the existing mmap region
-   (Apple Silicon unified memory makes this free). Default thread count
-   drops to 1 when Metal is active. **CPU usage falls to ~27% at 23 tok/s**
-   on TinyLlama Q8_0 — fan stays off.
+   `-Dmetal=true` build flag. Initial cut: Q8_0 matmul on GPU only,
+   one sync per matmul (~155/token), other ops on CPU.
+4. **Zero-copy state aliasing** — *shipped*. `forward.State` slices alias
+   the backend's persistent shared-storage `MTLBuffer`s. No host↔device
+   memcpy on the per-token path.
+5. **Single command buffer per layer** — *shipped*. Segment API batches
+   rmsnorm + matmul + RoPE + KV-write + attention + O-proj + residual +
+   FFN ops into one `MTLCommandBuffer`. ~155 commits/token → ~22.
+6. **Full GPU forward** — *shipped*. New MSL kernels: `copy_f32`,
+   `attn_scores`, `softmax_rows`, `attn_weighted_sum`, two-buffer
+   `rmsnorm`. KV cache + attention scores live in shared `MTLBuffer`s.
+   The CPU only does the embedding gather and the sampler.
+7. **Tighter MSL matmul (threadgroup tiling, simdgroup matmul)** —
+   *attempted, parked*. Tested three matmul kernel rewrites
+   (threadgroup-shared activation tiling, multi-row-per-thread,
+   simdgroup-per-row with `simd_sum`). All matched the simple per-thread
+   per-row kernel within noise on TinyLlama-scale GEMV — Apple's L2 was
+   already amortizing activation re-reads across simdgroups, and
+   single-token decode at this model scale isn't matmul-kernel-bound.
+   Kept the simple kernel; closing the remaining gap to llama.cpp needs
+   one of the next three items.
+8. **Async pipelining across layers** — *planned*. Enqueue the next
+   layer's command buffer while the current one runs (instead of
+   `waitUntilCompleted` per layer). ~1.5–3× expected; biggest
+   remaining lever for tok/s.
+9. **Weight fusion (QKV / gate-up)** — *planned*. Pre-concatenate Q/K/V
+   and gate/up weights at init so each fused matmul reads the activation
+   buffer once. ~5–10% expected; +~660 MB memory for TinyLlama Q8_0.
+10. **Q4_K / Q5_K / Q6_K MSL kernels** — *planned*. Required to put
+    K-quant models on the GPU at all. Currently only the Q8_0 forward
+    path is GPU-eligible; mixed-quant models stay on the CPU side.
+11. **Prompt prefill batching** — *planned*. Process N prompt tokens in
+    one forward pass. Big speedup on long prompts (no effect on per-token
+    decode rate).
+12. **Apple AMX matrix coprocessor** — *planned*. M1/M2/M3 ship a hidden
+    matrix unit accessible via inline assembly. Pure-Zig + lower power
+    than even GPU for some shapes. Useful as a CPU-only fallback path.
+13. **NEON `sdot` int8 dot** — *planned*. ARMv8.2-A dedicated dot-product
+    instruction. Modest CPU-path speedup, no FFI needed.
 
-   Trade-off: this required relaxing the original "pure Zig std only"
-   rule. The Metal backend links Foundation + Metal frameworks and
-   compiles ~250 LoC of Objective-C. The pure-Zig CPU path is preserved
-   and remains the default when `-Dmetal=true` is not passed.
-
-4. **All ops on GPU (RMSNorm, attention, RoPE, softmax, SwiGLU)** —
-   *planned*. Currently we sync GPU↔CPU per matmul (~220 syncs per
-   token). Moving the small ops to MSL too would let one command buffer
-   process a full layer. Would also enable Q4_K/Q5_K/Q6_K kernels.
-5. **Tighter MSL matmul (threadgroup tiling, simdgroup matmul)** —
-   *planned*. Current kernel is one thread per output row with scalar
-   inner loop. M-series GPUs expose `simdgroup_multiply_accumulate` for
-   8×8 tile FMA; using it gives ~4× kernel speedup.
-6. **Apple AMX matrix coprocessor** — *planned*. M1/M2/M3 ship a hidden
-   matrix unit accessible via inline assembly. Pure-Zig + lower power
-   than even GPU for some shapes. Useful as a CPU-only fallback path.
-7. **NEON `sdot` int8 dot** — *planned*. ARMv8.2-A dedicated dot-product
-   instruction. Modest CPU-path speedup, no FFI needed.
-8. **Prompt prefill batching** — *planned*. Process N prompt tokens in
-   one forward pass. Big speedup on long prompts.
-
-Items 4 + 5 are the next big perf push: `-Dmetal=true` should hit
-50–100+ tok/s like llama.cpp once attention + small ops also run on the
-GPU.
+Items 8 + 9 + 10 are the next perf pushes. Item 7's negative result
+shifted the model: the matmul kernel is at the hardware's effective
+limit for GEMV at TinyLlama scale; further wins need architecture
+changes (async dispatch, weight fusion, batching), not better kernels.
 
 ---
 
 ## Limitations + future work
 
-- **Cross-thread floating-point non-determinism.** Matmul partial sums are
-  reduced per-worker, then summed. fp32 addition is non-associative, so
-  greedy outputs can differ slightly between runs (or vs single-threaded).
-  Outputs stay coherent.
 - **No prompt prefill batching.** Prompt tokens are processed one at a time.
   For an N-token prompt the cost is N forward passes. Real throughput on
   long prompts will improve substantially with batched prefill.
 - **TQ2_0 untested on real weights.** Spec-derived layout, internally
   consistent, no public TQ2_0 GGUF weights to validate against.
-- **Single-architecture (Llama).** Mistral / Phi / Gemma metadata key
-  remapping not done.
+- **Single-architecture (Llama).** `runtime/model.zig` requires
+  `general.architecture = "llama"` and the standard `blk.{i}.*` tensor
+  names. Mistral / Phi / Gemma require small metadata-key adjustments
+  and tensor-name remapping; not yet wired up.
 - **No tokenizer encoder fallback.** SentencePiece BPE only. Tiktoken-style
   byte-level BPE (GPT-2/Llama-3) requires a different merge algorithm.
-- **GPU partial coverage.** `-Dmetal=true` ships Q8_0 matmul on GPU but
-  attention / norms / softmax / SwiGLU still run on CPU. One sync per
-  matmul (~220 per token). Throughput is ~23 tok/s vs ~45 tok/s on full
-  CPU pin — but at 27% CPU instead of 1500%. Roadmap items 4+5 in "CPU,
-  power, GPU" close this gap.
-- **Yielding workers, not parking.** Idle workers `std.Thread.yield()`
-  rather than blocking on a futex/condvar — Zig 0.16's std doesn't expose
-  futex publicly without libc. Idle CPU drops sharply but is not zero.
+- **GPU eligibility is narrow.** `-Dmetal=true` runs the full forward pass
+  on GPU only when every projection is Q8_0 and every norm is f32 (the
+  common TinyLlama / Llama Q8_0 layout). Mixed-quant models — Q4_K_M,
+  Q4_K_S, Q5_K, Q6_K — fall back to a per-op path that still uses the
+  GPU for Q8_0 matmul where possible but runs everything else on CPU.
+  Closing this needs Q4_K / Q5_K / Q6_K MSL kernels (roadmap item 10).
+- **GPU throughput trails llama.cpp.** ~37 tok/s vs ~50–100 tok/s on the
+  same hardware. Empirically not a kernel issue — the gap is layer-level
+  dispatch + sync overhead. Roadmap items 8 + 9 (async pipelining,
+  weight fusion) cover the remaining headroom.
+- **Yielding workers, not parking.** When the CPU pool is in use (Metal
+  off or fallback path), idle workers `std.atomic.spinLoopHint()` for a
+  bounded window then `std.Thread.yield()` — they don't block on a
+  futex/condvar (Zig 0.16's std doesn't expose futex publicly without
+  libc). Idle CPU drops sharply between requests but is not zero.
 - **Server is serial.** One request at a time, mutex-guarded. Good for
   single-user code-gen; multi-tenant requires multiple `serve` processes
   on different ports.
-- **Server `created_at` is a placeholder** (`1970-01-01T00:00:00Z`) and
-  `digest`/`total_duration`/`eval_count` fields are omitted. Most clients
-  tolerate it; full Ollama parity would add real timestamps + sha256.
+- **Server response metadata is minimal.** `created_at` is a placeholder
+  (`1970-01-01T00:00:00Z`); `digest`, `total_duration`, `prompt_eval_count`,
+  `eval_count`, `eval_duration` are omitted. Most Ollama clients tolerate
+  it; full parity would add real timestamps + sha256 + per-request timings.
+- **No `error_tracing` in ReleaseSmall.** `build.zig` disables it for the
+  binary-size win. Crashes in ReleaseSmall builds give a stack address,
+  not a Zig stack trace. Use ReleaseFast or Debug for diagnostic builds.
 
 ---
 
 ## Build history
 
-The engine grew in five tracked phases. Commit log mirrors this:
+The engine grew in tracked phases. Commit log mirrors this:
 
 1. **Task 1 — Foundation** — `build.zig` flags, `core/{mapper,parser}.zig`,
    `kernels/comptime_gen.zig`, kernel stubs. CLI prints tensor catalog.
@@ -440,6 +571,24 @@ The engine grew in five tracked phases. Commit log mirrors this:
    relax the no-FFI constraint** — bridge needs to call Obj-C runtime,
    linker needs Foundation+Metal frameworks. Pure-Zig path preserved
    and still default.
+7. **Phase 1 — Zero-copy state aliasing** — `forward.State` slices
+   alias the backend's persistent shared-storage `MTLBuffer`s. Per-token
+   matmul path drops the host↔device memcpys.
+8. **Phase 2 — Segment API + per-layer batching** — `bridge.m` exposes
+   `vtb_metal_segment_*` for chained dispatches in one
+   `MTLCommandBuffer`. Two segments per layer (pre-attn + post-attn)
+   replace seven separate command buffers.
+9. **Phase 3 — Full GPU forward** — new MSL kernels: `copy_f32`,
+   `attn_scores`, `softmax_rows`, `attn_weighted_sum`, two-buffer
+   `rmsnorm`. KV cache + attention scores moved into shared `MTLBuffer`s.
+   `forward.zig` ships a single command buffer per layer; CPU does only
+   embedding gather + sampler.
+10. **Phase 4 — Matmul kernel exploration** — tested threadgroup-shared
+    activation tiling, multi-row-per-thread, simdgroup-per-row with
+    `simd_sum`. All matched the simple kernel within noise; kept the
+    simple kernel and updated docs to reflect that further perf wins
+    will come from architecture (async pipelining, weight fusion,
+    batching), not the matmul kernel itself.
 
 Each phase preserved the hard constraints that still apply (mmap-first,
 < 5 MB stripped, no global state) and shipped passing tests + real-model
