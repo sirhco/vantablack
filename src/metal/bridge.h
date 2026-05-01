@@ -54,6 +54,57 @@ int vtb_metal_matmul_q8_0(
     size_t m,
     size_t k);
 
+// ----- Batched / fused dispatch -------------------------------------------
+//
+// `vtb_metal_segment_*` lets the caller chain multiple operations into one
+// MTLCommandBuffer and flush only when CPU needs to read intermediate
+// results. Cuts per-token GPU↔CPU sync count dramatically.
+
+typedef struct VtbMetalSeg VtbMetalSeg;
+
+VtbMetalSeg *vtb_metal_segment_begin(VtbMetalCtx *ctx);
+// Commits the segment and waits for completion. Returns 0 on success.
+int vtb_metal_segment_commit(VtbMetalSeg *seg);
+
+// All segment_* fns enqueue into `seg`. Buffer dimensions must already match.
+
+void vtb_metal_segment_matmul_q8_0(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *out_buf,
+    VtbMetalBuf *w_buf,
+    size_t w_offset,
+    VtbMetalBuf *acts_buf,
+    size_t m,
+    size_t k);
+
+void vtb_metal_segment_rmsnorm(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *x_buf,
+    VtbMetalBuf *weight_buf,
+    size_t weight_offset,
+    size_t n,
+    float eps);
+
+void vtb_metal_segment_rope(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *x_buf,
+    size_t n_heads,
+    size_t head_dim,
+    size_t pos,
+    float base);
+
+void vtb_metal_segment_swiglu(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *gate_buf,
+    VtbMetalBuf *up_buf,
+    size_t n);
+
+void vtb_metal_segment_residual_add(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *a_buf,
+    VtbMetalBuf *b_buf,
+    size_t n);
+
 #ifdef __cplusplus
 }
 #endif

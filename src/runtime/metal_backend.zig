@@ -1,14 +1,15 @@
 //! Per-process Metal backend state.
 //!
-//! Owns: the MTLDevice, a no-copy MTLBuffer wrapping the entire mmap'd weight
-//! region, and pre-allocated scratch buffers for activations + output. Init
-//! cost is amortized across all subsequent matmul calls.
+//! Owns the MTLDevice + persistent state buffers used by the GPU forward
+//! path. State scratch (x, xb, q, k_cur, ...) and the LM-head logits live in
+//! shared-storage MTLBuffers so the CPU can read intermediate values when
+//! attention runs CPU-side, and the GPU can read activations without
+//! per-call memcpy.
 //!
-//! Currently only Q8_0 matmul has a GPU kernel. Other ops fall back to the
-//! CPU thread pool. See `runtime/forward.zig`.
+//! Weights are wrapped no-copy from the mmap'd region; norm weights are
+//! addressed via per-call buffer offsets.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const metal = @import("../metal/bridge.zig");
@@ -20,23 +21,34 @@ pub const InitError = error{
     MetalAllocFailed,
 };
 
+pub const ScratchBuf = struct {
+    buf: *metal.Buf,
+    ptr: [*]f32,
+    cap: usize,
+};
+
 pub const MetalBackend = struct {
     dev: metal.Device,
+
+    // Whole-mmap weight buffer (no-copy wrap).
     weights_buf: *metal.Buf,
     weights_base: [*]const u8,
     weights_len: usize,
 
-    /// Reusable shared MTLBuffer for activations input. Sized to fit the
-    /// largest k of any matmul in the model (`max(dim, ffn_dim, kv_dim)`).
-    acts_buf: *metal.Buf,
-    acts_ptr: [*]f32,
-    acts_cap: usize,
-
-    /// Reusable shared MTLBuffer for matmul output. Sized to fit the largest
-    /// m of any matmul (`max(dim, ffn_dim, vocab_size)`).
-    out_buf: *metal.Buf,
-    out_ptr: [*]f32,
-    out_cap: usize,
+    // Per-token persistent state. All shared-storage MTLBuffers; both CPU
+    // and GPU read/write them (Apple Silicon unified memory means same
+    // physical pages — no DMA, no copy).
+    x: ScratchBuf,
+    xb: ScratchBuf,
+    xb2: ScratchBuf,
+    q: ScratchBuf,
+    k_cur: ScratchBuf,
+    v_cur: ScratchBuf,
+    attn_out: ScratchBuf,
+    gate: ScratchBuf,
+    up: ScratchBuf,
+    ffn_out: ScratchBuf,
+    logits: ScratchBuf,
 
     pub fn init(
         allocator: Allocator,
@@ -49,75 +61,119 @@ pub const MetalBackend = struct {
         var dev = metal.Device.init() catch return error.MetalUnavailable;
         errdefer dev.deinit();
 
-        // Wrap the entire mmap'd weight region. mmap maps full pages so the
-        // allocation is already page-aligned; round len up to page boundary.
         const page = std.heap.pageSize();
         const len_aligned = std.mem.alignForward(usize, mapper.mapped.len, page);
         const weights_buf = dev.wrap(@as([*]const u8, @ptrCast(mapper.mapped.ptr))[0..len_aligned]) catch
             return error.MetalAllocFailed;
         errdefer dev.release(weights_buf);
 
-        const max_k = @max(cfg.dim, @max(cfg.ffn_dim, cfg.n_kv_heads * cfg.head_dim));
-        const max_m = @max(cfg.vocab_size, @max(cfg.dim, cfg.ffn_dim));
-
-        var acts_ptr_raw: ?*anyopaque = null;
-        const acts_buf = dev.alloc(max_k * @sizeOf(f32), &acts_ptr_raw) catch
-            return error.MetalAllocFailed;
-        errdefer dev.release(acts_buf);
-
-        var out_ptr_raw: ?*anyopaque = null;
-        const out_buf = dev.alloc(max_m * @sizeOf(f32), &out_ptr_raw) catch
-            return error.MetalAllocFailed;
-        errdefer dev.release(out_buf);
+        const kv_dim = cfg.n_kv_heads * cfg.head_dim;
+        const x = try allocScratch(dev, cfg.dim);
+        errdefer dev.release(x.buf);
+        const xb = try allocScratch(dev, cfg.dim);
+        errdefer dev.release(xb.buf);
+        const xb2 = try allocScratch(dev, cfg.dim);
+        errdefer dev.release(xb2.buf);
+        const q = try allocScratch(dev, cfg.n_heads * cfg.head_dim);
+        errdefer dev.release(q.buf);
+        const k_cur = try allocScratch(dev, kv_dim);
+        errdefer dev.release(k_cur.buf);
+        const v_cur = try allocScratch(dev, kv_dim);
+        errdefer dev.release(v_cur.buf);
+        const attn_out = try allocScratch(dev, cfg.dim);
+        errdefer dev.release(attn_out.buf);
+        const gate = try allocScratch(dev, cfg.ffn_dim);
+        errdefer dev.release(gate.buf);
+        const up = try allocScratch(dev, cfg.ffn_dim);
+        errdefer dev.release(up.buf);
+        const ffn_out = try allocScratch(dev, cfg.dim);
+        errdefer dev.release(ffn_out.buf);
+        const logits = try allocScratch(dev, cfg.vocab_size);
+        errdefer dev.release(logits.buf);
 
         return .{
             .dev = dev,
             .weights_buf = weights_buf,
             .weights_base = @ptrCast(mapper.mapped.ptr),
             .weights_len = len_aligned,
-            .acts_buf = acts_buf,
-            .acts_ptr = @as([*]f32, @ptrCast(@alignCast(acts_ptr_raw.?))),
-            .acts_cap = max_k,
-            .out_buf = out_buf,
-            .out_ptr = @as([*]f32, @ptrCast(@alignCast(out_ptr_raw.?))),
-            .out_cap = max_m,
+            .x = x,
+            .xb = xb,
+            .xb2 = xb2,
+            .q = q,
+            .k_cur = k_cur,
+            .v_cur = v_cur,
+            .attn_out = attn_out,
+            .gate = gate,
+            .up = up,
+            .ffn_out = ffn_out,
+            .logits = logits,
         };
     }
 
     pub fn deinit(self: *MetalBackend) void {
-        self.dev.release(self.out_buf);
-        self.dev.release(self.acts_buf);
+        self.dev.release(self.logits.buf);
+        self.dev.release(self.ffn_out.buf);
+        self.dev.release(self.up.buf);
+        self.dev.release(self.gate.buf);
+        self.dev.release(self.attn_out.buf);
+        self.dev.release(self.v_cur.buf);
+        self.dev.release(self.k_cur.buf);
+        self.dev.release(self.q.buf);
+        self.dev.release(self.xb2.buf);
+        self.dev.release(self.xb.buf);
+        self.dev.release(self.x.buf);
         self.dev.release(self.weights_buf);
         self.dev.deinit();
         self.* = undefined;
     }
 
-    /// Q8_0 matmul: out = W @ acts using the GPU. Input/output are host f32
-    /// slices; this fn handles the in/out memcpy through the shared scratch
-    /// buffers.
-    pub fn matmulQ8_0(
-        self: *MetalBackend,
-        out: []f32,
-        weight_bytes: []const u8,
-        acts: []const f32,
-        m: usize,
-        k: usize,
-    ) !void {
-        std.debug.assert(out.len >= m);
-        std.debug.assert(acts.len >= k);
-        std.debug.assert(k <= self.acts_cap);
-        std.debug.assert(m <= self.out_cap);
-
-        // Compute byte offset into the wrapped mmap region.
+    /// Byte offset of `weight_bytes.ptr` inside the wrapped weight buffer.
+    /// Caller must ensure the slice is within the mmap region.
+    pub fn weightOffset(self: *const MetalBackend, weight_bytes: []const u8) usize {
         const w_ptr_int = @intFromPtr(weight_bytes.ptr);
         const base_int = @intFromPtr(self.weights_base);
         std.debug.assert(w_ptr_int >= base_int);
-        const w_offset = w_ptr_int - base_int;
-        std.debug.assert(w_offset + weight_bytes.len <= self.weights_len);
+        const off = w_ptr_int - base_int;
+        std.debug.assert(off + weight_bytes.len <= self.weights_len);
+        return off;
+    }
 
-        // Stage acts into shared buffer, dispatch, read back.
-        @memcpy(self.acts_ptr[0..k], acts);
-        try self.dev.matmulQ8_0(self.out_buf, self.weights_buf, w_offset, self.acts_buf, m, k);
-        @memcpy(out[0..m], self.out_ptr[0..m]);
+    /// Stand-alone Q8_0 matmul entry point: still used for the LM-head pass
+    /// where the input lives in a scratch buffer rather than the per-token
+    /// persistent state.
+    pub fn matmulQ8_0(
+        self: *MetalBackend,
+        out_buf: *ScratchBuf,
+        weight_bytes: []const u8,
+        in_buf: *const ScratchBuf,
+        m: usize,
+        k: usize,
+    ) !void {
+        std.debug.assert(m <= out_buf.cap);
+        std.debug.assert(k <= in_buf.cap);
+        const off = self.weightOffset(weight_bytes);
+        try self.dev.matmulQ8_0(out_buf.buf, self.weights_buf, off, in_buf.buf, m, k);
+    }
+
+    /// Returns the ScratchBuf whose shared-storage pointer matches `p`, or
+    /// null if `p` was allocated outside the backend (e.g. in CPU-only mode).
+    /// Lets `forward.zig` map a plain `[]f32` view back to its GPU buffer
+    /// without threading an explicit handle through every call site.
+    pub fn scratchForPtr(self: *MetalBackend, p: [*]const f32) ?*ScratchBuf {
+        const fields = .{ "x", "xb", "xb2", "q", "k_cur", "v_cur", "attn_out", "gate", "up", "ffn_out", "logits" };
+        inline for (fields) |name| {
+            if (@field(self, name).ptr == p) return &@field(self, name);
+        }
+        return null;
     }
 };
+
+fn allocScratch(dev: metal.Device, n: usize) !ScratchBuf {
+    var raw: ?*anyopaque = null;
+    const buf = dev.alloc(n * @sizeOf(f32), &raw) catch return error.MetalAllocFailed;
+    return .{
+        .buf = buf,
+        .ptr = @ptrCast(@alignCast(raw.?)),
+        .cap = n,
+    };
+}

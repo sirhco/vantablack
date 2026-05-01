@@ -39,24 +39,135 @@ kernel void matmul_q8_0(
     uint row_bytes = blocks_per_row * Q8_BLOCK_BYTES;
     device const uchar *row = weights + p.w_offset_bytes + gid * row_bytes;
 
+    // Vectorized inner: one Q8_0 block = 32 elements = 8 char4 / 8 float4.
+    // float4 FMA + char4 -> float4 conversion is one ALU op each on M-series.
     float total = 0.0;
     for (uint b = 0; b < blocks_per_row; ++b) {
         device const uchar *blk = row + b * Q8_BLOCK_BYTES;
-        // Read f16 scale (bytes 0..2, little-endian).
         ushort scale_u16 = (ushort)blk[0] | ((ushort)blk[1] << 8);
-        half scale = as_type<half>(scale_u16);
-        float scale_f = (float)scale;
-        // Quants are i8 packed at bytes 2..34.
-        device const char *qs = (device const char*)(blk + 2);
-        device const float *x = acts + b * Q8_BLOCK_ELEMS;
+        float scale_f = (float)as_type<half>(scale_u16);
 
-        float block_dot = 0.0;
-        for (uint j = 0; j < Q8_BLOCK_ELEMS; ++j) {
-            block_dot += (float)qs[j] * x[j];
-        }
-        total += scale_f * block_dot;
+        // qs lives at byte offset 2 within the block — only 2-byte aligned,
+        // so packed_char4 (no alignment requirement) is required for the load.
+        device const packed_char4 *qs4 = (device const packed_char4 *)(blk + 2);
+        device const float4 *x4 = (device const float4 *)(acts + b * Q8_BLOCK_ELEMS);
+
+        float4 acc = float4(0.0);
+        // Unrolled: 8 iterations of float4 FMA covers the 32-element block.
+        acc = fma(float4(char4(qs4[0])), x4[0], acc);
+        acc = fma(float4(char4(qs4[1])), x4[1], acc);
+        acc = fma(float4(char4(qs4[2])), x4[2], acc);
+        acc = fma(float4(char4(qs4[3])), x4[3], acc);
+        acc = fma(float4(char4(qs4[4])), x4[4], acc);
+        acc = fma(float4(char4(qs4[5])), x4[5], acc);
+        acc = fma(float4(char4(qs4[6])), x4[6], acc);
+        acc = fma(float4(char4(qs4[7])), x4[7], acc);
+        total = fma(scale_f, acc.x + acc.y + acc.z + acc.w, total);
     }
     out[gid] = total;
+}
+
+// In-place RMSNorm: x[i] = (x[i] / rms(x)) * weight[i]
+// One threadgroup per call. Threads collaboratively compute sum-of-squares
+// using simdgroup reduction, then apply the normalization.
+
+struct RmsNormParams {
+    uint n;
+    float eps;
+};
+
+kernel void rmsnorm_inplace(
+    device float        *x       [[buffer(0)]],
+    device const float  *weight  [[buffer(1)]],
+    constant RmsNormParams &p    [[buffer(2)]],
+    uint                 tid     [[thread_position_in_threadgroup]],
+    uint                 ntg     [[threads_per_threadgroup]])
+{
+    // Per-thread partial sum of squares.
+    float ss = 0.0;
+    for (uint i = tid; i < p.n; i += ntg) {
+        float v = x[i];
+        ss += v * v;
+    }
+    // Threadgroup reduce via threadgroup memory.
+    threadgroup float scratch[32];
+    uint sid = tid % 32;
+    uint sgrp = tid / 32;
+    // Simdgroup-level reduce.
+    ss = simd_sum(ss);
+    if (sid == 0) scratch[sgrp] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgrp == 0) {
+        ss = (sid < (ntg + 31) / 32) ? scratch[sid] : 0.0;
+        ss = simd_sum(ss);
+        if (sid == 0) scratch[0] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total_ss = scratch[0];
+    float inv = rsqrt(total_ss / float(p.n) + p.eps);
+    for (uint i = tid; i < p.n; i += ntg) {
+        x[i] = x[i] * inv * weight[i];
+    }
+}
+
+// In-place RoPE on Q or K. Each kernel invocation handles all heads/pairs.
+// One thread per (head, pair).
+
+struct RopeParams {
+    uint n_heads;
+    uint head_dim;
+    uint pos;
+    float base;
+};
+
+kernel void rope_inplace(
+    device float        *x       [[buffer(0)]],
+    constant RopeParams &p       [[buffer(1)]],
+    uint                 gid     [[thread_position_in_grid]])
+{
+    uint pairs_per_head = p.head_dim / 2;
+    uint total_pairs = p.n_heads * pairs_per_head;
+    if (gid >= total_pairs) return;
+    uint h = gid / pairs_per_head;
+    uint pair_idx = gid % pairs_per_head;
+    uint i = pair_idx * 2;
+    float inv_freq = 1.0 / pow(p.base, float(i) / float(p.head_dim));
+    float theta = float(p.pos) * inv_freq;
+    float c = cos(theta);
+    float s = sin(theta);
+    uint off = h * p.head_dim + i;
+    float x0 = x[off];
+    float x1 = x[off + 1];
+    x[off]     = x0 * c - x1 * s;
+    x[off + 1] = x0 * s + x1 * c;
+}
+
+// SwiGLU: gate[i] = silu(gate[i]) * up[i] where silu(z) = z / (1 + exp(-z)).
+
+struct LenParams { uint n; };
+
+kernel void swiglu(
+    device float        *gate    [[buffer(0)]],
+    device const float  *up      [[buffer(1)]],
+    constant LenParams  &p       [[buffer(2)]],
+    uint                 gid     [[thread_position_in_grid]])
+{
+    if (gid >= p.n) return;
+    float z = gate[gid];
+    float silu = z / (1.0 + exp(-z));
+    gate[gid] = silu * up[gid];
+}
+
+// In-place residual: a[i] += b[i].
+
+kernel void residual_add(
+    device float        *a       [[buffer(0)]],
+    device const float  *b       [[buffer(1)]],
+    constant LenParams  &p       [[buffer(2)]],
+    uint                 gid     [[thread_position_in_grid]])
+{
+    if (gid >= p.n) return;
+    a[gid] = a[gid] + b[gid];
 }
 )MSL";
 
@@ -67,10 +178,20 @@ struct VtbMetalCtx {
     id<MTLCommandQueue> queue;
     id<MTLLibrary> library;
     id<MTLComputePipelineState> pso_q8_0;
+    id<MTLComputePipelineState> pso_rmsnorm;
+    id<MTLComputePipelineState> pso_rope;
+    id<MTLComputePipelineState> pso_swiglu;
+    id<MTLComputePipelineState> pso_residual;
 };
 
 struct VtbMetalBuf {
     id<MTLBuffer> buffer;
+};
+
+struct VtbMetalSeg {
+    VtbMetalCtx *ctx;
+    id<MTLCommandBuffer> cmd;
+    id<MTLComputeCommandEncoder> enc;
 };
 
 // ----------------- Lifecycle -------------------------------------------------
@@ -91,15 +212,24 @@ VtbMetalCtx *vtb_metal_init(void) {
             return NULL;
         }
 
-        id<MTLFunction> fn_q8_0 = [library newFunctionWithName:@"matmul_q8_0"];
-        if (!fn_q8_0) {
-            NSLog(@"vtb_metal_init: matmul_q8_0 function not found");
-            return NULL;
-        }
-        id<MTLComputePipelineState> pso_q8_0 = [device newComputePipelineStateWithFunction:fn_q8_0 error:&err];
-        if (!pso_q8_0) {
-            NSLog(@"vtb_metal_init: pso compile failed: %@", err);
-            return NULL;
+        // Compile every pipeline up front so subsequent dispatches are pure
+        // kernel-launch overhead with no first-use latency.
+        NSString *names[] = {
+            @"matmul_q8_0", @"rmsnorm_inplace", @"rope_inplace",
+            @"swiglu", @"residual_add",
+        };
+        id<MTLComputePipelineState> psos[5] = {nil, nil, nil, nil, nil};
+        for (int i = 0; i < 5; i++) {
+            id<MTLFunction> fn = [library newFunctionWithName:names[i]];
+            if (!fn) {
+                NSLog(@"vtb_metal_init: function %@ not found", names[i]);
+                return NULL;
+            }
+            psos[i] = [device newComputePipelineStateWithFunction:fn error:&err];
+            if (!psos[i]) {
+                NSLog(@"vtb_metal_init: pso %@ compile failed: %@", names[i], err);
+                return NULL;
+            }
         }
 
         VtbMetalCtx *ctx = (VtbMetalCtx *)calloc(1, sizeof(VtbMetalCtx));
@@ -107,7 +237,11 @@ VtbMetalCtx *vtb_metal_init(void) {
         ctx->device = device;
         ctx->queue = queue;
         ctx->library = library;
-        ctx->pso_q8_0 = pso_q8_0;
+        ctx->pso_q8_0 = psos[0];
+        ctx->pso_rmsnorm = psos[1];
+        ctx->pso_rope = psos[2];
+        ctx->pso_swiglu = psos[3];
+        ctx->pso_residual = psos[4];
         return ctx;
     }
 }
@@ -118,6 +252,10 @@ void vtb_metal_destroy(VtbMetalCtx *ctx) {
     ctx->queue = nil;
     ctx->library = nil;
     ctx->pso_q8_0 = nil;
+    ctx->pso_rmsnorm = nil;
+    ctx->pso_rope = nil;
+    ctx->pso_swiglu = nil;
+    ctx->pso_residual = nil;
     free(ctx);
 }
 
@@ -203,4 +341,137 @@ int vtb_metal_matmul_q8_0(
         }
         return 0;
     }
+}
+
+// ----------------- Segment (batched) dispatch --------------------------------
+
+VtbMetalSeg *vtb_metal_segment_begin(VtbMetalCtx *ctx) {
+    if (!ctx) return NULL;
+    @autoreleasepool {
+        VtbMetalSeg *seg = (VtbMetalSeg *)calloc(1, sizeof(VtbMetalSeg));
+        if (!seg) return NULL;
+        seg->ctx = ctx;
+        seg->cmd = [ctx->queue commandBuffer];
+        seg->enc = [seg->cmd computeCommandEncoder];
+        return seg;
+    }
+}
+
+int vtb_metal_segment_commit(VtbMetalSeg *seg) {
+    if (!seg) return 1;
+    @autoreleasepool {
+        [seg->enc endEncoding];
+        [seg->cmd commit];
+        [seg->cmd waitUntilCompleted];
+        int rc = (seg->cmd.status == MTLCommandBufferStatusError) ? 2 : 0;
+        if (rc != 0) NSLog(@"vtb_metal_segment_commit: %@", seg->cmd.error);
+        seg->enc = nil;
+        seg->cmd = nil;
+        free(seg);
+        return rc;
+    }
+}
+
+void vtb_metal_segment_matmul_q8_0(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *out_buf,
+    VtbMetalBuf *w_buf,
+    size_t w_offset,
+    VtbMetalBuf *acts_buf,
+    size_t m,
+    size_t k)
+{
+    if (!seg) return;
+    [seg->enc setComputePipelineState:seg->ctx->pso_q8_0];
+    [seg->enc setBuffer:out_buf->buffer offset:0 atIndex:0];
+    [seg->enc setBuffer:w_buf->buffer offset:0 atIndex:1];
+    [seg->enc setBuffer:acts_buf->buffer offset:0 atIndex:2];
+    struct MMParams { uint32_t m; uint32_t k; uint32_t w_offset_bytes; } params;
+    params.m = (uint32_t)m;
+    params.k = (uint32_t)k;
+    params.w_offset_bytes = (uint32_t)w_offset;
+    [seg->enc setBytes:&params length:sizeof(params) atIndex:3];
+    NSUInteger tg = 64;
+    if (tg > seg->ctx->pso_q8_0.maxTotalThreadsPerThreadgroup)
+        tg = seg->ctx->pso_q8_0.maxTotalThreadsPerThreadgroup;
+    [seg->enc dispatchThreads:MTLSizeMake(m, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+}
+
+void vtb_metal_segment_rmsnorm(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *x_buf,
+    VtbMetalBuf *weight_buf,
+    size_t weight_offset,
+    size_t n,
+    float eps)
+{
+    if (!seg) return;
+    [seg->enc setComputePipelineState:seg->ctx->pso_rmsnorm];
+    [seg->enc setBuffer:x_buf->buffer offset:0 atIndex:0];
+    [seg->enc setBuffer:weight_buf->buffer offset:weight_offset atIndex:1];
+    struct RmsParams { uint32_t n; float eps; } p = { (uint32_t)n, eps };
+    [seg->enc setBytes:&p length:sizeof(p) atIndex:2];
+    // One threadgroup, sized to a power-of-2 ≤ 1024 ≤ pso max.
+    NSUInteger tg = 256;
+    if (tg > seg->ctx->pso_rmsnorm.maxTotalThreadsPerThreadgroup)
+        tg = seg->ctx->pso_rmsnorm.maxTotalThreadsPerThreadgroup;
+    [seg->enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+}
+
+void vtb_metal_segment_rope(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *x_buf,
+    size_t n_heads,
+    size_t head_dim,
+    size_t pos,
+    float base)
+{
+    if (!seg) return;
+    [seg->enc setComputePipelineState:seg->ctx->pso_rope];
+    [seg->enc setBuffer:x_buf->buffer offset:0 atIndex:0];
+    struct RopeParams { uint32_t n_heads; uint32_t head_dim; uint32_t pos; float base; } p = {
+        (uint32_t)n_heads, (uint32_t)head_dim, (uint32_t)pos, base,
+    };
+    [seg->enc setBytes:&p length:sizeof(p) atIndex:1];
+    NSUInteger total = n_heads * (head_dim / 2);
+    NSUInteger tg = 64;
+    if (tg > seg->ctx->pso_rope.maxTotalThreadsPerThreadgroup)
+        tg = seg->ctx->pso_rope.maxTotalThreadsPerThreadgroup;
+    [seg->enc dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+}
+
+void vtb_metal_segment_swiglu(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *gate_buf,
+    VtbMetalBuf *up_buf,
+    size_t n)
+{
+    if (!seg) return;
+    [seg->enc setComputePipelineState:seg->ctx->pso_swiglu];
+    [seg->enc setBuffer:gate_buf->buffer offset:0 atIndex:0];
+    [seg->enc setBuffer:up_buf->buffer offset:0 atIndex:1];
+    struct LenParams { uint32_t n; } p = { (uint32_t)n };
+    [seg->enc setBytes:&p length:sizeof(p) atIndex:2];
+    NSUInteger tg = 64;
+    if (tg > seg->ctx->pso_swiglu.maxTotalThreadsPerThreadgroup)
+        tg = seg->ctx->pso_swiglu.maxTotalThreadsPerThreadgroup;
+    [seg->enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+}
+
+void vtb_metal_segment_residual_add(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *a_buf,
+    VtbMetalBuf *b_buf,
+    size_t n)
+{
+    if (!seg) return;
+    [seg->enc setComputePipelineState:seg->ctx->pso_residual];
+    [seg->enc setBuffer:a_buf->buffer offset:0 atIndex:0];
+    [seg->enc setBuffer:b_buf->buffer offset:0 atIndex:1];
+    struct LenParams { uint32_t n; } p = { (uint32_t)n };
+    [seg->enc setBytes:&p length:sizeof(p) atIndex:2];
+    NSUInteger tg = 64;
+    if (tg > seg->ctx->pso_residual.maxTotalThreadsPerThreadgroup)
+        tg = seg->ctx->pso_residual.maxTotalThreadsPerThreadgroup;
+    [seg->enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
 }

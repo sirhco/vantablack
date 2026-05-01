@@ -195,7 +195,15 @@ fn generate(
     var model = try vantablack.Model.init(gpa, mapper);
     defer model.deinit(gpa);
 
-    var state = try vantablack.forward.State.init(gpa, &model);
+    // Metal first so State can alias persistent shared-storage scratch.
+    var maybe_metal: ?vantablack.MetalBackend = blk: {
+        if (!vantablack.metal.metal_enabled) break :blk null;
+        break :blk vantablack.MetalBackend.init(gpa, mapper, model.config) catch null;
+    };
+    defer if (maybe_metal) |*mb| mb.deinit();
+    const metal_ptr: ?*vantablack.MetalBackend = if (maybe_metal != null) &maybe_metal.? else null;
+
+    var state = try vantablack.forward.State.init(gpa, &model, metal_ptr);
     defer state.deinit(gpa);
 
     var cache = try vantablack.KvCache.init(
@@ -212,13 +220,6 @@ fn generate(
 
     var sampler = try vantablack.Sampler.init(gpa, sampler_cfg, model.config.vocab_size);
     defer sampler.deinit(gpa);
-
-    var maybe_metal: ?vantablack.MetalBackend = blk: {
-        if (!vantablack.metal.metal_enabled) break :blk null;
-        break :blk vantablack.MetalBackend.init(gpa, mapper, model.config) catch null;
-    };
-    defer if (maybe_metal) |*mb| mb.deinit();
-    const metal_ptr: ?*vantablack.MetalBackend = if (maybe_metal != null) &maybe_metal.? else null;
 
     // When the GPU is doing the heavy matmuls, more CPU workers just spin
     // waiting on GPU sync. Default to 1 thread when Metal is active.

@@ -35,16 +35,45 @@ pub const State = struct {
     q: []f32,
     k_cur: []f32,
     v_cur: []f32,
-    attn_scores: []f32, // size: n_heads * max_seq
+    attn_scores: []f32, // size: n_heads * max_seq, CPU-only.
     attn_out: []f32,
     gate: []f32,
     up: []f32,
     ffn_out: []f32,
     logits: []f32,
 
-    pub fn init(allocator: Allocator, m: *const Model) !State {
+    /// True when the buffer slices are heap-allocated and must be freed by
+    /// `deinit`. False when they alias `MetalBackend` shared-storage scratch
+    /// (in which case the backend frees them).
+    owns_buffers: bool,
+
+    pub fn init(allocator: Allocator, m: *const Model, metal: ?*MetalBackend) !State {
         const c = m.config;
         const kv_dim = c.n_kv_heads * c.head_dim;
+        // attn_scores stays CPU-only — attention is on the CPU thread pool.
+        const attn_scores = try allocator.alloc(f32, c.n_heads * c.max_seq);
+        errdefer allocator.free(attn_scores);
+
+        if (metal) |mb| {
+            // Alias the persistent shared-storage scratch buffers. Slices are
+            // views over the same memory the GPU writes; no copy at dispatch.
+            return .{
+                .x = mb.x.ptr[0..c.dim],
+                .xb = mb.xb.ptr[0..c.dim],
+                .xb2 = mb.xb2.ptr[0..c.dim],
+                .q = mb.q.ptr[0 .. c.n_heads * c.head_dim],
+                .k_cur = mb.k_cur.ptr[0..kv_dim],
+                .v_cur = mb.v_cur.ptr[0..kv_dim],
+                .attn_scores = attn_scores,
+                .attn_out = mb.attn_out.ptr[0..c.dim],
+                .gate = mb.gate.ptr[0..c.ffn_dim],
+                .up = mb.up.ptr[0..c.ffn_dim],
+                .ffn_out = mb.ffn_out.ptr[0..c.dim],
+                .logits = mb.logits.ptr[0..c.vocab_size],
+                .owns_buffers = false,
+            };
+        }
+
         return .{
             .x = try allocator.alloc(f32, c.dim),
             .xb = try allocator.alloc(f32, c.dim),
@@ -52,28 +81,31 @@ pub const State = struct {
             .q = try allocator.alloc(f32, c.n_heads * c.head_dim),
             .k_cur = try allocator.alloc(f32, kv_dim),
             .v_cur = try allocator.alloc(f32, kv_dim),
-            .attn_scores = try allocator.alloc(f32, c.n_heads * c.max_seq),
+            .attn_scores = attn_scores,
             .attn_out = try allocator.alloc(f32, c.dim),
             .gate = try allocator.alloc(f32, c.ffn_dim),
             .up = try allocator.alloc(f32, c.ffn_dim),
             .ffn_out = try allocator.alloc(f32, c.dim),
             .logits = try allocator.alloc(f32, c.vocab_size),
+            .owns_buffers = true,
         };
     }
 
     pub fn deinit(self: *State, allocator: Allocator) void {
-        allocator.free(self.x);
-        allocator.free(self.xb);
-        allocator.free(self.xb2);
-        allocator.free(self.q);
-        allocator.free(self.k_cur);
-        allocator.free(self.v_cur);
         allocator.free(self.attn_scores);
-        allocator.free(self.attn_out);
-        allocator.free(self.gate);
-        allocator.free(self.up);
-        allocator.free(self.ffn_out);
-        allocator.free(self.logits);
+        if (self.owns_buffers) {
+            allocator.free(self.x);
+            allocator.free(self.xb);
+            allocator.free(self.xb2);
+            allocator.free(self.q);
+            allocator.free(self.k_cur);
+            allocator.free(self.v_cur);
+            allocator.free(self.attn_out);
+            allocator.free(self.gate);
+            allocator.free(self.up);
+            allocator.free(self.ffn_out);
+            allocator.free(self.logits);
+        }
         self.* = undefined;
     }
 };
@@ -214,8 +246,12 @@ fn matmulRuntime(
     const q = model_mod.quantOf(w.ggml_type) catch return error.UnsupportedWeightType;
 
     // GPU fast path: Q8_0 only for now. Other quants stay on CPU.
+    // Both `out` and `acts` must alias persistent ScratchBufs so the
+    // dispatch can be zero-copy. State.init wires this up when metal is on.
     if (metal) |mb| if (q == .q8_0) {
-        mb.matmulQ8_0(out, w.bytes, acts, m, k) catch return error.UnsupportedWeightType;
+        const out_buf = mb.scratchForPtr(out.ptr) orelse return error.UnsupportedWeightType;
+        const in_buf = mb.scratchForPtr(acts.ptr) orelse return error.UnsupportedWeightType;
+        mb.matmulQ8_0(out_buf, w.bytes, in_buf, m, k) catch return error.UnsupportedWeightType;
         return;
     };
 

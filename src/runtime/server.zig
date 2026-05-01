@@ -88,7 +88,22 @@ pub const Server = struct {
         var model = try Model.init(gpa, mapper);
         errdefer model.deinit(gpa);
 
-        var state = try forward_mod.State.init(gpa, &model);
+        // Metal is built before State so State can alias the backend's
+        // persistent shared-storage scratch buffers (zero-copy GPU dispatch).
+        var maybe_metal: ?MetalBackend = blk: {
+            if (!metal_bridge.metal_enabled) break :blk null;
+            const mb = MetalBackend.init(gpa, mapper, model.config) catch break :blk null;
+            break :blk mb;
+        };
+        errdefer if (maybe_metal) |*mb| mb.deinit();
+
+        // Take a stable pointer into the local optional. Once this Server is
+        // moved into the caller's slot the backend's Metal-heap pointers do
+        // not change (they live in MTLBuffer storage, not in Server memory),
+        // so the aliases held by State remain valid.
+        const metal_ptr_init: ?*MetalBackend = if (maybe_metal != null) &maybe_metal.? else null;
+
+        var state = try forward_mod.State.init(gpa, &model, metal_ptr_init);
         errdefer state.deinit(gpa);
 
         var cache = try KvCache.init(
@@ -103,11 +118,6 @@ pub const Server = struct {
         var tok = try Tokenizer.init(gpa, mapper.catalog);
         errdefer tok.deinit(gpa);
 
-        const maybe_metal: ?MetalBackend = blk: {
-            if (!metal_bridge.metal_enabled) break :blk null;
-            const mb = MetalBackend.init(gpa, mapper, model.config) catch break :blk null;
-            break :blk mb;
-        };
         // When Metal handles matmuls, CPU workers just spin on GPU sync.
         // Default to 1 thread in that case.
         const effective_threads = if (maybe_metal != null and cfg.threads == 0) @as(usize, 1) else cfg.threads;
