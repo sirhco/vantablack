@@ -17,6 +17,7 @@ const usage =
     \\  --top-p <f>    nucleus filter (0 = disabled)
     \\  --seed <u64>   RNG seed (default 0)
     \\  --system <s>   system prompt for chat mode (default "You are a helpful assistant.")
+    \\  --threads <n>  worker thread count (0 = autodetect, default ~half of cpu cores)
     \\
 ;
 
@@ -55,6 +56,7 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 3 and std.mem.eql(u8, args[2], "serve")) {
         var host: []const u8 = "127.0.0.1";
         var port: u16 = 11434;
+        var threads: usize = 0;
         var idx: usize = 3;
         while (idx < args.len) : (idx += 1) {
             const a = args[idx];
@@ -64,6 +66,9 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, a, "--port")) {
                 idx += 1;
                 port = try std.fmt.parseInt(u16, args[idx], 10);
+            } else if (std.mem.eql(u8, a, "--threads")) {
+                idx += 1;
+                threads = try std.fmt.parseInt(usize, args[idx], 10);
             } else break;
         }
         const model_name = std.fs.path.basename(abs_path);
@@ -72,6 +77,7 @@ pub fn main(init: std.process.Init) !void {
             .port = port,
             .model_name = model_name,
             .model_path = abs_path,
+            .threads = threads,
         });
         defer srv.deinit();
         try srv.run();
@@ -90,6 +96,7 @@ pub fn main(init: std.process.Init) !void {
 
         var cfg: vantablack.SamplerConfig = .{};
         var system_prompt: []const u8 = "You are a helpful assistant.";
+        var threads: usize = 0;
         var idx: usize = 3;
         while (idx < args.len) {
             const a = args[idx];
@@ -108,6 +115,9 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, a, "--system")) {
                 idx += 1;
                 system_prompt = args[idx];
+            } else if (std.mem.eql(u8, a, "--threads")) {
+                idx += 1;
+                threads = try std.fmt.parseInt(usize, args[idx], 10);
             } else break;
             idx += 1;
         }
@@ -165,7 +175,7 @@ pub fn main(init: std.process.Init) !void {
             },
         };
 
-        try generate(gpa, &mapper, n_steps, prompt_ids, cfg, out);
+        try generate(gpa, &mapper, n_steps, prompt_ids, cfg, threads, out);
     } else {
         try printCatalog(out, arena, mapper.catalog);
     }
@@ -179,6 +189,7 @@ fn generate(
     n_steps: u32,
     prompt_ids: []const u32,
     sampler_cfg: vantablack.SamplerConfig,
+    threads: usize,
     out: *Io.Writer,
 ) !void {
     var model = try vantablack.Model.init(gpa, mapper);
@@ -202,12 +213,22 @@ fn generate(
     var sampler = try vantablack.Sampler.init(gpa, sampler_cfg, model.config.vocab_size);
     defer sampler.deinit(gpa);
 
-    var pool = try vantablack.ThreadPool.init(gpa, 0);
+    var maybe_metal: ?vantablack.MetalBackend = blk: {
+        if (!vantablack.metal.metal_enabled) break :blk null;
+        break :blk vantablack.MetalBackend.init(gpa, mapper, model.config) catch null;
+    };
+    defer if (maybe_metal) |*mb| mb.deinit();
+    const metal_ptr: ?*vantablack.MetalBackend = if (maybe_metal != null) &maybe_metal.? else null;
+
+    // When the GPU is doing the heavy matmuls, more CPU workers just spin
+    // waiting on GPU sync. Default to 1 thread when Metal is active.
+    const effective_threads = if (metal_ptr != null and threads == 0) @as(usize, 1) else threads;
+    var pool = try vantablack.ThreadPool.init(gpa, effective_threads);
     defer pool.deinit(gpa);
 
     if (prompt_ids.len == 0) return;
     for (prompt_ids) |id| {
-        try vantablack.forward.step(&model, &state, &cache, pool, id);
+        try vantablack.forward.step(&model, &state, &cache, pool, metal_ptr, id);
         try tok.decodeTo(out, id);
     }
     try out.flush();
@@ -218,7 +239,7 @@ fn generate(
         if (next == tok.eos) break;
         try tok.decodeTo(out, next);
         try out.flush();
-        try vantablack.forward.step(&model, &state, &cache, pool, next);
+        try vantablack.forward.step(&model, &state, &cache, pool, metal_ptr, next);
         next = sampler.sample(state.logits);
     }
     try out.writeByte('\n');

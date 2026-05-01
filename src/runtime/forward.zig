@@ -14,11 +14,13 @@ const kernels = @import("../kernels/comptime_gen.zig");
 const model_mod = @import("model.zig");
 const kv_cache_mod = @import("kv_cache.zig");
 const pool_mod = @import("pool.zig");
+const metal_backend_mod = @import("metal_backend.zig");
 
 const Model = model_mod.Model;
 const TypedTensor = model_mod.TypedTensor;
 const KvCache = kv_cache_mod.KvCache;
 const ThreadPool = pool_mod.ThreadPool;
+pub const MetalBackend = metal_backend_mod.MetalBackend;
 
 pub const StepError = error{
     UnsupportedWeightType,
@@ -81,6 +83,7 @@ pub fn step(
     state: *State,
     cache: *KvCache,
     pool: *ThreadPool,
+    metal: ?*MetalBackend,
     token_id: u32,
 ) StepError!void {
     const c = m.config;
@@ -100,9 +103,9 @@ pub fn step(
         try rmsNormTyped(state.xb, layer.attn_norm, c.rms_eps);
 
         // QKV projections.
-        try matmulRuntime(pool, state.q, layer.attn_q, state.xb, c.dim, c.dim);
-        try matmulRuntime(pool, state.k_cur, layer.attn_k, state.xb, kv_dim, c.dim);
-        try matmulRuntime(pool, state.v_cur, layer.attn_v, state.xb, kv_dim, c.dim);
+        try matmulRuntime(pool, metal, state.q, layer.attn_q, state.xb, c.dim, c.dim);
+        try matmulRuntime(pool, metal, state.k_cur, layer.attn_k, state.xb, kv_dim, c.dim);
+        try matmulRuntime(pool, metal, state.v_cur, layer.attn_v, state.xb, kv_dim, c.dim);
 
         // RoPE on Q (per head) and K (per kv head).
         for (0..c.n_heads) |h| {
@@ -148,7 +151,7 @@ pub fn step(
         }
 
         // Output projection + residual.
-        try matmulRuntime(pool, state.xb2, layer.attn_o, state.attn_out, c.dim, c.dim);
+        try matmulRuntime(pool, metal, state.xb2, layer.attn_o, state.attn_out, c.dim, c.dim);
         math.addInto(state.x, state.xb2);
 
         // FFN RMSNorm.
@@ -156,10 +159,10 @@ pub fn step(
         try rmsNormTyped(state.xb, layer.ffn_norm, c.rms_eps);
 
         // SwiGLU FFN.
-        try matmulRuntime(pool, state.gate, layer.ffn_gate, state.xb, c.ffn_dim, c.dim);
-        try matmulRuntime(pool, state.up, layer.ffn_up, state.xb, c.ffn_dim, c.dim);
+        try matmulRuntime(pool, metal, state.gate, layer.ffn_gate, state.xb, c.ffn_dim, c.dim);
+        try matmulRuntime(pool, metal, state.up, layer.ffn_up, state.xb, c.ffn_dim, c.dim);
         math.swiglu(state.gate, state.up);
-        try matmulRuntime(pool, state.ffn_out, layer.ffn_down, state.gate, c.dim, c.ffn_dim);
+        try matmulRuntime(pool, metal, state.ffn_out, layer.ffn_down, state.gate, c.dim, c.ffn_dim);
         math.addInto(state.x, state.ffn_out);
     }
 
@@ -167,7 +170,7 @@ pub fn step(
 
     // Final norm + LM head.
     try rmsNormTyped(state.x, m.output_norm, c.rms_eps);
-    try matmulRuntime(pool, state.logits, m.output_w, state.x, c.vocab_size, c.dim);
+    try matmulRuntime(pool, metal, state.logits, m.output_w, state.x, c.vocab_size, c.dim);
 }
 
 // -------------------- helpers ---------------------------------------------
@@ -201,6 +204,7 @@ fn matmulWorker(worker_id: usize, n_workers: usize, ctx_ptr: *anyopaque) void {
 
 fn matmulRuntime(
     pool: *ThreadPool,
+    metal: ?*MetalBackend,
     out: []f32,
     w: TypedTensor,
     acts: []const f32,
@@ -208,6 +212,13 @@ fn matmulRuntime(
     k: usize,
 ) StepError!void {
     const q = model_mod.quantOf(w.ggml_type) catch return error.UnsupportedWeightType;
+
+    // GPU fast path: Q8_0 only for now. Other quants stay on CPU.
+    if (metal) |mb| if (q == .q8_0) {
+        mb.matmulQ8_0(out, w.bytes, acts, m, k) catch return error.UnsupportedWeightType;
+        return;
+    };
+
     var ctx: MatmulCtx = .{
         .out = out,
         .weights = w.bytes,

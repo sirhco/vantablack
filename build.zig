@@ -12,6 +12,15 @@ pub fn build(b: *std.Build) void {
     const omit_frame_pointer: ?bool = if (is_release) true else null;
     const error_tracing: ?bool = if (optimize == .ReleaseSmall) false else null;
 
+    // Optional Apple Metal GPU backend. Off by default (preserves pure-Zig
+    // path + ReleaseSmall binary size). When on, links Foundation + Metal +
+    // CoreGraphics frameworks and compiles the Objective-C bridge in
+    // src/metal/bridge.m. Requires macOS host.
+    const metal = b.option(bool, "metal", "build with Apple Metal GPU backend (macOS only)") orelse false;
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "metal", metal);
+
     const mod = b.addModule("vantablack", .{
         .root_source_file = b.path("src/vantablack.zig"),
         .target = target,
@@ -21,6 +30,7 @@ pub fn build(b: *std.Build) void {
         .omit_frame_pointer = omit_frame_pointer,
         .error_tracing = error_tracing,
     });
+    mod.addOptions("build_options", build_options);
 
     const exe = b.addExecutable(.{
         .name = "vantablack",
@@ -37,6 +47,10 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.root_module.addOptions("build_options", build_options);
+    if (metal) {
+        attachMetal(b, exe.root_module);
+    }
 
     b.installArtifact(exe);
 
@@ -57,4 +71,20 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+}
+
+fn attachMetal(b: *std.Build, mod: *std.Build.Module) void {
+    mod.link_libc = true; // Obj-C runtime needs libc
+    mod.linkFramework("Foundation", .{});
+    mod.linkFramework("Metal", .{});
+    mod.linkFramework("CoreGraphics", .{});
+    mod.addCSourceFile(.{
+        .file = b.path("src/metal/bridge.m"),
+        .flags = &.{
+            "-fobjc-arc",
+            "-Wall",
+            "-Wextra",
+        },
+        .language = .objective_c,
+    });
 }

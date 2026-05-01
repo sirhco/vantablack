@@ -13,9 +13,12 @@ pub const sampler = @import("runtime/sampler.zig");
 pub const pool = @import("runtime/pool.zig");
 pub const chat_template = @import("runtime/chat_template.zig");
 pub const server = @import("runtime/server.zig");
+pub const metal = @import("metal/bridge.zig");
+pub const metal_backend = @import("runtime/metal_backend.zig");
 
 pub const ThreadPool = pool.ThreadPool;
 pub const Server = server.Server;
+pub const MetalBackend = metal_backend.MetalBackend;
 
 pub const Tokenizer = tokenizer.Tokenizer;
 pub const Sampler = sampler.Sampler;

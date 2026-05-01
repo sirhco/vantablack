@@ -29,6 +29,8 @@ const sampler_mod = @import("sampler.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const pool_mod = @import("pool.zig");
 const chat_template = @import("chat_template.zig");
+const metal_backend_mod = @import("metal_backend.zig");
+const metal_bridge = @import("../metal/bridge.zig");
 
 const ModelMapper = mapper_mod.ModelMapper;
 const Model = model_mod.Model;
@@ -36,6 +38,7 @@ const KvCache = kv_cache_mod.KvCache;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const Sampler = sampler_mod.Sampler;
 const ThreadPool = pool_mod.ThreadPool;
+const MetalBackend = metal_backend_mod.MetalBackend;
 
 const max_body_bytes: usize = 1 * 1024 * 1024; // 1 MB request body cap
 const created_at_placeholder: []const u8 = "1970-01-01T00:00:00Z";
@@ -51,6 +54,8 @@ pub const Config = struct {
     /// to favour deterministic code generation.
     default_sampler: sampler_mod.Config = .{},
     default_num_predict: u32 = 256,
+    /// Worker thread count. 0 = autodetect (~half of cpu cores).
+    threads: usize = 0,
 };
 
 pub const Server = struct {
@@ -63,11 +68,16 @@ pub const Server = struct {
     cache: KvCache,
     tok: Tokenizer,
     pool: *ThreadPool,
+    metal: ?MetalBackend,
     /// Mutex serializes the inference path. tryLock + spinLoopHint, same
     /// pattern as `runtime/pool.zig`.
     inference_mu: std.atomic.Value(u8),
     /// Stat'd once at init, returned in /api/tags.
     model_size_bytes: u64,
+
+    fn metal_ptr(self: *Server) ?*MetalBackend {
+        return if (self.metal != null) &self.metal.? else null;
+    }
 
     pub fn init(
         gpa: Allocator,
@@ -93,7 +103,15 @@ pub const Server = struct {
         var tok = try Tokenizer.init(gpa, mapper.catalog);
         errdefer tok.deinit(gpa);
 
-        const pool = try ThreadPool.init(gpa, 0);
+        const maybe_metal: ?MetalBackend = blk: {
+            if (!metal_bridge.metal_enabled) break :blk null;
+            const mb = MetalBackend.init(gpa, mapper, model.config) catch break :blk null;
+            break :blk mb;
+        };
+        // When Metal handles matmuls, CPU workers just spin on GPU sync.
+        // Default to 1 thread in that case.
+        const effective_threads = if (maybe_metal != null and cfg.threads == 0) @as(usize, 1) else cfg.threads;
+        const pool = try ThreadPool.init(gpa, effective_threads);
         errdefer pool.deinit(gpa);
 
         // Best-effort stat for model size; ignore errors and report 0.
@@ -113,12 +131,14 @@ pub const Server = struct {
             .cache = cache,
             .tok = tok,
             .pool = pool,
+            .metal = maybe_metal,
             .inference_mu = .init(0),
             .model_size_bytes = model_size,
         };
     }
 
     pub fn deinit(self: *Server) void {
+        if (self.metal) |*mb| mb.deinit();
         self.pool.deinit(self.gpa);
         self.tok.deinit(self.gpa);
         self.cache.deinit(self.gpa);
@@ -354,7 +374,7 @@ pub const Server = struct {
 
         // Feed prompt (no streaming back per Ollama convention).
         for (prompt_ids) |id| {
-            try forward_mod.step(&self.model, &self.state, &self.cache, self.pool, id);
+            try forward_mod.step(&self.model, &self.state, &self.cache, self.pool, self.metal_ptr(), id);
         }
 
         if (stream_mode) {
@@ -387,7 +407,7 @@ pub const Server = struct {
             if (next == self.tok.eos) break;
             try writeChunk(w, self.cfg.model_name, mode, false, try decodeOne(self.tok, a, next));
             try body_writer.flush();
-            try forward_mod.step(&self.model, &self.state, &self.cache, self.pool, next);
+            try forward_mod.step(&self.model, &self.state, &self.cache, self.pool, self.metal_ptr(), next);
             next = sampler.sample(self.state.logits);
         }
         try writeChunk(w, self.cfg.model_name, mode, true, "");
@@ -411,7 +431,7 @@ pub const Server = struct {
             if (next == self.tok.eos) break;
             const piece = try decodeOne(self.tok, a, next);
             try collected.appendSlice(a, piece);
-            try forward_mod.step(&self.model, &self.state, &self.cache, self.pool, next);
+            try forward_mod.step(&self.model, &self.state, &self.cache, self.pool, self.metal_ptr(), next);
             next = sampler.sample(self.state.logits);
         }
 

@@ -29,14 +29,21 @@ pub const ThreadPool = struct {
     job: std.atomic.Value(?*Job) align(64),
     shutdown: std.atomic.Value(bool),
 
+    /// `requested == 0` triggers autodetect: defaults to roughly the number of
+    /// performance cores. On Apple Silicon this avoids burning the
+    /// efficiency cores (which are ~5x slower per watt at matmul) and cuts
+    /// total CPU usage roughly in half versus pinning every logical CPU.
+    /// Caller can pass an explicit count to override.
     pub fn init(allocator: Allocator, requested: usize) !*ThreadPool {
         const n_workers = blk: {
             if (builtin.single_threaded) break :blk 1;
-            const n = if (requested == 0)
-                std.Thread.getCpuCount() catch 1
-            else
-                requested;
-            break :blk @max(n, 1);
+            if (requested != 0) break :blk @max(requested, 1);
+            const total = std.Thread.getCpuCount() catch 1;
+            // Heuristic: assume ~half are perf cores. M1/M2/M3 typically have
+            // 4 efficiency cores so this maps cleanly. Hosts with no e-cores
+            // (Intel, AMD) get capped at half their logical CPUs which favours
+            // power+thermal headroom for other work; override with --threads.
+            break :blk @max(1, (total + 1) / 2);
         };
 
         const self = try allocator.create(ThreadPool);
@@ -94,10 +101,18 @@ pub const ThreadPool = struct {
     }
 };
 
+/// After this many spin iterations without seeing a new epoch, the worker
+/// yields to the scheduler. Pure spinning would pin every CPU at ~100%
+/// even when the pool is idle (server mode between requests). Yielding
+/// preserves wake-up latency in the hot path while letting the OS reclaim
+/// the CPU when no work is pending.
+const idle_spin_threshold: u32 = 1024;
+
 fn workerLoop(pool: *ThreadPool, worker_id: usize) void {
     var seen_epoch: u64 = 0;
     while (true) {
-        // Spin until a new epoch arrives.
+        // Spin briefly, then yield, until a new epoch arrives.
+        var spins: u32 = 0;
         while (true) {
             const e = pool.epoch.load(.acquire);
             if (e != seen_epoch) {
@@ -105,7 +120,12 @@ fn workerLoop(pool: *ThreadPool, worker_id: usize) void {
                 break;
             }
             if (pool.shutdown.load(.acquire)) return;
-            std.atomic.spinLoopHint();
+            if (spins < idle_spin_threshold) {
+                std.atomic.spinLoopHint();
+                spins += 1;
+            } else {
+                std.Thread.yield() catch {};
+            }
         }
         if (pool.shutdown.load(.acquire)) return;
         const job = pool.job.load(.acquire) orelse continue;
