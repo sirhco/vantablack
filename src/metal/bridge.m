@@ -76,24 +76,25 @@ struct RmsNormParams {
     float eps;
 };
 
-kernel void rmsnorm_inplace(
-    device float        *x       [[buffer(0)]],
-    device const float  *weight  [[buffer(1)]],
-    constant RmsNormParams &p    [[buffer(2)]],
+// Two-buffer RMSNorm: out[i] = (in[i] / rms(in)) * weight[i].
+// Lets the caller chain residual_add(x, …) → rmsnorm(out=xb, in=x) without a
+// memcpy in between. Pass in == out for in-place.
+kernel void rmsnorm(
+    device float        *out     [[buffer(0)]],
+    device const float  *in      [[buffer(1)]],
+    device const float  *weight  [[buffer(2)]],
+    constant RmsNormParams &p    [[buffer(3)]],
     uint                 tid     [[thread_position_in_threadgroup]],
     uint                 ntg     [[threads_per_threadgroup]])
 {
-    // Per-thread partial sum of squares.
     float ss = 0.0;
     for (uint i = tid; i < p.n; i += ntg) {
-        float v = x[i];
+        float v = in[i];
         ss += v * v;
     }
-    // Threadgroup reduce via threadgroup memory.
     threadgroup float scratch[32];
     uint sid = tid % 32;
     uint sgrp = tid / 32;
-    // Simdgroup-level reduce.
     ss = simd_sum(ss);
     if (sid == 0) scratch[sgrp] = ss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -106,7 +107,7 @@ kernel void rmsnorm_inplace(
     float total_ss = scratch[0];
     float inv = rsqrt(total_ss / float(p.n) + p.eps);
     for (uint i = tid; i < p.n; i += ntg) {
-        x[i] = x[i] * inv * weight[i];
+        out[i] = in[i] * inv * weight[i];
     }
 }
 
@@ -215,7 +216,7 @@ VtbMetalCtx *vtb_metal_init(void) {
         // Compile every pipeline up front so subsequent dispatches are pure
         // kernel-launch overhead with no first-use latency.
         NSString *names[] = {
-            @"matmul_q8_0", @"rmsnorm_inplace", @"rope_inplace",
+            @"matmul_q8_0", @"rmsnorm", @"rope_inplace",
             @"swiglu", @"residual_add",
         };
         id<MTLComputePipelineState> psos[5] = {nil, nil, nil, nil, nil};
@@ -399,7 +400,8 @@ void vtb_metal_segment_matmul_q8_0(
 
 void vtb_metal_segment_rmsnorm(
     VtbMetalSeg *seg,
-    VtbMetalBuf *x_buf,
+    VtbMetalBuf *out_buf,
+    VtbMetalBuf *in_buf,
     VtbMetalBuf *weight_buf,
     size_t weight_offset,
     size_t n,
@@ -407,11 +409,11 @@ void vtb_metal_segment_rmsnorm(
 {
     if (!seg) return;
     [seg->enc setComputePipelineState:seg->ctx->pso_rmsnorm];
-    [seg->enc setBuffer:x_buf->buffer offset:0 atIndex:0];
-    [seg->enc setBuffer:weight_buf->buffer offset:weight_offset atIndex:1];
+    [seg->enc setBuffer:out_buf->buffer offset:0 atIndex:0];
+    [seg->enc setBuffer:in_buf->buffer offset:0 atIndex:1];
+    [seg->enc setBuffer:weight_buf->buffer offset:weight_offset atIndex:2];
     struct RmsParams { uint32_t n; float eps; } p = { (uint32_t)n, eps };
-    [seg->enc setBytes:&p length:sizeof(p) atIndex:2];
-    // One threadgroup, sized to a power-of-2 ≤ 1024 ≤ pso max.
+    [seg->enc setBytes:&p length:sizeof(p) atIndex:3];
     NSUInteger tg = 256;
     if (tg > seg->ctx->pso_rmsnorm.maxTotalThreadsPerThreadgroup)
         tg = seg->ctx->pso_rmsnorm.maxTotalThreadsPerThreadgroup;

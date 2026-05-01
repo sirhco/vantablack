@@ -79,7 +79,8 @@ void vtb_metal_segment_matmul_q8_0(
 
 void vtb_metal_segment_rmsnorm(
     VtbMetalSeg *seg,
-    VtbMetalBuf *x_buf,
+    VtbMetalBuf *out_buf,
+    VtbMetalBuf *in_buf,
     VtbMetalBuf *weight_buf,
     size_t weight_offset,
     size_t n,

@@ -125,84 +125,185 @@ pub fn step(
     // Embed.
     try gatherEmbedding(state.x, m.token_embd, token_id, c.dim);
 
-    const kv_dim = c.n_kv_heads * c.head_dim;
-    const head_dim_f: f32 = @floatFromInt(c.head_dim);
-    const inv_sqrt_hd: f32 = 1.0 / @sqrt(head_dim_f);
+    // GPU fast path: per-layer ops are chained into 3 MTLCommandBuffers,
+    // each containing rmsnorm/matmul/rope/swiglu/residual dispatches. CPU
+    // only does KV-cache writes and attention. Fall back to the per-op CPU
+    // path when the model uses non-Q8_0 projections or non-f32 norms.
+    const gpu_ready: ?*MetalBackend = blk: {
+        if (metal) |mb| if (modelGpuEligible(m)) break :blk mb;
+        break :blk null;
+    };
 
     for (m.layers, 0..) |layer, l| {
-        // Attention RMSNorm.
-        @memcpy(state.xb, state.x);
-        try rmsNormTyped(state.xb, layer.attn_norm, c.rms_eps);
-
-        // QKV projections.
-        try matmulRuntime(pool, metal, state.q, layer.attn_q, state.xb, c.dim, c.dim);
-        try matmulRuntime(pool, metal, state.k_cur, layer.attn_k, state.xb, kv_dim, c.dim);
-        try matmulRuntime(pool, metal, state.v_cur, layer.attn_v, state.xb, kv_dim, c.dim);
-
-        // RoPE on Q (per head) and K (per kv head).
-        for (0..c.n_heads) |h| {
-            math.rope(state.q[h * c.head_dim ..][0..c.head_dim], cache.pos, c.rope_base);
+        if (gpu_ready) |mb| {
+            try gpuLayerStep(mb, layer, state, cache, c, l);
+        } else {
+            try cpuLayerStep(pool, metal, layer, state, cache, c, l);
         }
-        for (0..c.n_kv_heads) |h| {
-            math.rope(state.k_cur[h * c.head_dim ..][0..c.head_dim], cache.pos, c.rope_base);
-        }
-
-        // Write into KV cache and bump pos.
-        @memcpy(cache.keySlot(l), state.k_cur);
-        @memcpy(cache.valueSlot(l), state.v_cur);
-        // Defer cache.advance() until all layers wrote — but pos is shared
-        // across layers for the SAME token, so advance once after the loop.
-
-        // Attention.
-        const seq_len = cache.pos + 1; // includes current
-        const kv_row = c.n_kv_heads * c.head_dim;
-        const k_buf = cache.keysFor(l, seq_len);
-        const v_buf = cache.valuesFor(l, seq_len);
-
-        @memset(state.attn_out, 0);
-        for (0..c.n_heads) |h| {
-            const kv_h = (h * c.n_kv_heads) / c.n_heads; // GQA fan-in
-            const q_h = state.q[h * c.head_dim ..][0..c.head_dim];
-            const scores = state.attn_scores[h * c.max_seq ..][0..seq_len];
-
-            for (0..seq_len) |t| {
-                const k_th = k_buf[t * kv_row + kv_h * c.head_dim ..][0..c.head_dim];
-                var s: f32 = 0;
-                for (q_h, k_th) |qv, kv| s += qv * kv;
-                scores[t] = s * inv_sqrt_hd;
-            }
-            math.softmax(scores);
-
-            // Weighted sum of V into attn_out_h.
-            const out_h = state.attn_out[h * c.head_dim ..][0..c.head_dim];
-            for (0..seq_len) |t| {
-                const v_th = v_buf[t * kv_row + kv_h * c.head_dim ..][0..c.head_dim];
-                const w = scores[t];
-                for (out_h, v_th) |*o, vv| o.* += w * vv;
-            }
-        }
-
-        // Output projection + residual.
-        try matmulRuntime(pool, metal, state.xb2, layer.attn_o, state.attn_out, c.dim, c.dim);
-        math.addInto(state.x, state.xb2);
-
-        // FFN RMSNorm.
-        @memcpy(state.xb, state.x);
-        try rmsNormTyped(state.xb, layer.ffn_norm, c.rms_eps);
-
-        // SwiGLU FFN.
-        try matmulRuntime(pool, metal, state.gate, layer.ffn_gate, state.xb, c.ffn_dim, c.dim);
-        try matmulRuntime(pool, metal, state.up, layer.ffn_up, state.xb, c.ffn_dim, c.dim);
-        math.swiglu(state.gate, state.up);
-        try matmulRuntime(pool, metal, state.ffn_out, layer.ffn_down, state.gate, c.dim, c.ffn_dim);
-        math.addInto(state.x, state.ffn_out);
     }
 
     cache.advance();
 
-    // Final norm + LM head.
-    try rmsNormTyped(state.x, m.output_norm, c.rms_eps);
-    try matmulRuntime(pool, metal, state.logits, m.output_w, state.x, c.vocab_size, c.dim);
+    if (gpu_ready) |mb| {
+        try gpuFinalStep(mb, m, c);
+    } else {
+        try rmsNormTyped(state.x, m.output_norm, c.rms_eps);
+        try matmulRuntime(pool, metal, state.logits, m.output_w, state.x, c.vocab_size, c.dim);
+    }
+}
+
+fn cpuAttention(state: *State, cache: *KvCache, c: model_mod.LlamaConfig, l: usize) void {
+    const head_dim_f: f32 = @floatFromInt(c.head_dim);
+    const inv_sqrt_hd: f32 = 1.0 / @sqrt(head_dim_f);
+    const seq_len = cache.pos + 1;
+    const kv_row = c.n_kv_heads * c.head_dim;
+    const k_buf = cache.keysFor(l, seq_len);
+    const v_buf = cache.valuesFor(l, seq_len);
+
+    @memset(state.attn_out, 0);
+    for (0..c.n_heads) |h| {
+        const kv_h = (h * c.n_kv_heads) / c.n_heads; // GQA fan-in
+        const q_h = state.q[h * c.head_dim ..][0..c.head_dim];
+        const scores = state.attn_scores[h * c.max_seq ..][0..seq_len];
+
+        for (0..seq_len) |t| {
+            const k_th = k_buf[t * kv_row + kv_h * c.head_dim ..][0..c.head_dim];
+            var s: f32 = 0;
+            for (q_h, k_th) |qv, kv| s += qv * kv;
+            scores[t] = s * inv_sqrt_hd;
+        }
+        math.softmax(scores);
+
+        const out_h = state.attn_out[h * c.head_dim ..][0..c.head_dim];
+        for (0..seq_len) |t| {
+            const v_th = v_buf[t * kv_row + kv_h * c.head_dim ..][0..c.head_dim];
+            const w = scores[t];
+            for (out_h, v_th) |*o, vv| o.* += w * vv;
+        }
+    }
+}
+
+fn cpuLayerStep(
+    pool: *ThreadPool,
+    metal: ?*MetalBackend,
+    layer: model_mod.LayerWeights,
+    state: *State,
+    cache: *KvCache,
+    c: model_mod.LlamaConfig,
+    l: usize,
+) StepError!void {
+    const kv_dim = c.n_kv_heads * c.head_dim;
+
+    // Attention RMSNorm.
+    @memcpy(state.xb, state.x);
+    try rmsNormTyped(state.xb, layer.attn_norm, c.rms_eps);
+
+    // QKV projections.
+    try matmulRuntime(pool, metal, state.q, layer.attn_q, state.xb, c.dim, c.dim);
+    try matmulRuntime(pool, metal, state.k_cur, layer.attn_k, state.xb, kv_dim, c.dim);
+    try matmulRuntime(pool, metal, state.v_cur, layer.attn_v, state.xb, kv_dim, c.dim);
+
+    // RoPE on Q (per head) and K (per kv head).
+    for (0..c.n_heads) |h| {
+        math.rope(state.q[h * c.head_dim ..][0..c.head_dim], cache.pos, c.rope_base);
+    }
+    for (0..c.n_kv_heads) |h| {
+        math.rope(state.k_cur[h * c.head_dim ..][0..c.head_dim], cache.pos, c.rope_base);
+    }
+
+    // KV cache write + attention.
+    @memcpy(cache.keySlot(l), state.k_cur);
+    @memcpy(cache.valueSlot(l), state.v_cur);
+    cpuAttention(state, cache, c, l);
+
+    // Output projection + residual.
+    try matmulRuntime(pool, metal, state.xb2, layer.attn_o, state.attn_out, c.dim, c.dim);
+    math.addInto(state.x, state.xb2);
+
+    // FFN RMSNorm + SwiGLU.
+    @memcpy(state.xb, state.x);
+    try rmsNormTyped(state.xb, layer.ffn_norm, c.rms_eps);
+    try matmulRuntime(pool, metal, state.gate, layer.ffn_gate, state.xb, c.ffn_dim, c.dim);
+    try matmulRuntime(pool, metal, state.up, layer.ffn_up, state.xb, c.ffn_dim, c.dim);
+    math.swiglu(state.gate, state.up);
+    try matmulRuntime(pool, metal, state.ffn_out, layer.ffn_down, state.gate, c.dim, c.ffn_dim);
+    math.addInto(state.x, state.ffn_out);
+}
+
+fn modelGpuEligible(m: *const Model) bool {
+    if (m.output_norm.ggml_type != .f32) return false;
+    if (m.output_w.ggml_type != .q8_0) return false;
+    for (m.layers) |lw| {
+        if (lw.attn_norm.ggml_type != .f32) return false;
+        if (lw.ffn_norm.ggml_type != .f32) return false;
+        const projs = [_]parser.GgmlType{
+            lw.attn_q.ggml_type,    lw.attn_k.ggml_type,
+            lw.attn_v.ggml_type,    lw.attn_o.ggml_type,
+            lw.ffn_gate.ggml_type,  lw.ffn_up.ggml_type,
+            lw.ffn_down.ggml_type,
+        };
+        for (projs) |p| if (p != .q8_0) return false;
+    }
+    return true;
+}
+
+fn gpuLayerStep(
+    mb: *MetalBackend,
+    layer: model_mod.LayerWeights,
+    state: *State,
+    cache: *KvCache,
+    c: model_mod.LlamaConfig,
+    l: usize,
+) StepError!void {
+    const kv_dim = c.n_kv_heads * c.head_dim;
+
+    // Two segments per layer: pre-attn (rmsnorm + QKV + RoPE) and the rest
+    // (O + residual + ffn_rmsnorm + gate/up + SwiGLU + ffn_down + residual).
+    // The CPU island between them is KV write + scalar attention; everything
+    // else is GPU-side, chained on a single MTLCommandBuffer with implicit
+    // serial barriers between dispatches. Two-buffer rmsnorm reads from one
+    // buffer and writes to another so we don't need a CPU memcpy to stage.
+
+    // Segment 1: attn_rmsnorm(xb ← x), Q/K/V matmul, RoPE on Q,K.
+    {
+        const seg = mb.dev.segmentBegin() catch return error.UnsupportedWeightType;
+        seg.rmsnorm(mb.xb.buf, mb.x.buf, mb.weights_buf, mb.weightOffset(layer.attn_norm.bytes), c.dim, c.rms_eps);
+        seg.matmulQ8_0(mb.q.buf, mb.weights_buf, mb.weightOffset(layer.attn_q.bytes), mb.xb.buf, c.dim, c.dim);
+        seg.matmulQ8_0(mb.k_cur.buf, mb.weights_buf, mb.weightOffset(layer.attn_k.bytes), mb.xb.buf, kv_dim, c.dim);
+        seg.matmulQ8_0(mb.v_cur.buf, mb.weights_buf, mb.weightOffset(layer.attn_v.bytes), mb.xb.buf, kv_dim, c.dim);
+        seg.rope(mb.q.buf, c.n_heads, c.head_dim, cache.pos, c.rope_base);
+        seg.rope(mb.k_cur.buf, c.n_kv_heads, c.head_dim, cache.pos, c.rope_base);
+        seg.commit() catch return error.UnsupportedWeightType;
+    }
+
+    // CPU island: KV cache write + scalar causal attention. Reads q/k_cur/
+    // v_cur straight out of shared-storage MTLBuffers; no dequant/copy.
+    @memcpy(cache.keySlot(l), state.k_cur);
+    @memcpy(cache.valueSlot(l), state.v_cur);
+    cpuAttention(state, cache, c, l);
+
+    // Segment 2: O matmul → attn residual → ffn_rmsnorm(xb ← x) → gate/up →
+    // SwiGLU → ffn_down → ffn residual. One MTLCommandBuffer for the whole
+    // back half of the layer.
+    {
+        const seg = mb.dev.segmentBegin() catch return error.UnsupportedWeightType;
+        seg.matmulQ8_0(mb.xb2.buf, mb.weights_buf, mb.weightOffset(layer.attn_o.bytes), mb.attn_out.buf, c.dim, c.dim);
+        seg.residualAdd(mb.x.buf, mb.xb2.buf, c.dim);
+        seg.rmsnorm(mb.xb.buf, mb.x.buf, mb.weights_buf, mb.weightOffset(layer.ffn_norm.bytes), c.dim, c.rms_eps);
+        seg.matmulQ8_0(mb.gate.buf, mb.weights_buf, mb.weightOffset(layer.ffn_gate.bytes), mb.xb.buf, c.ffn_dim, c.dim);
+        seg.matmulQ8_0(mb.up.buf, mb.weights_buf, mb.weightOffset(layer.ffn_up.bytes), mb.xb.buf, c.ffn_dim, c.dim);
+        seg.swiglu(mb.gate.buf, mb.up.buf, c.ffn_dim);
+        seg.matmulQ8_0(mb.ffn_out.buf, mb.weights_buf, mb.weightOffset(layer.ffn_down.bytes), mb.gate.buf, c.dim, c.ffn_dim);
+        seg.residualAdd(mb.x.buf, mb.ffn_out.buf, c.dim);
+        seg.commit() catch return error.UnsupportedWeightType;
+    }
+}
+
+fn gpuFinalStep(mb: *MetalBackend, m: *const Model, c: model_mod.LlamaConfig) StepError!void {
+    const seg = mb.dev.segmentBegin() catch return error.UnsupportedWeightType;
+    seg.rmsnorm(mb.x.buf, mb.x.buf, mb.weights_buf, mb.weightOffset(m.output_norm.bytes), c.dim, c.rms_eps);
+    seg.matmulQ8_0(mb.logits.buf, mb.weights_buf, mb.weightOffset(m.output_w.bytes), mb.x.buf, c.vocab_size, c.dim);
+    seg.commit() catch return error.UnsupportedWeightType;
 }
 
 // -------------------- helpers ---------------------------------------------

@@ -31,7 +31,7 @@ const c_api = if (metal_enabled) struct {
     extern "c" fn vtb_metal_segment_begin(ctx: *Ctx) ?*Seg;
     extern "c" fn vtb_metal_segment_commit(seg: *Seg) c_int;
     extern "c" fn vtb_metal_segment_matmul_q8_0(seg: *Seg, out_buf: *Buf, w_buf: *Buf, w_offset: usize, acts_buf: *Buf, m: usize, k: usize) void;
-    extern "c" fn vtb_metal_segment_rmsnorm(seg: *Seg, x_buf: *Buf, weight_buf: *Buf, weight_offset: usize, n: usize, eps: f32) void;
+    extern "c" fn vtb_metal_segment_rmsnorm(seg: *Seg, out_buf: *Buf, in_buf: *Buf, weight_buf: *Buf, weight_offset: usize, n: usize, eps: f32) void;
     extern "c" fn vtb_metal_segment_rope(seg: *Seg, x_buf: *Buf, n_heads: usize, head_dim: usize, pos: usize, base: f32) void;
     extern "c" fn vtb_metal_segment_swiglu(seg: *Seg, gate_buf: *Buf, up_buf: *Buf, n: usize) void;
     extern "c" fn vtb_metal_segment_residual_add(seg: *Seg, a_buf: *Buf, b_buf: *Buf, n: usize) void;
@@ -57,7 +57,7 @@ const c_api = if (metal_enabled) struct {
         return 1;
     }
     fn vtb_metal_segment_matmul_q8_0(_: *Seg, _: *Buf, _: *Buf, _: usize, _: *Buf, _: usize, _: usize) void {}
-    fn vtb_metal_segment_rmsnorm(_: *Seg, _: *Buf, _: *Buf, _: usize, _: usize, _: f32) void {}
+    fn vtb_metal_segment_rmsnorm(_: *Seg, _: *Buf, _: *Buf, _: *Buf, _: usize, _: usize, _: f32) void {}
     fn vtb_metal_segment_rope(_: *Seg, _: *Buf, _: usize, _: usize, _: usize, _: f32) void {}
     fn vtb_metal_segment_swiglu(_: *Seg, _: *Buf, _: *Buf, _: usize) void {}
     fn vtb_metal_segment_residual_add(_: *Seg, _: *Buf, _: *Buf, _: usize) void {}
@@ -142,8 +142,8 @@ pub const Segment = struct {
     pub fn matmulQ8_0(self: Segment, out_buf: *Buf, w_buf: *Buf, w_offset: usize, acts_buf: *Buf, m: usize, k: usize) void {
         vtb_metal_segment_matmul_q8_0(self.handle, out_buf, w_buf, w_offset, acts_buf, m, k);
     }
-    pub fn rmsnorm(self: Segment, x_buf: *Buf, weight_buf: *Buf, weight_offset: usize, n: usize, eps: f32) void {
-        vtb_metal_segment_rmsnorm(self.handle, x_buf, weight_buf, weight_offset, n, eps);
+    pub fn rmsnorm(self: Segment, out_buf: *Buf, in_buf: *Buf, weight_buf: *Buf, weight_offset: usize, n: usize, eps: f32) void {
+        vtb_metal_segment_rmsnorm(self.handle, out_buf, in_buf, weight_buf, weight_offset, n, eps);
     }
     pub fn rope(self: Segment, x_buf: *Buf, n_heads: usize, head_dim: usize, pos: usize, base: f32) void {
         vtb_metal_segment_rope(self.handle, x_buf, n_heads, head_dim, pos, base);
