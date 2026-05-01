@@ -100,9 +100,19 @@ What ships:
   models stay on the original interleaved-pair `math.rope`; the CLI sets
   the flag automatically based on which loader picked the file.
 - **CLI dispatch** — if the path argument resolves to a directory, runs
-  the HF/MLX path; otherwise runs the GGUF path. Both `prompt` and `chat`
-  subcommands work in either mode; `serve` and `generate` (raw IDs) stay
-  GGUF-only for now.
+  the HF/MLX path; otherwise runs the GGUF path. `prompt`, `chat`, and
+  `serve` all work in either mode (`Server.initFromHf` builds the same
+  Ollama-compatible HTTP server against an `HfBundle`); `generate` (raw
+  token IDs) remains GGUF-only.
+
+  ```sh
+  # MLX HTTP server, Ollama-compatible:
+  vantablack ~/.cache/huggingface/hub/models--mlx-community--<repo>/snapshots/<rev> \
+    serve --host 127.0.0.1 --port 11434
+  # In requests, "model" must match the snapshot directory basename
+  # (the rev hash); switch to a friendlier alias by symlinking the
+  # snapshot dir under a name of your choice.
+  ```
 
 Caveats / not-yet:
 - **MLX 4-bit on GPU**: the MSL kernel `matmul_mlx_q4` is compiled into

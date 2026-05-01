@@ -22,6 +22,8 @@ const net = std.Io.net;
 
 const parser = @import("../core/parser.zig");
 const mapper_mod = @import("../core/mapper.zig");
+const hf_loader_mod = @import("../core/hf_loader.zig");
+const hf_config_mod = @import("../core/hf_config.zig");
 const model_mod = @import("model.zig");
 const forward_mod = @import("forward.zig");
 const kv_cache_mod = @import("kv_cache.zig");
@@ -62,11 +64,17 @@ pub const Server = struct {
     cfg: Config,
     gpa: Allocator,
     io: Io,
-    mapper: *const ModelMapper,
+    /// GGUF mode: borrowed mapper. HF/MLX mode: null.
+    mapper: ?*const ModelMapper,
+    /// HF/MLX mode: heap-owned bundle, freed by `deinit`. GGUF mode: null.
+    bundle: ?*hf_loader_mod.HfBundle,
     model: Model,
     state: forward_mod.State,
     cache: KvCache,
     tok: Tokenizer,
+    /// True when `tok.pieces` were `gpa.dupe`'d (HF tokenizer.json path);
+    /// requires `Tokenizer.deinitOwnedPieces` instead of plain `deinit`.
+    tok_owns_pieces: bool,
     pool: *ThreadPool,
     metal: ?MetalBackend,
     /// Mutex serializes the inference path. tryLock + spinLoopHint, same
@@ -137,12 +145,80 @@ pub const Server = struct {
             .gpa = gpa,
             .io = io,
             .mapper = mapper,
+            .bundle = null,
             .model = model,
             .state = state,
             .cache = cache,
             .tok = tok,
+            .tok_owns_pieces = false,
             .pool = pool,
             .metal = maybe_metal,
+            .inference_mu = .init(0),
+            .model_size_bytes = model_size,
+        };
+    }
+
+    /// Build a `Server` against a HuggingFace / MLX directory bundle. The
+    /// `Server` takes ownership of `bundle_owned` and frees it via `deinit`.
+    /// Metal is **not** wired up for MLX models in this path yet — the GPU
+    /// matmul kernel exists (`bridge.m::matmul_mlx_q4`) but the
+    /// `MetalBackend` plumbing for the 3-buffer layout is the next push.
+    /// Q8_0 GGUF `serve` keeps full GPU acceleration; MLX `serve` is CPU.
+    pub fn initFromHf(
+        gpa: Allocator,
+        io: Io,
+        bundle_owned: *hf_loader_mod.HfBundle,
+        hf_cfg: hf_config_mod.HfConfig,
+        cfg: Config,
+    ) !Server {
+        errdefer {
+            bundle_owned.deinit();
+            gpa.destroy(bundle_owned);
+        }
+
+        var model = try Model.initFromHf(gpa, bundle_owned, hf_cfg);
+        errdefer model.deinit(gpa);
+
+        var state = try forward_mod.State.init(gpa, &model, null);
+        errdefer state.deinit(gpa);
+
+        var cache = try KvCache.init(
+            gpa,
+            model.config.n_layers,
+            model.config.n_kv_heads,
+            model.config.head_dim,
+            model.config.max_seq,
+            null,
+        );
+        errdefer cache.deinit(gpa);
+
+        if (bundle_owned.tokenizer_json == null) return error.MissingTokenizer;
+        var tok = try Tokenizer.initFromHfJson(gpa, bundle_owned.tokenizer_json.?);
+        errdefer tok.deinitOwnedPieces(gpa);
+
+        const pool = try ThreadPool.init(gpa, cfg.threads);
+        errdefer pool.deinit(gpa);
+
+        // model_path may point at a directory; report 0 size if stat fails.
+        const model_size: u64 = blk: {
+            const file = Io.Dir.openFileAbsolute(io, cfg.model_path, .{ .allow_directory = true }) catch break :blk 0;
+            defer file.close(io);
+            break :blk file.length(io) catch 0;
+        };
+
+        return .{
+            .cfg = cfg,
+            .gpa = gpa,
+            .io = io,
+            .mapper = null,
+            .bundle = bundle_owned,
+            .model = model,
+            .state = state,
+            .cache = cache,
+            .tok = tok,
+            .tok_owns_pieces = true,
+            .pool = pool,
+            .metal = null,
             .inference_mu = .init(0),
             .model_size_bytes = model_size,
         };
@@ -151,10 +227,14 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         if (self.metal) |*mb| mb.deinit();
         self.pool.deinit(self.gpa);
-        self.tok.deinit(self.gpa);
+        if (self.tok_owns_pieces) self.tok.deinitOwnedPieces(self.gpa) else self.tok.deinit(self.gpa);
         self.cache.deinit(self.gpa);
         self.state.deinit(self.gpa);
         self.model.deinit(self.gpa);
+        if (self.bundle) |b| {
+            b.deinit();
+            self.gpa.destroy(b);
+        }
         self.* = undefined;
     }
 

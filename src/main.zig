@@ -352,15 +352,19 @@ fn runHfCli(
     out: *Io.Writer,
     err: *Io.Writer,
 ) !void {
-    if (args.len < 3 or !(std.mem.eql(u8, args[2], "prompt") or std.mem.eql(u8, args[2], "chat"))) {
+    if (args.len < 3 or !(std.mem.eql(u8, args[2], "prompt") or std.mem.eql(u8, args[2], "chat") or std.mem.eql(u8, args[2], "serve"))) {
         try err.writeAll(
-            "MLX/HF directory mode supports only:\n" ++
+            "MLX/HF directory mode supports:\n" ++
                 "  vantablack <model_dir> prompt <n> <text>\n" ++
                 "  vantablack <model_dir> chat   <n> <user-message>\n" ++
+                "  vantablack <model_dir> serve  [--host H] [--port P] [--threads N]\n" ++
                 "Sampler flags (--temp / --top-k / --top-p / --seed / --threads / --system) work as in GGUF mode.\n",
         );
         try err.flush();
         return error.MissingArgs;
+    }
+    if (std.mem.eql(u8, args[2], "serve")) {
+        return runHfServe(gpa, arena, io, dir_path, args, err);
     }
     const is_chat = std.mem.eql(u8, args[2], "chat");
 
@@ -465,6 +469,63 @@ fn runHfCli(
     }
     try out.writeByte('\n');
     try out.flush();
+}
+
+fn runHfServe(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: Io,
+    dir_path: []const u8,
+    args: []const []const u8,
+    err: *Io.Writer,
+) !void {
+    var host: []const u8 = "127.0.0.1";
+    var port: u16 = 11434;
+    var threads: usize = 0;
+    var idx: usize = 3;
+    while (idx < args.len) : (idx += 1) {
+        const a = args[idx];
+        if (std.mem.eql(u8, a, "--host")) {
+            idx += 1;
+            host = args[idx];
+        } else if (std.mem.eql(u8, a, "--port")) {
+            idx += 1;
+            port = try std.fmt.parseInt(u16, args[idx], 10);
+        } else if (std.mem.eql(u8, a, "--threads")) {
+            idx += 1;
+            threads = try std.fmt.parseInt(usize, args[idx], 10);
+        } else break;
+    }
+
+    // Heap-allocate the bundle so the Server can own it across its move
+    // out of this stack frame; the bundle's mmap'd shard pointers are what
+    // every TypedTensor inside Model points into.
+    const bundle_ptr = try gpa.create(vantablack.hf_loader.HfBundle);
+    errdefer gpa.destroy(bundle_ptr);
+    bundle_ptr.* = try vantablack.hf_loader.HfBundle.init(gpa, io, dir_path);
+    // Note: on success, ownership transfers into the Server.
+
+    const cfg = try vantablack.hf_config.parse(arena, bundle_ptr.config_json);
+
+    // Use the directory basename as the model name; clients address it via
+    // POST /api/generate {"model": "<basename>"}.
+    const model_name = std.fs.path.basename(dir_path);
+
+    var srv = vantablack.Server.initFromHf(gpa, io, bundle_ptr, cfg, .{
+        .host = host,
+        .port = port,
+        .model_name = model_name,
+        .model_path = dir_path,
+        .threads = threads,
+    }) catch |e| {
+        // initFromHf's errdefer already cleaned the bundle on its error
+        // paths, so just surface and exit.
+        try err.print("vantablack: serve init failed: {t}\n", .{e});
+        try err.flush();
+        return e;
+    };
+    defer srv.deinit();
+    try srv.run();
 }
 
 test "simple test" {
