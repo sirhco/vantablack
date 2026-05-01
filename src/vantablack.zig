@@ -2,9 +2,12 @@
 
 pub const mapper = @import("core/mapper.zig");
 pub const parser = @import("core/parser.zig");
+pub const safetensors = @import("core/safetensors.zig");
+pub const hf_config = @import("core/hf_config.zig");
 pub const kernels = @import("kernels/comptime_gen.zig");
 pub const simd = @import("kernels/simd.zig");
 pub const math = @import("kernels/math.zig");
+pub const mlx = @import("kernels/mlx.zig");
 pub const kv_cache = @import("runtime/kv_cache.zig");
 pub const model = @import("runtime/model.zig");
 pub const forward = @import("runtime/forward.zig");

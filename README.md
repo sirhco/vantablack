@@ -34,7 +34,10 @@ tax, no framework tax. Just weights and math.
 | Apple Metal GPU backend (full forward — see below)      | shipped (opt-in `-Dmetal=true`) |
 | Q8_0 / Q4_K / Q5_K / Q6_K / F32 / F16                   | shipped              |
 | TQ2_0 (1.58-bit ternary) plumbed                        | dequant + matmul written, untested on real model |
-| Safetensors loader                                      | not yet              |
+| Safetensors v1 mmap parser                              | shipped              |
+| HuggingFace `config.json` → `LlamaConfig` adapter       | shipped              |
+| MLX 4-bit quant CPU kernels (dequant + GEMV)            | shipped              |
+| MLX model end-to-end (loader + tokenizer + forward)     | foundation only — see below |
 | Vulkan / cross-vendor GPU                               | not yet              |
 | Prompt prefill batching                                 | not yet              |
 
@@ -52,6 +55,35 @@ criteria fall back to the per-op path (CPU + GPU Q8_0 matmul only).
 **Verified end-to-end** on TinyLlama-1.1B-Chat-v1.0 GGUF Q8_0, Q4_K_M, Q4_K_S
 (ReleaseFast, macOS arm64). Coherent text generation, canonical SentencePiece
 tokenization, EOS-correct chat-template completions.
+
+### MLX-format models — foundation status
+
+MLX (Apple's array framework) ships Llama-architecture models as a directory
+of `*.safetensors` shards + `config.json` + `tokenizer.{model,json}`, with
+weights packed in MLX's own 4-bit / 8-bit affine block-quant format
+(`mlx_lm.utils.quantize`). vantablack is being extended to load these
+natively so users on Apple Silicon can run mlx-community models without a
+GGUF conversion step.
+
+Shipped in this tree (covered by 9 unit tests):
+- `core/safetensors.zig` — single-file safetensors v1 parser; mmap-friendly,
+  zero-copy descriptor extraction.
+- `core/hf_config.zig` — `config.json` → typed config struct (incl. the
+  `quantization: {bits, group_size}` block written by `mlx_lm`).
+- `kernels/mlx.zig` — MLX 4-bit row dequant + GEMV (CPU baseline).
+
+Still required for end-to-end MLX inference (separate sessions):
+- Multi-shard safetensors loader (`model.safetensors.index.json`).
+- `TypedTensor` refactor to carry the 3-buffer (weight + scales + biases)
+  layout MLX needs alongside the existing single-buffer GGUF tensors.
+- HF tensor-name → vantablack layer-binding remap
+  (`model.layers.{i}.self_attn.q_proj.weight` → `attn_q`, etc.).
+- CLI detection: directory path → MLX loader, file path → GGUF loader.
+- Tokenizer: many MLX llama checkpoints bundle `tokenizer.model`
+  (SentencePiece) alongside `tokenizer.json` — the existing SP encoder
+  works directly. Models that ship only `tokenizer.json` will need an HF
+  tokenizers.json reader.
+- MLX 4-bit Metal kernel for the GPU path (CPU kernel ships now).
 
 ---
 
@@ -182,10 +214,13 @@ src/
 ├── vantablack.zig            public module index (re-exports)
 ├── core/
 │   ├── mapper.zig            ModelMapper: open + std.posix.mmap + catalog
-│   └── parser.zig            GGUF v2/v3 parser, MetaValue union, BlockInfo table
+│   ├── parser.zig            GGUF v2/v3 parser, MetaValue union, BlockInfo table
+│   ├── safetensors.zig       safetensors v1 parser (mmap-friendly, zero-copy descriptors)
+│   └── hf_config.zig         HuggingFace config.json → struct adapter (incl. MLX `quantization` block)
 ├── kernels/
 │   ├── simd.zig              real Q8_0/Q4_K/Q5_K/Q6_K/TQ2_0/F16/F32 dequant + matmul
 │   ├── math.zig              RMSNorm / RoPE / softmax / SwiGLU / argmax
+│   ├── mlx.zig               MLX 4-bit quant dequant + GEMV (CPU baseline)
 │   └── comptime_gen.zig      QuantType + Kernel + dispatch(comptime q)
 ├── metal/                    only compiled with -Dmetal=true
 │   ├── bridge.h              flat C ABI for the Zig side
@@ -489,6 +524,14 @@ root cause: pure CPU matmul saturates every core. The fixes:
 11. **Prompt prefill batching** — *planned*. Process N prompt tokens in
     one forward pass. Big speedup on long prompts (no effect on per-token
     decode rate).
+12. **MLX model loader (full integration)** — *partially shipped*. See the
+    "MLX-format models" section in Status: parser + config adapter + 4-bit
+    CPU kernel are in. Remaining work is the multi-shard loader, the
+    `TypedTensor` 3-buffer refactor, the HF tensor-name remap, and the
+    Metal kernel for the GPU path. Models from `mlx-community/*` that
+    bundle `tokenizer.model` (SentencePiece) will run end-to-end once
+    those land; models that only ship `tokenizer.json` additionally need
+    an HF tokenizers.json reader.
 12. **Apple AMX matrix coprocessor** — *planned*. M1/M2/M3 ship a hidden
     matrix unit accessible via inline assembly. Pure-Zig + lower power
     than even GPU for some shapes. Useful as a CPU-only fallback path.
