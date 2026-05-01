@@ -9,8 +9,11 @@ pub const kv_cache = @import("runtime/kv_cache.zig");
 pub const model = @import("runtime/model.zig");
 pub const forward = @import("runtime/forward.zig");
 pub const tokenizer = @import("runtime/tokenizer.zig");
+pub const sampler = @import("runtime/sampler.zig");
 
 pub const Tokenizer = tokenizer.Tokenizer;
+pub const Sampler = sampler.Sampler;
+pub const SamplerConfig = sampler.Config;
 
 pub const ModelMapper = mapper.ModelMapper;
 pub const Catalog = parser.Catalog;

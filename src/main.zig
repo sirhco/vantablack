@@ -7,7 +7,13 @@ const usage =
     \\usage:
     \\  vantablack <model.gguf>                              print tensor catalog
     \\  vantablack <model.gguf> generate <n> <id> [id...]    generate n tokens
-    \\                                                       after the given prompt ids
+    \\  vantablack <model.gguf> prompt <n> <text>            encode text, generate n more tokens
+    \\
+    \\generate / prompt accept sampler flags BEFORE the n value:
+    \\  --temp <f>     temperature (0.0 = greedy)
+    \\  --top-k <n>    top-k filter (0 = disabled)
+    \\  --top-p <f>    nucleus filter (0 = disabled)
+    \\  --seed <u64>   RNG seed (default 0)
     \\
 ;
 
@@ -43,16 +49,60 @@ pub fn main(init: std.process.Init) !void {
     var mapper = try vantablack.ModelMapper.init(gpa, io, abs_path);
     defer mapper.deinit();
 
-    if (args.len >= 3 and std.mem.eql(u8, args[2], "generate")) {
-        if (args.len < 5) {
+    if (args.len >= 3 and (std.mem.eql(u8, args[2], "generate") or std.mem.eql(u8, args[2], "prompt"))) {
+        const mode_prompt = std.mem.eql(u8, args[2], "prompt");
+        var cfg: vantablack.SamplerConfig = .{};
+        var idx: usize = 3;
+        while (idx < args.len) {
+            const a = args[idx];
+            if (std.mem.eql(u8, a, "--temp")) {
+                idx += 1;
+                cfg.temperature = try std.fmt.parseFloat(f32, args[idx]);
+            } else if (std.mem.eql(u8, a, "--top-k")) {
+                idx += 1;
+                cfg.top_k = try std.fmt.parseInt(usize, args[idx], 10);
+            } else if (std.mem.eql(u8, a, "--top-p")) {
+                idx += 1;
+                cfg.top_p = try std.fmt.parseFloat(f32, args[idx]);
+            } else if (std.mem.eql(u8, a, "--seed")) {
+                idx += 1;
+                cfg.seed = try std.fmt.parseInt(u64, args[idx], 10);
+            } else break;
+            idx += 1;
+        }
+        if (idx >= args.len) {
             try err.writeAll(usage);
             try err.flush();
             return error.MissingArgs;
         }
-        const n_steps = try std.fmt.parseInt(u32, args[3], 10);
-        const prompt_ids = try arena.alloc(u32, args.len - 4);
-        for (prompt_ids, args[4..]) |*id, s| id.* = try std.fmt.parseInt(u32, s, 10);
-        try generate(gpa, &mapper, n_steps, prompt_ids, out);
+        const n_steps = try std.fmt.parseInt(u32, args[idx], 10);
+        idx += 1;
+        if (idx >= args.len) {
+            try err.writeAll(usage);
+            try err.flush();
+            return error.MissingArgs;
+        }
+
+        const prompt_ids = if (mode_prompt) blk: {
+            var text_buf: std.ArrayList(u8) = .empty;
+            defer text_buf.deinit(arena);
+            for (args[idx..], 0..) |a, i| {
+                if (i != 0) try text_buf.append(arena, ' ');
+                try text_buf.appendSlice(arena, a);
+            }
+            var tok = try vantablack.Tokenizer.init(gpa, mapper.catalog);
+            defer tok.deinit(gpa);
+            const ids = try tok.encode(arena, text_buf.items, true);
+            try out.print("[encoded {d} tokens]\n", .{ids.len});
+            try out.flush();
+            break :blk ids;
+        } else blk: {
+            const ids = try arena.alloc(u32, args.len - idx);
+            for (ids, args[idx..]) |*id, s| id.* = try std.fmt.parseInt(u32, s, 10);
+            break :blk ids;
+        };
+
+        try generate(gpa, &mapper, n_steps, prompt_ids, cfg, out);
     } else {
         try printCatalog(out, arena, mapper.catalog);
     }
@@ -65,6 +115,7 @@ fn generate(
     mapper: *const vantablack.ModelMapper,
     n_steps: u32,
     prompt_ids: []const u32,
+    sampler_cfg: vantablack.SamplerConfig,
     out: *Io.Writer,
 ) !void {
     var model = try vantablack.Model.init(gpa, mapper);
@@ -85,7 +136,9 @@ fn generate(
     var tok = try vantablack.Tokenizer.init(gpa, mapper.catalog);
     defer tok.deinit(gpa);
 
-    // Feed the prompt one token at a time. Decode + print as we go for visibility.
+    var sampler = try vantablack.Sampler.init(gpa, sampler_cfg, model.config.vocab_size);
+    defer sampler.deinit(gpa);
+
     if (prompt_ids.len == 0) return;
     for (prompt_ids) |id| {
         try vantablack.forward.step(&model, &state, &cache, id);
@@ -93,15 +146,14 @@ fn generate(
     }
     try out.flush();
 
-    // Generate n_steps tokens after the prompt, greedy argmax.
     var produced: u32 = 0;
-    var next: u32 = @intCast(vantablack.math.argmax(state.logits));
+    var next: u32 = sampler.sample(state.logits);
     while (produced < n_steps) : (produced += 1) {
         if (next == tok.eos) break;
         try tok.decodeTo(out, next);
         try out.flush();
         try vantablack.forward.step(&model, &state, &cache, next);
-        next = @intCast(vantablack.math.argmax(state.logits));
+        next = sampler.sample(state.logits);
     }
     try out.writeByte('\n');
 }
