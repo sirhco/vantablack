@@ -178,3 +178,66 @@ fn readFile(allocator: Allocator, io: Io, abs_path: []const u8) ![]const u8 {
     }
     return buf;
 }
+
+// -- tests ----------------------------------------------------------------
+
+test "HfBundle: multi-shard tensor lookup spans files" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    // Carve out a temp dir.
+    const cwd_path = try std.process.currentPathAlloc(io, aalloc);
+    const tmp_dir = try std.fs.path.join(aalloc, &.{ cwd_path, "vtb_hf_test" });
+    Io.Dir.cwd().createDirPath(io, "vtb_hf_test") catch |e| switch (e) {
+        else => return e,
+    };
+    defer Io.Dir.cwd().deleteTree(io, "vtb_hf_test") catch {};
+
+    // config.json (HfBundle requires it).
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = "vtb_hf_test/config.json",
+        .data = "{\"model_type\":\"llama\"}",
+    });
+
+    // Two shards: shard A has tensor "a", shard B has tensor "b". Build
+    // each as a synthetic 4-byte-data safetensors file.
+    const shards = [_]struct { name: []const u8, tensor: []const u8 }{
+        .{ .name = "weights.00.safetensors", .tensor = "a" },
+        .{ .name = "weights.01.safetensors", .tensor = "b" },
+    };
+    for (shards) |sh| {
+        var json_buf: [256]u8 = undefined;
+        const json = try std.fmt.bufPrint(
+            &json_buf,
+            "{{\"{s}\":{{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}}}",
+            .{sh.tensor},
+        );
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(aalloc);
+        var hdr: [8]u8 = undefined;
+        std.mem.writeInt(u64, &hdr, json.len, .little);
+        try bytes.appendSlice(aalloc, &hdr);
+        try bytes.appendSlice(aalloc, json);
+        // 4 bytes of distinguishable data per shard.
+        try bytes.appendNTimes(aalloc, sh.tensor[0], 4);
+
+        var path_buf: [128]u8 = undefined;
+        const sub = try std.fmt.bufPrint(&path_buf, "vtb_hf_test/{s}", .{sh.name});
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = sub, .data = bytes.items });
+    }
+
+    var bundle = try HfBundle.init(gpa, io, tmp_dir);
+    defer bundle.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), bundle.shards.len);
+    const a = bundle.tensorBytes("a") orelse return error.TensorNotFound;
+    const b = bundle.tensorBytes("b") orelse return error.TensorNotFound;
+    try std.testing.expectEqual(@as(usize, 4), a.len);
+    try std.testing.expectEqual(@as(usize, 4), b.len);
+    try std.testing.expectEqual(@as(u8, 'a'), a[0]);
+    try std.testing.expectEqual(@as(u8, 'b'), b[0]);
+}

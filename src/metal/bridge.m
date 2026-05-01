@@ -177,6 +177,88 @@ kernel void residual_add(
     a[gid] = a[gid] + b[gid];
 }
 
+// MLX 4-bit affine block-quant matmul (GEMV). Mirrors the layout produced
+// by `mlx_lm.utils.quantize` with bits=4, group_size ∈ {64, 128}. Three
+// device buffers per layer: packed weights (U32, 8 nibbles each), scales
+// and biases (F16 or BF16, one entry per group). One thread per output row.
+// Dequant happens implicitly inside the inner loop:
+//   total = Σ_g (scale_g * Σ_{c in group_g} q[c] * x[c]
+//             + bias_g  * Σ_{c in group_g}        x[c])
+//
+// `scale_dtype_is_bf16` lets the same kernel cover both BF16 (modern MLX)
+// and F16 (legacy) scales/biases.
+
+struct MlxQ4Params {
+    uint m;
+    uint k;
+    uint w_offset_bytes;        // packed weight offset
+    uint scales_offset_bytes;
+    uint biases_offset_bytes;
+    uint group_size;
+    uint scale_dtype_is_bf16;   // 0 = f16, 1 = bf16
+};
+
+inline float bf16_to_f32(ushort bits) {
+    uint w = ((uint)bits) << 16;
+    return as_type<float>(w);
+}
+
+inline float scale_load(device const ushort *p, uint i, bool is_bf16) {
+    ushort bits = p[i];
+    if (is_bf16) return bf16_to_f32(bits);
+    half h = as_type<half>(bits);
+    return (float)h;
+}
+
+kernel void matmul_mlx_q4(
+    device float          *out     [[buffer(0)]],
+    device const uchar    *weights [[buffer(1)]],
+    device const uchar    *scales  [[buffer(2)]],
+    device const uchar    *biases  [[buffer(3)]],
+    device const float    *acts    [[buffer(4)]],
+    constant MlxQ4Params  &p       [[buffer(5)]],
+    uint                   gid     [[thread_position_in_grid]])
+{
+    if (gid >= p.m) return;
+
+    bool is_bf16 = (p.scale_dtype_is_bf16 != 0);
+    uint groups_per_row = p.k / p.group_size;
+    uint u32_per_row = p.k / 8;            // 8 nibbles per u32 for 4-bit
+    uint weight_row_bytes = u32_per_row * 4;
+    uint scale_row_bytes = groups_per_row * 2;
+
+    device const uchar *w_row = weights + p.w_offset_bytes + gid * weight_row_bytes;
+    device const ushort *s_row = (device const ushort *)(scales + p.scales_offset_bytes + gid * scale_row_bytes);
+    device const ushort *b_row = (device const ushort *)(biases + p.biases_offset_bytes + gid * scale_row_bytes);
+
+    float total = 0.0;
+    uint col = 0;
+    for (uint g = 0; g < groups_per_row; ++g) {
+        float scale = scale_load(s_row, g, is_bf16);
+        float bias = scale_load(b_row, g, is_bf16);
+        float q_dot = 0.0;
+        float x_sum = 0.0;
+        uint end = col + p.group_size;
+        for (uint c = col; c < end; c += 8) {
+            // (c / 8) * 4 is always 4-byte aligned, so a plain `uint *`
+            // load is valid even though the underlying buffer has no
+            // higher alignment guarantee.
+            device const uint *wp = (device const uint *)(w_row + (c / 8) * 4);
+            uint word = wp[0];
+            for (uint i = 0; i < 8; ++i) {
+                uint q = (word >> (i * 4)) & 0xF;
+                float xv = acts[c + i];
+                q_dot = fma((float)q, xv, q_dot);
+                x_sum += xv;
+            }
+        }
+        total = fma(scale, q_dot, total);
+        total = fma(bias, x_sum, total);
+        col = end;
+    }
+    out[gid] = total;
+}
+
 // Plain f32 copy. Caller binds dst+offset and src+offset; kernel just writes
 // p.n contiguous floats from src to dst. Used to splice the just-computed
 // k_cur / v_cur into the right slot in the persistent KV cache.
@@ -321,6 +403,7 @@ struct VtbMetalCtx {
     id<MTLComputePipelineState> pso_attn_scores;
     id<MTLComputePipelineState> pso_softmax;
     id<MTLComputePipelineState> pso_attn_weighted;
+    id<MTLComputePipelineState> pso_mlx_q4;
 };
 
 struct VtbMetalBuf {
@@ -357,9 +440,10 @@ VtbMetalCtx *vtb_metal_init(void) {
             @"matmul_q8_0", @"rmsnorm", @"rope_inplace",
             @"swiglu", @"residual_add", @"copy_f32",
             @"attn_scores", @"softmax_rows", @"attn_weighted_sum",
+            @"matmul_mlx_q4",
         };
         const int n_psos = sizeof(names) / sizeof(names[0]);
-        id<MTLComputePipelineState> psos[9] = {nil};
+        id<MTLComputePipelineState> psos[10] = {nil};
         for (int i = 0; i < n_psos; i++) {
             id<MTLFunction> fn = [library newFunctionWithName:names[i]];
             if (!fn) {
@@ -387,6 +471,7 @@ VtbMetalCtx *vtb_metal_init(void) {
         ctx->pso_attn_scores = psos[6];
         ctx->pso_softmax = psos[7];
         ctx->pso_attn_weighted = psos[8];
+        ctx->pso_mlx_q4 = psos[9];
         return ctx;
     }
 }
@@ -405,6 +490,7 @@ void vtb_metal_destroy(VtbMetalCtx *ctx) {
     ctx->pso_attn_scores = nil;
     ctx->pso_softmax = nil;
     ctx->pso_attn_weighted = nil;
+    ctx->pso_mlx_q4 = nil;
     free(ctx);
 }
 

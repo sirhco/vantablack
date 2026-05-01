@@ -359,13 +359,13 @@ fn matmulRuntime(
 ) StepError!void {
     const q = w.quant;
 
-    // MLX-Q4: 3-buffer kernel, CPU only for now.
+    // MLX-Q4: 3-buffer kernel, CPU only for now. bits/group_size from aux.
     if (q == .mlx_q4) {
         const aux = w.mlx orelse return error.UnsupportedWeightType;
-        @import("../kernels/mlx.zig").matmulQ4(
+        @import("../kernels/mlx.zig").matmul(
             out, w.bytes, aux.scales, aux.biases, acts,
-            m, k, aux.group_size, aux.scale_dtype,
-        );
+            m, k, aux.bits, aux.group_size, aux.scale_dtype,
+        ) catch return error.UnsupportedWeightType;
         return;
     }
 
@@ -438,10 +438,9 @@ fn dequantToF32(out: []f32, w: TypedTensor, n: usize) StepError!void {
         },
         .mlx_q4 => {
             const aux = w.mlx orelse return error.UnsupportedWeightType;
-            // Single-row dequant: norms and embedding rows are k entries each.
-            @import("../kernels/mlx.zig").dequantRowQ4(
-                out[0..n], w.bytes, aux.scales, aux.biases, aux.group_size, aux.scale_dtype,
-            );
+            @import("../kernels/mlx.zig").dequantRowDispatch(
+                out[0..n], w.bytes, aux.scales, aux.biases, aux.bits, aux.group_size, aux.scale_dtype,
+            ) catch return error.UnsupportedWeightType;
         },
         .q8_0 => {
             std.debug.assert(n % simd.q8_0_block_elems == 0);
@@ -510,14 +509,17 @@ fn gatherEmbedding(out: []f32, table: TypedTensor, id: u32, dim: usize) StepErro
             // (out_features rows × in_features quant cols), so reuse the
             // single-row dequant for row `id`.
             const aux = table.mlx orelse return error.UnsupportedWeightType;
-            const u32_per_row = dim / 8;
+            const el_per_int: usize = 32 / aux.bits;
+            const u32_per_row = dim / el_per_int;
             const row_bytes = u32_per_row * 4;
             const groups_per_row = dim / aux.group_size;
             const scale_row_bytes = groups_per_row * 2;
             const w_row = table.bytes[id_us * row_bytes ..][0..row_bytes];
             const s_row = aux.scales[id_us * scale_row_bytes ..][0..scale_row_bytes];
             const b_row = aux.biases[id_us * scale_row_bytes ..][0..scale_row_bytes];
-            @import("../kernels/mlx.zig").dequantRowQ4(out, w_row, s_row, b_row, aux.group_size, aux.scale_dtype);
+            @import("../kernels/mlx.zig").dequantRowDispatch(
+                out, w_row, s_row, b_row, aux.bits, aux.group_size, aux.scale_dtype,
+            ) catch return error.UnsupportedWeightType;
             return;
         },
         .f32 => {

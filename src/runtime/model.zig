@@ -272,7 +272,7 @@ fn fetchHfLinear(
     const w_loc = bundle.find(w_name) orelse return error.MissingTensor;
     const w_bytes = bundle.tensorBytes(w_name) orelse return error.MissingTensor;
 
-    if (cfg.quantization) |qcfg| if (qcfg.bits == 4) {
+    if (cfg.quantization) |qcfg| if (qcfg.bits == 2 or qcfg.bits == 3 or qcfg.bits == 4 or qcfg.bits == 5 or qcfg.bits == 6 or qcfg.bits == 8) {
         // Try scales/biases. mlx_lm leaves embedding (and sometimes lm_head)
         // unquantized, so missing scales just means "fall through to plain
         // dense" rather than a hard error.

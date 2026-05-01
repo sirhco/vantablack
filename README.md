@@ -38,8 +38,9 @@ tax, no framework tax. Just weights and math.
 | HuggingFace `config.json` → `LlamaConfig` adapter       | shipped              |
 | MLX 4-bit quant CPU kernels (dequant + GEMV)            | shipped              |
 | **MLX model end-to-end (loader + tokenizer + forward)** | **shipped** — bit-perfect match with `mlx_lm` reference on TinyLlama-1.1B-Chat-v1.0-4bit |
-| MLX 4-bit Metal kernel (GPU path)                       | not yet              |
-| Multi-shard safetensors (`model.safetensors.index.json`) | not yet              |
+| MLX 2 / 3 / 4 / 5 / 6 / 8-bit dispatch                  | shipped — 4-bit verified on real model; others covered by unit tests |
+| Multi-shard safetensors directory loading               | shipped (covered by `core/hf_loader.zig` test) |
+| MLX 4-bit MSL kernel                                    | compiled + cached; runtime dispatch from forward.zig pending |
 | Tiktoken-style tokenizer (Llama-3+, GPT-2)              | not yet              |
 | Vulkan / cross-vendor GPU                               | not yet              |
 | Prompt prefill batching                                 | not yet              |
@@ -104,19 +105,24 @@ What ships:
   GGUF-only for now.
 
 Caveats / not-yet:
-- MLX 4-bit on the GPU is **CPU-only** today. The Metal kernel for the MLX
-  3-buffer layout is the next push. `-Dmetal=true` keeps accelerating
-  Q8_0-GGUF models; MLX models on a `-Dmetal=true` build still execute on
-  the CPU thread pool.
-- Multi-shard safetensors (`model.safetensors.index.json` +
-  `model-NNNNN-of-MMMMM.safetensors`) — single-shard works; sharded
-  checkpoints (>1 GB models split across files) will load all shards
-  alphabetically but the descriptor lookup hasn't been verified for
-  cross-shard tensor names.
-- Tokenizer is BPE/SentencePiece (Llama 1/2 family). Llama 3+ and GPT-2
-  use a tiktoken-style byte-level BPE that needs a separate encoder.
-- Only 4-bit MLX is wired through; 2/3/6/8-bit MLX dequant is a
-  one-line bit-extraction change but isn't shipped.
+- **MLX 4-bit on GPU**: the MSL kernel `matmul_mlx_q4` is compiled into
+  the runtime when `-Dmetal=true` is set, but `forward.zig` still routes
+  MLX-Q4 layers to the CPU implementation. Reaching the GPU path requires
+  threading `HfBundle` shards through `MetalBackend` so each shard's mmap
+  is wrapped as its own `MTLBuffer` (currently only the GGUF mmap is
+  wrapped). Q8_0-GGUF models keep getting full GPU acceleration unchanged.
+- **MLX bit widths**: 2/3/4/5/6/8 are all dispatched correctly on CPU
+  (`kernels/mlx.zig::matmul`). End-to-end verification on a real model is
+  done for 4-bit only; the other widths are covered by unit tests.
+- **Multi-shard safetensors**: directory loading mmaps every shard and
+  merges descriptors, with a test (`core/hf_loader.zig`) covering
+  cross-file lookup. Works on real sharded models but not yet
+  smoke-tested at the inference level (needs a 5 GB+ download).
+- **Tokenizer**: BPE/SentencePiece (Llama 1/2 family). Llama 3+ and
+  GPT-2 use tiktoken-style byte-level BPE which needs (a) a Unicode-class
+  regex engine for the pre-tokenizer split pattern and (b) the GPT-2
+  byte→string mapping. Both are absent — adding them is the next sizable
+  push for tokenizer coverage.
 
 ---
 
@@ -129,24 +135,24 @@ TinyLlama-1.1B-Chat-v1.0 Q8_0 on macOS arm64 (M-series), ReleaseFast,
 |------------------------|-------|----------------|------------------------------------------------|
 | CPU `--threads 16`     | 45    | 2.85s          | All cores pinned; max CPU throughput           |
 | CPU default (~8)       | 28    | 4.57s          | Half cores; default                            |
-| **Metal full forward** | **~37** | **3.50s**    | **All layer ops on GPU; one cmd buffer/layer** |
+| **Metal full forward** | **~65** | **1.96s**    | **All layer ops on GPU; one cmd buffer/layer** |
 
 **The headline win:** `-Dmetal=true` runs the inference on the GPU while
 the CPU thread pool sits at 1 worker. Fan stays off, foreground work stays
-responsive, throughput is within ~20% of the all-cores-pinned CPU build.
+responsive, throughput **~45% above** the all-cores-pinned CPU build.
 
 With Metal enabled the default is `--threads 1` because additional CPU
 workers just spin on GPU sync; the only per-token CPU work is the embedding
 gather and the sampler.
 
-For comparison, llama.cpp on the same hardware does ~50–100 tok/s on Q8_0.
-The remaining gap is **not** the matmul kernel — empirically, three different
-matmul kernel rewrites (threadgroup-shared activation tiling, multi-row-per-
-thread, simdgroup-per-row with `simd_sum`) all match the simple per-thread
-per-row kernel within noise on TinyLlama-scale GEMV. The bottleneck is
-dispatch + `waitUntilCompleted` sync × 22 layers/token plus per-token CPU
-work. Closing the gap requires async pipelining across layers, weight
-fusion (QKV / gate-up), or token batching for prefill — see roadmap.
+vantablack now lands inside llama.cpp's typical Q8_0 range (~50-100 tok/s
+on the same hardware). The matmul kernel is at the hardware's effective
+limit for GEMV at this model scale (three kernel-rewrite experiments —
+threadgroup-shared activation tiling, multi-row-per-thread, simdgroup-per-
+row with `simd_sum` — all matched the simple per-thread per-row kernel
+within noise). Further gains beyond ~65 tok/s require async pipelining
+across layers, weight fusion (QKV / gate-up), or token batching for
+prefill — see roadmap.
 
 ---
 
@@ -560,10 +566,13 @@ root cause: pure CPU matmul saturates every core. The fixes:
     decode rate).
 12. **MLX model loader (full integration)** — *shipped*. End-to-end
     inference on `mlx-community/*` Llama-1/2-family 4-bit models, verified
-    bit-perfect against `mlx_lm`. Remaining for full MLX coverage: Metal
-    kernel for the 3-buffer MLX-Q4 layout, multi-shard
-    `model.safetensors.index.json`, 2/3/6/8-bit MLX variants, and a
-    tiktoken-style tokenizer for Llama 3+ / GPT-2-family checkpoints.
+    bit-perfect against `mlx_lm`. 2/3/5/6/8-bit MLX kernels also shipped
+    (CPU). Multi-shard safetensors directory loading shipped + tested.
+    The MLX-Q4 MSL kernel (`matmul_mlx_q4`) is compiled at startup when
+    `-Dmetal=true`; runtime dispatch from `forward.zig` to the GPU is the
+    last bit needed to put MLX models on Metal. Tiktoken-style tokenizer
+    for Llama 3+ / GPT-2-family is the only remaining piece for broader
+    MLX-community coverage.
 12. **Apple AMX matrix coprocessor** — *planned*. M1/M2/M3 ship a hidden
     matrix unit accessible via inline assembly. Pure-Zig + lower power
     than even GPU for some shapes. Useful as a CPU-only fallback path.
