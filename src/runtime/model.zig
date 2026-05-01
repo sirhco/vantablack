@@ -192,6 +192,8 @@ pub fn quantOf(t: parser.GgmlType) ConfigError!@import("../kernels/comptime_gen.
         .f16 => .f16,
         .q8_0 => .q8_0,
         .q4_k => .q4_k,
+        .q5_k => .q5_k,
+        .q6_k => .q6_k,
         .tq2_0, .tq1_0 => .ternary158,
         else => error.UnsupportedWeightType,
     };

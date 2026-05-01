@@ -21,6 +21,8 @@ pub const QuantType = enum {
     f16,
     q8_0,
     q4_k,
+    q5_k,
+    q6_k,
     ternary158,
 };
 
@@ -38,6 +40,8 @@ pub fn dispatch(comptime q: QuantType) Kernel {
         .f16 => &simd.matmul_f16,
         .q8_0 => &simd.matmul_q8_0,
         .q4_k => &simd.matmul_q4_k,
+        .q5_k => &simd.matmul_q5_k,
+        .q6_k => &simd.matmul_q6_k,
         .ternary158 => &simd.matmul_ternary158,
     };
 }

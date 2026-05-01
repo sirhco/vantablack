@@ -215,6 +215,167 @@ pub fn matmul_q4_k(out: []f32, weights: []const u8, acts: []const f32, m: usize,
     }
 }
 
+// -------------------- Q5_K ----------------------------------------------
+//
+// block_q5_K (176 bytes per 256 weights):
+//   bytes [0..2]    : f16 d           super-block scale for sub-scales
+//   bytes [2..4]    : f16 dmin        super-block scale for sub-mins
+//   bytes [4..16]   : u8 scales[12]   packed 6-bit (scale, min) per sub-block (same layout as Q4_K)
+//   bytes [16..48]  : u8 qh[32]       1-bit hi nibble per weight, bit s of qh[l] serves sub-block s
+//   bytes [48..176] : u8 qs[128]      4-bit lo nibble, 2 weights per byte
+//
+// 5-bit weight = (lo4 | (hi1 << 4)). Then weight = sub_scale * w5 - sub_min
+// (same dequant formula as Q4_K).
+
+pub const q5_k_block_bytes: usize = 176;
+pub const q5_k_block_elems: usize = 256;
+
+pub fn dequantBlockQ5_K(block: *const [q5_k_block_bytes]u8, out: *[q5_k_block_elems]f32) void {
+    const d = f16BitsToF32(std.mem.readInt(u16, block[0..2], .little));
+    const dmin = f16BitsToF32(std.mem.readInt(u16, block[2..4], .little));
+    const scales: *const [12]u8 = block[4..16];
+    const qh: *const [32]u8 = block[16..48];
+    const qs: *const [128]u8 = block[48..176];
+
+    var y_idx: usize = 0;
+    var s: usize = 0;
+    while (s < 8) : (s += 2) {
+        const a = q4kScaleMin(s, scales);
+        const b = q4kScaleMin(s + 1, scales);
+        const d1 = d * @as(f32, @floatFromInt(a.sc));
+        const m1 = dmin * @as(f32, @floatFromInt(a.mn));
+        const d2 = d * @as(f32, @floatFromInt(b.sc));
+        const m2 = dmin * @as(f32, @floatFromInt(b.mn));
+        const q = qs[(s / 2) * 32 ..][0..32];
+        const mask_lo: u8 = @as(u8, 1) << @intCast(s);
+        const mask_hi: u8 = @as(u8, 1) << @intCast(s + 1);
+        for (0..32) |l| {
+            const w0: u8 = (q[l] & 0x0F) + (if ((qh[l] & mask_lo) != 0) @as(u8, 16) else 0);
+            const w1: u8 = (q[l] >> 4) + (if ((qh[l] & mask_hi) != 0) @as(u8, 16) else 0);
+            out[y_idx + l] = d1 * @as(f32, @floatFromInt(w0)) - m1;
+            out[y_idx + 32 + l] = d2 * @as(f32, @floatFromInt(w1)) - m2;
+        }
+        y_idx += 64;
+    }
+}
+
+pub fn matmul_q5_k(out: []f32, weights: []const u8, acts: []const f32, m: usize, k: usize) void {
+    std.debug.assert(k % q5_k_block_elems == 0);
+    std.debug.assert(out.len == m);
+    std.debug.assert(acts.len == k);
+    const blocks_per_row = k / q5_k_block_elems;
+    const row_bytes = blocks_per_row * q5_k_block_bytes;
+    std.debug.assert(weights.len >= m * row_bytes);
+
+    var dq: [q5_k_block_elems]f32 = undefined;
+    for (0..m) |i| {
+        const row = weights[i * row_bytes ..][0..row_bytes];
+        var total: f32 = 0;
+        for (0..blocks_per_row) |b| {
+            const blk: *const [q5_k_block_bytes]u8 =
+                row[b * q5_k_block_bytes ..][0..q5_k_block_bytes];
+            dequantBlockQ5_K(blk, &dq);
+            const x = acts[b * q5_k_block_elems ..][0..q5_k_block_elems];
+            var acc: Vec = @splat(0.0);
+            var j: usize = 0;
+            while (j + lane_width <= q5_k_block_elems) : (j += lane_width) {
+                const wv: Vec = dq[j..][0..lane_width].*;
+                const av: Vec = x[j..][0..lane_width].*;
+                acc += wv * av;
+            }
+            total += @reduce(.Add, acc);
+        }
+        out[i] = total;
+    }
+}
+
+// -------------------- Q6_K ----------------------------------------------
+//
+// block_q6_K (210 bytes per 256 weights):
+//   bytes [0..128]   : ql[128]    quants, low 4 bits, 2 weights per byte
+//   bytes [128..192] : qh[64]     quants, high 2 bits, 4 weights per byte
+//   bytes [192..208] : sc[16]     i8 sub-block scales (1 byte per 16 elems)
+//   bytes [208..210] : f16 d      super-block scale
+//
+// Per the ggml reference (ggml-quants.c `dequantize_row_q6_K`), each
+// super-block of 256 weights is processed in two halves of 128. For each l in
+// 0..32 within a half, four weights (positions l, l+32, l+64, l+96) are
+// reconstructed from one byte of `ql` plus 2 bits of `qh`, biased by -32, then
+// scaled by `d * sc[is + n]` for n ∈ {0,2,4,6} and `is = l/16`.
+
+pub const q6_k_block_bytes: usize = 210;
+pub const q6_k_block_elems: usize = 256;
+
+pub fn dequantBlockQ6_K(block: *const [q6_k_block_bytes]u8, out: *[q6_k_block_elems]f32) void {
+    const d = f16BitsToF32(std.mem.readInt(u16, block[208..210], .little));
+    const ql_all: *const [128]u8 = block[0..128];
+    const qh_all: *const [64]u8 = block[128..192];
+    const sc_all: *const [16]i8 = @ptrCast(block[192..208]);
+
+    var y_off: usize = 0;
+    var ql_off: usize = 0;
+    var qh_off: usize = 0;
+    var sc_off: usize = 0;
+    var half: usize = 0;
+    while (half < 2) : (half += 1) {
+        for (0..32) |l| {
+            const is = l / 16;
+            const ql_l = ql_all[ql_off + l];
+            const ql_l32 = ql_all[ql_off + l + 32];
+            const qh_l = qh_all[qh_off + l];
+
+            const q1: i32 = @as(i32, (ql_l & 0x0F) | (((qh_l >> 0) & 0x3) << 4)) - 32;
+            const q2: i32 = @as(i32, (ql_l32 & 0x0F) | (((qh_l >> 2) & 0x3) << 4)) - 32;
+            const q3: i32 = @as(i32, (ql_l >> 4) | (((qh_l >> 4) & 0x3) << 4)) - 32;
+            const q4: i32 = @as(i32, (ql_l32 >> 4) | (((qh_l >> 6) & 0x3) << 4)) - 32;
+
+            const s0: f32 = @floatFromInt(sc_all[sc_off + is + 0]);
+            const s2: f32 = @floatFromInt(sc_all[sc_off + is + 2]);
+            const s4: f32 = @floatFromInt(sc_all[sc_off + is + 4]);
+            const s6: f32 = @floatFromInt(sc_all[sc_off + is + 6]);
+
+            out[y_off + l + 0] = d * s0 * @as(f32, @floatFromInt(q1));
+            out[y_off + l + 32] = d * s2 * @as(f32, @floatFromInt(q2));
+            out[y_off + l + 64] = d * s4 * @as(f32, @floatFromInt(q3));
+            out[y_off + l + 96] = d * s6 * @as(f32, @floatFromInt(q4));
+        }
+        y_off += 128;
+        ql_off += 64;
+        qh_off += 32;
+        sc_off += 8;
+    }
+}
+
+pub fn matmul_q6_k(out: []f32, weights: []const u8, acts: []const f32, m: usize, k: usize) void {
+    std.debug.assert(k % q6_k_block_elems == 0);
+    std.debug.assert(out.len == m);
+    std.debug.assert(acts.len == k);
+    const blocks_per_row = k / q6_k_block_elems;
+    const row_bytes = blocks_per_row * q6_k_block_bytes;
+    std.debug.assert(weights.len >= m * row_bytes);
+
+    var dq: [q6_k_block_elems]f32 = undefined;
+    for (0..m) |i| {
+        const row = weights[i * row_bytes ..][0..row_bytes];
+        var total: f32 = 0;
+        for (0..blocks_per_row) |b| {
+            const blk: *const [q6_k_block_bytes]u8 =
+                row[b * q6_k_block_bytes ..][0..q6_k_block_bytes];
+            dequantBlockQ6_K(blk, &dq);
+            const x = acts[b * q6_k_block_elems ..][0..q6_k_block_elems];
+            var acc: Vec = @splat(0.0);
+            var j: usize = 0;
+            while (j + lane_width <= q6_k_block_elems) : (j += lane_width) {
+                const wv: Vec = dq[j..][0..lane_width].*;
+                const av: Vec = x[j..][0..lane_width].*;
+                acc += wv * av;
+            }
+            total += @reduce(.Add, acc);
+        }
+        out[i] = total;
+    }
+}
+
 // -------------------- TQ2_0 (1.58-bit ternary) ---------------------------
 //
 // block_tq2_0 (66 bytes per 256 weights):

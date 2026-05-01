@@ -6,7 +6,9 @@ pub fn build(b: *std.Build) void {
 
     const is_release = optimize != .Debug;
     const strip: ?bool = if (is_release) true else null;
-    const single_threaded: ?bool = if (is_release) true else null;
+    // ReleaseSmall stays single-threaded for binary size; ReleaseFast/Safe
+    // get the thread pool for matmul parallelism.
+    const single_threaded: ?bool = if (optimize == .ReleaseSmall) true else null;
     const omit_frame_pointer: ?bool = if (is_release) true else null;
     const error_tracing: ?bool = if (optimize == .ReleaseSmall) false else null;
 

@@ -8,12 +8,14 @@ const usage =
     \\  vantablack <model.gguf>                              print tensor catalog
     \\  vantablack <model.gguf> generate <n> <id> [id...]    generate n tokens
     \\  vantablack <model.gguf> prompt <n> <text>            encode text, generate n more tokens
+    \\  vantablack <model.gguf> chat <n> <user-message>      wrap in TinyLlama-Chat (zephyr) template
     \\
-    \\generate / prompt accept sampler flags BEFORE the n value:
+    \\generate / prompt / chat accept sampler flags BEFORE the n value:
     \\  --temp <f>     temperature (0.0 = greedy)
     \\  --top-k <n>    top-k filter (0 = disabled)
     \\  --top-p <f>    nucleus filter (0 = disabled)
     \\  --seed <u64>   RNG seed (default 0)
+    \\  --system <s>   system prompt for chat mode (default "You are a helpful assistant.")
     \\
 ;
 
@@ -49,9 +51,20 @@ pub fn main(init: std.process.Init) !void {
     var mapper = try vantablack.ModelMapper.init(gpa, io, abs_path);
     defer mapper.deinit();
 
-    if (args.len >= 3 and (std.mem.eql(u8, args[2], "generate") or std.mem.eql(u8, args[2], "prompt"))) {
-        const mode_prompt = std.mem.eql(u8, args[2], "prompt");
+    if (args.len >= 3 and (std.mem.eql(u8, args[2], "generate") or
+        std.mem.eql(u8, args[2], "prompt") or
+        std.mem.eql(u8, args[2], "chat")))
+    {
+        const Mode = enum { generate, prompt, chat };
+        const mode: Mode = if (std.mem.eql(u8, args[2], "generate"))
+            .generate
+        else if (std.mem.eql(u8, args[2], "prompt"))
+            .prompt
+        else
+            .chat;
+
         var cfg: vantablack.SamplerConfig = .{};
+        var system_prompt: []const u8 = "You are a helpful assistant.";
         var idx: usize = 3;
         while (idx < args.len) {
             const a = args[idx];
@@ -67,6 +80,9 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, a, "--seed")) {
                 idx += 1;
                 cfg.seed = try std.fmt.parseInt(u64, args[idx], 10);
+            } else if (std.mem.eql(u8, a, "--system")) {
+                idx += 1;
+                system_prompt = args[idx];
             } else break;
             idx += 1;
         }
@@ -83,23 +99,46 @@ pub fn main(init: std.process.Init) !void {
             return error.MissingArgs;
         }
 
-        const prompt_ids = if (mode_prompt) blk: {
-            var text_buf: std.ArrayList(u8) = .empty;
-            defer text_buf.deinit(arena);
-            for (args[idx..], 0..) |a, i| {
-                if (i != 0) try text_buf.append(arena, ' ');
-                try text_buf.appendSlice(arena, a);
-            }
-            var tok = try vantablack.Tokenizer.init(gpa, mapper.catalog);
-            defer tok.deinit(gpa);
-            const ids = try tok.encode(arena, text_buf.items, true);
-            try out.print("[encoded {d} tokens]\n", .{ids.len});
-            try out.flush();
-            break :blk ids;
-        } else blk: {
-            const ids = try arena.alloc(u32, args.len - idx);
-            for (ids, args[idx..]) |*id, s| id.* = try std.fmt.parseInt(u32, s, 10);
-            break :blk ids;
+        const prompt_ids = switch (mode) {
+            .generate => blk: {
+                const ids = try arena.alloc(u32, args.len - idx);
+                for (ids, args[idx..]) |*id, s| id.* = try std.fmt.parseInt(u32, s, 10);
+                break :blk ids;
+            },
+            .prompt => blk: {
+                var text_buf: std.ArrayList(u8) = .empty;
+                defer text_buf.deinit(arena);
+                for (args[idx..], 0..) |a, i| {
+                    if (i != 0) try text_buf.append(arena, ' ');
+                    try text_buf.appendSlice(arena, a);
+                }
+                var tok = try vantablack.Tokenizer.init(gpa, mapper.catalog);
+                defer tok.deinit(gpa);
+                const ids = try tok.encode(arena, text_buf.items, true);
+                try out.print("[encoded {d} tokens]\n", .{ids.len});
+                try out.flush();
+                break :blk ids;
+            },
+            .chat => blk: {
+                var user_buf: std.ArrayList(u8) = .empty;
+                defer user_buf.deinit(arena);
+                for (args[idx..], 0..) |a, i| {
+                    if (i != 0) try user_buf.append(arena, ' ');
+                    try user_buf.appendSlice(arena, a);
+                }
+                // TinyLlama-Chat zephyr template.
+                const wrapped = try std.fmt.allocPrint(
+                    arena,
+                    "<|system|>\n{s}</s>\n<|user|>\n{s}</s>\n<|assistant|>\n",
+                    .{ system_prompt, user_buf.items },
+                );
+                var tok = try vantablack.Tokenizer.init(gpa, mapper.catalog);
+                defer tok.deinit(gpa);
+                const ids = try tok.encode(arena, wrapped, true);
+                try out.print("[chat: encoded {d} tokens]\n", .{ids.len});
+                try out.flush();
+                break :blk ids;
+            },
         };
 
         try generate(gpa, &mapper, n_steps, prompt_ids, cfg, out);
@@ -139,9 +178,12 @@ fn generate(
     var sampler = try vantablack.Sampler.init(gpa, sampler_cfg, model.config.vocab_size);
     defer sampler.deinit(gpa);
 
+    var pool = try vantablack.ThreadPool.init(gpa, 0);
+    defer pool.deinit(gpa);
+
     if (prompt_ids.len == 0) return;
     for (prompt_ids) |id| {
-        try vantablack.forward.step(&model, &state, &cache, id);
+        try vantablack.forward.step(&model, &state, &cache, pool, id);
         try tok.decodeTo(out, id);
     }
     try out.flush();
@@ -152,7 +194,7 @@ fn generate(
         if (next == tok.eos) break;
         try tok.decodeTo(out, next);
         try out.flush();
-        try vantablack.forward.step(&model, &state, &cache, next);
+        try vantablack.forward.step(&model, &state, &cache, pool, next);
         next = sampler.sample(state.logits);
     }
     try out.writeByte('\n');

@@ -13,10 +13,12 @@ const math = @import("../kernels/math.zig");
 const kernels = @import("../kernels/comptime_gen.zig");
 const model_mod = @import("model.zig");
 const kv_cache_mod = @import("kv_cache.zig");
+const pool_mod = @import("pool.zig");
 
 const Model = model_mod.Model;
 const TypedTensor = model_mod.TypedTensor;
 const KvCache = kv_cache_mod.KvCache;
+const ThreadPool = pool_mod.ThreadPool;
 
 pub const StepError = error{
     UnsupportedWeightType,
@@ -78,6 +80,7 @@ pub fn step(
     m: *const Model,
     state: *State,
     cache: *KvCache,
+    pool: *ThreadPool,
     token_id: u32,
 ) StepError!void {
     const c = m.config;
@@ -97,9 +100,9 @@ pub fn step(
         try rmsNormTyped(state.xb, layer.attn_norm, c.rms_eps);
 
         // QKV projections.
-        try matmulRuntime(state.q, layer.attn_q, state.xb, c.dim, c.dim);
-        try matmulRuntime(state.k_cur, layer.attn_k, state.xb, kv_dim, c.dim);
-        try matmulRuntime(state.v_cur, layer.attn_v, state.xb, kv_dim, c.dim);
+        try matmulRuntime(pool, state.q, layer.attn_q, state.xb, c.dim, c.dim);
+        try matmulRuntime(pool, state.k_cur, layer.attn_k, state.xb, kv_dim, c.dim);
+        try matmulRuntime(pool, state.v_cur, layer.attn_v, state.xb, kv_dim, c.dim);
 
         // RoPE on Q (per head) and K (per kv head).
         for (0..c.n_heads) |h| {
@@ -145,7 +148,7 @@ pub fn step(
         }
 
         // Output projection + residual.
-        try matmulRuntime(state.xb2, layer.attn_o, state.attn_out, c.dim, c.dim);
+        try matmulRuntime(pool, state.xb2, layer.attn_o, state.attn_out, c.dim, c.dim);
         math.addInto(state.x, state.xb2);
 
         // FFN RMSNorm.
@@ -153,10 +156,10 @@ pub fn step(
         try rmsNormTyped(state.xb, layer.ffn_norm, c.rms_eps);
 
         // SwiGLU FFN.
-        try matmulRuntime(state.gate, layer.ffn_gate, state.xb, c.ffn_dim, c.dim);
-        try matmulRuntime(state.up, layer.ffn_up, state.xb, c.ffn_dim, c.dim);
+        try matmulRuntime(pool, state.gate, layer.ffn_gate, state.xb, c.ffn_dim, c.dim);
+        try matmulRuntime(pool, state.up, layer.ffn_up, state.xb, c.ffn_dim, c.dim);
         math.swiglu(state.gate, state.up);
-        try matmulRuntime(state.ffn_out, layer.ffn_down, state.gate, c.dim, c.ffn_dim);
+        try matmulRuntime(pool, state.ffn_out, layer.ffn_down, state.gate, c.dim, c.ffn_dim);
         math.addInto(state.x, state.ffn_out);
     }
 
@@ -164,19 +167,69 @@ pub fn step(
 
     // Final norm + LM head.
     try rmsNormTyped(state.x, m.output_norm, c.rms_eps);
-    try matmulRuntime(state.logits, m.output_w, state.x, c.vocab_size, c.dim);
+    try matmulRuntime(pool, state.logits, m.output_w, state.x, c.vocab_size, c.dim);
 }
 
 // -------------------- helpers ---------------------------------------------
 
-fn matmulRuntime(out: []f32, w: TypedTensor, acts: []const f32, m: usize, k: usize) StepError!void {
-    const q = model_mod.quantOf(w.ggml_type) catch return error.UnsupportedWeightType;
-    switch (q) {
+const MatmulCtx = struct {
+    out: []f32,
+    weights: []const u8,
+    acts: []const f32,
+    m: usize,
+    k: usize,
+    row_bytes: usize,
+    quant: kernels.QuantType,
+};
+
+fn matmulWorker(worker_id: usize, n_workers: usize, ctx_ptr: *anyopaque) void {
+    const ctx: *MatmulCtx = @ptrCast(@alignCast(ctx_ptr));
+    const chunk = (ctx.m + n_workers - 1) / n_workers;
+    const start = worker_id * chunk;
+    const end = @min(start + chunk, ctx.m);
+    if (start >= end) return;
+    const m_chunk = end - start;
+    const out_chunk = ctx.out[start..end];
+    const w_chunk = ctx.weights[start * ctx.row_bytes ..][0 .. m_chunk * ctx.row_bytes];
+    switch (ctx.quant) {
         inline else => |qt| {
             const kernel = comptime kernels.dispatch(qt);
-            kernel(out, w.bytes, acts, m, k);
+            kernel(out_chunk, w_chunk, ctx.acts, m_chunk, ctx.k);
         },
     }
+}
+
+fn matmulRuntime(
+    pool: *ThreadPool,
+    out: []f32,
+    w: TypedTensor,
+    acts: []const f32,
+    m: usize,
+    k: usize,
+) StepError!void {
+    const q = model_mod.quantOf(w.ggml_type) catch return error.UnsupportedWeightType;
+    var ctx: MatmulCtx = .{
+        .out = out,
+        .weights = w.bytes,
+        .acts = acts,
+        .m = m,
+        .k = k,
+        .row_bytes = rowBytes(q, k),
+        .quant = q,
+    };
+    pool.dispatch(matmulWorker, &ctx);
+}
+
+fn rowBytes(q: kernels.QuantType, k: usize) usize {
+    return switch (q) {
+        .f32 => k * 4,
+        .f16 => k * 2,
+        .q8_0 => (k / simd.q8_0_block_elems) * simd.q8_0_block_bytes,
+        .q4_k => (k / simd.q4_k_block_elems) * simd.q4_k_block_bytes,
+        .q5_k => (k / simd.q5_k_block_elems) * simd.q5_k_block_bytes,
+        .q6_k => (k / simd.q6_k_block_elems) * simd.q6_k_block_bytes,
+        .ternary158 => (k / simd.tq2_0_block_elems) * simd.tq2_0_block_bytes,
+    };
 }
 
 /// RMSNorm where the weight tensor is stored in some ggml type. Most llamas
@@ -224,6 +277,28 @@ fn dequantToF32(out: []f32, w: TypedTensor, n: usize) StepError!void {
                     w.bytes[b * simd.q4_k_block_bytes ..][0..simd.q4_k_block_bytes];
                 simd.dequantBlockQ4_K(blk, &tmp);
                 @memcpy(out[b * simd.q4_k_block_elems ..][0..simd.q4_k_block_elems], &tmp);
+            }
+        },
+        .q5_k => {
+            std.debug.assert(n % simd.q5_k_block_elems == 0);
+            const blocks = n / simd.q5_k_block_elems;
+            for (0..blocks) |b| {
+                var tmp: [simd.q5_k_block_elems]f32 = undefined;
+                const blk: *const [simd.q5_k_block_bytes]u8 =
+                    w.bytes[b * simd.q5_k_block_bytes ..][0..simd.q5_k_block_bytes];
+                simd.dequantBlockQ5_K(blk, &tmp);
+                @memcpy(out[b * simd.q5_k_block_elems ..][0..simd.q5_k_block_elems], &tmp);
+            }
+        },
+        .q6_k => {
+            std.debug.assert(n % simd.q6_k_block_elems == 0);
+            const blocks = n / simd.q6_k_block_elems;
+            for (0..blocks) |b| {
+                var tmp: [simd.q6_k_block_elems]f32 = undefined;
+                const blk: *const [simd.q6_k_block_bytes]u8 =
+                    w.bytes[b * simd.q6_k_block_bytes ..][0..simd.q6_k_block_bytes];
+                simd.dequantBlockQ6_K(blk, &tmp);
+                @memcpy(out[b * simd.q6_k_block_elems ..][0..simd.q6_k_block_elems], &tmp);
             }
         },
         .ternary158 => {
@@ -280,6 +355,32 @@ fn gatherEmbedding(out: []f32, table: TypedTensor, id: u32, dim: usize) StepErro
                     row[b * simd.q4_k_block_bytes ..][0..simd.q4_k_block_bytes];
                 simd.dequantBlockQ4_K(blk, &tmp);
                 @memcpy(out[b * simd.q4_k_block_elems ..][0..simd.q4_k_block_elems], &tmp);
+            }
+        },
+        .q5_k => {
+            std.debug.assert(dim % simd.q5_k_block_elems == 0);
+            const blocks = dim / simd.q5_k_block_elems;
+            const row_bytes = blocks * simd.q5_k_block_bytes;
+            const row = table.bytes[id_us * row_bytes ..][0..row_bytes];
+            for (0..blocks) |b| {
+                var tmp: [simd.q5_k_block_elems]f32 = undefined;
+                const blk: *const [simd.q5_k_block_bytes]u8 =
+                    row[b * simd.q5_k_block_bytes ..][0..simd.q5_k_block_bytes];
+                simd.dequantBlockQ5_K(blk, &tmp);
+                @memcpy(out[b * simd.q5_k_block_elems ..][0..simd.q5_k_block_elems], &tmp);
+            }
+        },
+        .q6_k => {
+            std.debug.assert(dim % simd.q6_k_block_elems == 0);
+            const blocks = dim / simd.q6_k_block_elems;
+            const row_bytes = blocks * simd.q6_k_block_bytes;
+            const row = table.bytes[id_us * row_bytes ..][0..row_bytes];
+            for (0..blocks) |b| {
+                var tmp: [simd.q6_k_block_elems]f32 = undefined;
+                const blk: *const [simd.q6_k_block_bytes]u8 =
+                    row[b * simd.q6_k_block_bytes ..][0..simd.q6_k_block_bytes];
+                simd.dequantBlockQ6_K(blk, &tmp);
+                @memcpy(out[b * simd.q6_k_block_elems ..][0..simd.q6_k_block_elems], &tmp);
             }
         },
         .ternary158 => {

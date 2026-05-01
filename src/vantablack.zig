@@ -10,6 +10,9 @@ pub const model = @import("runtime/model.zig");
 pub const forward = @import("runtime/forward.zig");
 pub const tokenizer = @import("runtime/tokenizer.zig");
 pub const sampler = @import("runtime/sampler.zig");
+pub const pool = @import("runtime/pool.zig");
+
+pub const ThreadPool = pool.ThreadPool;
 
 pub const Tokenizer = tokenizer.Tokenizer;
 pub const Sampler = sampler.Sampler;
