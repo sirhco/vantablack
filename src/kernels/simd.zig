@@ -562,6 +562,87 @@ test "Q4_K dequant + matmul self-consistent" {
     try std.testing.expectApproxEqAbs(expected, got[0], 1e-3);
 }
 
+test "Q5_K dequant + matmul self-consistent" {
+    var block: [q5_k_block_bytes]u8 = .{0} ** q5_k_block_bytes;
+    const d: f16 = 0.00390625; // 1/256
+    const dmin: f16 = 0.03125; // 1/32
+    std.mem.writeInt(u16, block[0..2], @bitCast(d), .little);
+    std.mem.writeInt(u16, block[2..4], @bitCast(dmin), .little);
+    // Same packed-scale layout as Q4_K (sub-blocks 0..3 in low 6 bits).
+    for (0..4) |s| {
+        block[4 + s] = @intCast((s + 1) * 4); // 4,8,12,16
+        block[4 + 4 + s] = @intCast(s + 1); // 1,2,3,4
+    }
+    for (0..4) |s| {
+        const sc_lo: u8 = @intCast((s + 1) * 2); // 2,4,6,8
+        const mn_lo: u8 = @intCast(s + 1); // 1,2,3,4
+        block[4 + 8 + s] = sc_lo | (mn_lo << 4);
+    }
+    // qh: bit s of qh[l] sets the 5th bit for sub-block s, weight l.
+    for (0..32) |l| block[16 + l] = @intCast((l * 31) % 256);
+    // qs: low 4 + high 4 nibbles of all sub-block pairs.
+    for (0..128) |i| block[48 + i] = @intCast(((i * 13) % 16) | (((i * 7) % 16) << 4));
+
+    var dq: [q5_k_block_elems]f32 = undefined;
+    dequantBlockQ5_K(&block, &dq);
+
+    // Spot-check: sub-block 0, weight 0.
+    const sc0: u8 = block[4] & 0x3F;
+    const mn0: u8 = block[8] & 0x3F;
+    const d_f: f32 = @floatCast(d);
+    const dmin_f: f32 = @floatCast(dmin);
+    const lo0: u8 = block[48] & 0x0F;
+    const hi0: u8 = if ((block[16] & 0x01) != 0) 16 else 0;
+    const w5_0: u8 = lo0 + hi0;
+    const expected0 = d_f * @as(f32, @floatFromInt(sc0)) * @as(f32, @floatFromInt(w5_0)) -
+        dmin_f * @as(f32, @floatFromInt(mn0));
+    try std.testing.expectApproxEqAbs(expected0, dq[0], 1e-4);
+
+    // Matmul vs dot-of-dequantized.
+    var x: [q5_k_block_elems]f32 = undefined;
+    for (&x, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 9)) * 0.1 - 0.4;
+    var got: [1]f32 = undefined;
+    matmul_q5_k(&got, &block, &x, 1, q5_k_block_elems);
+    var expected: f32 = 0;
+    for (dq, x) |w, xi| expected += w * xi;
+    try std.testing.expectApproxEqAbs(expected, got[0], 1e-3);
+}
+
+test "Q6_K dequant + matmul self-consistent" {
+    var block: [q6_k_block_bytes]u8 = .{0} ** q6_k_block_bytes;
+    const d: f16 = 0.001953125; // 1/512
+    std.mem.writeInt(u16, block[208..210], @bitCast(d), .little);
+    // ql + qh patterns; sc as i8.
+    for (0..128) |i| block[i] = @intCast((i * 17) % 256);
+    for (0..64) |i| block[128 + i] = @intCast((i * 19) % 256);
+    for (0..16) |i| {
+        const sv: i8 = @intCast(@as(i32, @intCast(i)) - 8); // -8..7
+        block[192 + i] = @bitCast(sv);
+    }
+
+    var dq: [q6_k_block_elems]f32 = undefined;
+    dequantBlockQ6_K(&block, &dq);
+
+    // Spot-check: position 0 (half=0, l=0, n=0).
+    // q1 = ((ql[0] & 0xF) | ((qh[0] & 0x3) << 4)) - 32
+    const ql0: u8 = block[0];
+    const qh0: u8 = block[128];
+    const q1: i32 = @as(i32, (ql0 & 0x0F) | (((qh0 >> 0) & 0x3) << 4)) - 32;
+    const sc0: i8 = @bitCast(block[192]);
+    const d_f: f32 = @floatCast(d);
+    const expected0 = d_f * @as(f32, @floatFromInt(sc0)) * @as(f32, @floatFromInt(q1));
+    try std.testing.expectApproxEqAbs(expected0, dq[0], 1e-4);
+
+    // Matmul vs dot-of-dequantized.
+    var x: [q6_k_block_elems]f32 = undefined;
+    for (&x, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 11)) * 0.05 - 0.25;
+    var got: [1]f32 = undefined;
+    matmul_q6_k(&got, &block, &x, 1, q6_k_block_elems);
+    var expected: f32 = 0;
+    for (dq, x) |w, xi| expected += w * xi;
+    try std.testing.expectApproxEqAbs(expected, got[0], 1e-3);
+}
+
 test "TQ2_0 dequant + matmul self-consistent" {
     var block: [tq2_0_block_bytes]u8 = .{0} ** tq2_0_block_bytes;
     const scale: f16 = 0.25;
