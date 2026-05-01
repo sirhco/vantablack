@@ -112,6 +112,7 @@ pub const Server = struct {
             model.config.n_kv_heads,
             model.config.head_dim,
             model.config.max_seq,
+            metal_ptr_init,
         );
         errdefer cache.deinit(gpa);
 

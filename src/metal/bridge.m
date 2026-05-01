@@ -170,6 +170,134 @@ kernel void residual_add(
     if (gid >= p.n) return;
     a[gid] = a[gid] + b[gid];
 }
+
+// Plain f32 copy. Caller binds dst+offset and src+offset; kernel just writes
+// p.n contiguous floats from src to dst. Used to splice the just-computed
+// k_cur / v_cur into the right slot in the persistent KV cache.
+kernel void copy_f32(
+    device float        *dst     [[buffer(0)]],
+    device const float  *src     [[buffer(1)]],
+    constant LenParams  &p       [[buffer(2)]],
+    uint                 gid     [[thread_position_in_grid]])
+{
+    if (gid >= p.n) return;
+    dst[gid] = src[gid];
+}
+
+// Attention scores: scores[h, t] = (q[h] · K[t, kv_h]) * inv_sqrt_hd.
+// Grid: (n_heads, seq_len). One thread per (h, t).
+
+struct AttnParams {
+    uint n_heads;
+    uint n_kv_heads;
+    uint head_dim;
+    uint seq_len;
+    float inv_sqrt_hd;
+};
+
+kernel void attn_scores(
+    device float        *scores  [[buffer(0)]],
+    device const float  *q       [[buffer(1)]],
+    device const float  *k_cache [[buffer(2)]],
+    constant AttnParams &p       [[buffer(3)]],
+    uint2                gid     [[thread_position_in_grid]])
+{
+    if (gid.x >= p.n_heads || gid.y >= p.seq_len) return;
+    uint h = gid.x;
+    uint t = gid.y;
+    uint kv_h = (h * p.n_kv_heads) / p.n_heads;
+    uint kv_row = p.n_kv_heads * p.head_dim;
+
+    device const float *qh = q + h * p.head_dim;
+    device const float *kt = k_cache + t * kv_row + kv_h * p.head_dim;
+
+    float s = 0.0;
+    for (uint i = 0; i < p.head_dim; ++i) {
+        s += qh[i] * kt[i];
+    }
+    scores[h * p.seq_len + t] = s * p.inv_sqrt_hd;
+}
+
+// Per-row numerically-stable softmax over `seq_len` columns. One threadgroup
+// per row (head); threads cooperate via simdgroup reductions for max + sum.
+
+kernel void softmax_rows(
+    device float        *scores  [[buffer(0)]],
+    constant AttnParams &p       [[buffer(1)]],
+    uint                 hid     [[threadgroup_position_in_grid]],
+    uint                 tid     [[thread_position_in_threadgroup]],
+    uint                 ntg     [[threads_per_threadgroup]])
+{
+    device float *row = scores + hid * p.seq_len;
+    threadgroup float scratch[32];
+    uint sid = tid % 32;
+    uint sgrp = tid / 32;
+    uint n_sgrps = (ntg + 31) / 32;
+
+    // Pass 1: max.
+    float m = -INFINITY;
+    for (uint i = tid; i < p.seq_len; i += ntg) {
+        m = max(m, row[i]);
+    }
+    m = simd_max(m);
+    if (sid == 0) scratch[sgrp] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgrp == 0) {
+        m = (sid < n_sgrps) ? scratch[sid] : -INFINITY;
+        m = simd_max(m);
+        if (sid == 0) scratch[0] = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float row_max = scratch[0];
+
+    // Pass 2: write exp, accumulate sum.
+    float s = 0.0;
+    for (uint i = tid; i < p.seq_len; i += ntg) {
+        float e = exp(row[i] - row_max);
+        row[i] = e;
+        s += e;
+    }
+    s = simd_sum(s);
+    if (sid == 0) scratch[sgrp] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgrp == 0) {
+        s = (sid < n_sgrps) ? scratch[sid] : 0.0;
+        s = simd_sum(s);
+        if (sid == 0) scratch[0] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv = 1.0 / scratch[0];
+
+    // Pass 3: normalize.
+    for (uint i = tid; i < p.seq_len; i += ntg) {
+        row[i] = row[i] * inv;
+    }
+}
+
+// Weighted sum of V rows by softmaxed scores: out[h, d] = Σ_t scores[h,t]·V[t,kv_h,d].
+// Grid: (n_heads, head_dim). One thread per (h, d).
+
+kernel void attn_weighted_sum(
+    device float        *out     [[buffer(0)]],
+    device const float  *scores  [[buffer(1)]],
+    device const float  *v_cache [[buffer(2)]],
+    constant AttnParams &p       [[buffer(3)]],
+    uint2                gid     [[thread_position_in_grid]])
+{
+    if (gid.x >= p.n_heads || gid.y >= p.head_dim) return;
+    uint h = gid.x;
+    uint d = gid.y;
+    uint kv_h = (h * p.n_kv_heads) / p.n_heads;
+    uint kv_row = p.n_kv_heads * p.head_dim;
+
+    device const float *score_row = scores + h * p.seq_len;
+    float acc = 0.0;
+    for (uint t = 0; t < p.seq_len; ++t) {
+        device const float *vt = v_cache + t * kv_row + kv_h * p.head_dim;
+        acc += score_row[t] * vt[d];
+    }
+    out[h * p.head_dim + d] = acc;
+}
 )MSL";
 
 // ----------------- Opaque handles --------------------------------------------
@@ -183,6 +311,10 @@ struct VtbMetalCtx {
     id<MTLComputePipelineState> pso_rope;
     id<MTLComputePipelineState> pso_swiglu;
     id<MTLComputePipelineState> pso_residual;
+    id<MTLComputePipelineState> pso_copy;
+    id<MTLComputePipelineState> pso_attn_scores;
+    id<MTLComputePipelineState> pso_softmax;
+    id<MTLComputePipelineState> pso_attn_weighted;
 };
 
 struct VtbMetalBuf {
@@ -217,10 +349,12 @@ VtbMetalCtx *vtb_metal_init(void) {
         // kernel-launch overhead with no first-use latency.
         NSString *names[] = {
             @"matmul_q8_0", @"rmsnorm", @"rope_inplace",
-            @"swiglu", @"residual_add",
+            @"swiglu", @"residual_add", @"copy_f32",
+            @"attn_scores", @"softmax_rows", @"attn_weighted_sum",
         };
-        id<MTLComputePipelineState> psos[5] = {nil, nil, nil, nil, nil};
-        for (int i = 0; i < 5; i++) {
+        const int n_psos = sizeof(names) / sizeof(names[0]);
+        id<MTLComputePipelineState> psos[9] = {nil};
+        for (int i = 0; i < n_psos; i++) {
             id<MTLFunction> fn = [library newFunctionWithName:names[i]];
             if (!fn) {
                 NSLog(@"vtb_metal_init: function %@ not found", names[i]);
@@ -243,6 +377,10 @@ VtbMetalCtx *vtb_metal_init(void) {
         ctx->pso_rope = psos[2];
         ctx->pso_swiglu = psos[3];
         ctx->pso_residual = psos[4];
+        ctx->pso_copy = psos[5];
+        ctx->pso_attn_scores = psos[6];
+        ctx->pso_softmax = psos[7];
+        ctx->pso_attn_weighted = psos[8];
         return ctx;
     }
 }
@@ -257,6 +395,10 @@ void vtb_metal_destroy(VtbMetalCtx *ctx) {
     ctx->pso_rope = nil;
     ctx->pso_swiglu = nil;
     ctx->pso_residual = nil;
+    ctx->pso_copy = nil;
+    ctx->pso_attn_scores = nil;
+    ctx->pso_softmax = nil;
+    ctx->pso_attn_weighted = nil;
     free(ctx);
 }
 
@@ -476,4 +618,106 @@ void vtb_metal_segment_residual_add(
     if (tg > seg->ctx->pso_residual.maxTotalThreadsPerThreadgroup)
         tg = seg->ctx->pso_residual.maxTotalThreadsPerThreadgroup;
     [seg->enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+}
+
+void vtb_metal_segment_copy(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *dst_buf, size_t dst_offset_bytes,
+    VtbMetalBuf *src_buf, size_t src_offset_bytes,
+    size_t n_floats)
+{
+    if (!seg) return;
+    [seg->enc setComputePipelineState:seg->ctx->pso_copy];
+    [seg->enc setBuffer:dst_buf->buffer offset:dst_offset_bytes atIndex:0];
+    [seg->enc setBuffer:src_buf->buffer offset:src_offset_bytes atIndex:1];
+    struct LenParams { uint32_t n; } p = { (uint32_t)n_floats };
+    [seg->enc setBytes:&p length:sizeof(p) atIndex:2];
+    NSUInteger tg = 64;
+    if (tg > seg->ctx->pso_copy.maxTotalThreadsPerThreadgroup)
+        tg = seg->ctx->pso_copy.maxTotalThreadsPerThreadgroup;
+    [seg->enc dispatchThreads:MTLSizeMake(n_floats, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+}
+
+// Bind helper for the three attention kernels: builds the param block with
+// the layer-pinned k/v cache offsets pre-applied via setBuffer:offset:.
+struct AttnParams {
+    uint32_t n_heads;
+    uint32_t n_kv_heads;
+    uint32_t head_dim;
+    uint32_t seq_len;
+    float    inv_sqrt_hd;
+};
+
+void vtb_metal_segment_attn_scores(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *scores_buf,
+    VtbMetalBuf *q_buf,
+    VtbMetalBuf *k_cache_buf, size_t k_cache_offset_bytes,
+    size_t n_heads, size_t n_kv_heads, size_t head_dim, size_t seq_len,
+    float inv_sqrt_hd)
+{
+    if (!seg) return;
+    [seg->enc setComputePipelineState:seg->ctx->pso_attn_scores];
+    [seg->enc setBuffer:scores_buf->buffer offset:0 atIndex:0];
+    [seg->enc setBuffer:q_buf->buffer offset:0 atIndex:1];
+    [seg->enc setBuffer:k_cache_buf->buffer offset:k_cache_offset_bytes atIndex:2];
+    struct AttnParams p = {
+        (uint32_t)n_heads, (uint32_t)n_kv_heads, (uint32_t)head_dim,
+        (uint32_t)seq_len, inv_sqrt_hd,
+    };
+    [seg->enc setBytes:&p length:sizeof(p) atIndex:3];
+    // 2D grid: (n_heads, seq_len). Threadgroup small — work per thread is
+    // O(head_dim) which is tiny.
+    NSUInteger tg_x = (n_heads <= 8) ? n_heads : 8;
+    NSUInteger tg_y = 8;
+    while (tg_x * tg_y > seg->ctx->pso_attn_scores.maxTotalThreadsPerThreadgroup) tg_y /= 2;
+    [seg->enc dispatchThreads:MTLSizeMake(n_heads, seq_len, 1)
+              threadsPerThreadgroup:MTLSizeMake(tg_x, tg_y, 1)];
+}
+
+void vtb_metal_segment_softmax_rows(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *scores_buf,
+    size_t n_heads, size_t n_kv_heads, size_t head_dim, size_t seq_len)
+{
+    if (!seg) return;
+    (void)head_dim; (void)n_kv_heads; // params bag shared with attn_scores
+    [seg->enc setComputePipelineState:seg->ctx->pso_softmax];
+    [seg->enc setBuffer:scores_buf->buffer offset:0 atIndex:0];
+    struct AttnParams p = {
+        (uint32_t)n_heads, (uint32_t)n_kv_heads, (uint32_t)head_dim,
+        (uint32_t)seq_len, 0.0f,
+    };
+    [seg->enc setBytes:&p length:sizeof(p) atIndex:1];
+    // One threadgroup per head row; 256 threads cooperate on the reduction.
+    NSUInteger tg = 256;
+    if (tg > seg->ctx->pso_softmax.maxTotalThreadsPerThreadgroup)
+        tg = seg->ctx->pso_softmax.maxTotalThreadsPerThreadgroup;
+    [seg->enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+}
+
+void vtb_metal_segment_attn_weighted_sum(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *out_buf,
+    VtbMetalBuf *scores_buf,
+    VtbMetalBuf *v_cache_buf, size_t v_cache_offset_bytes,
+    size_t n_heads, size_t n_kv_heads, size_t head_dim, size_t seq_len)
+{
+    if (!seg) return;
+    [seg->enc setComputePipelineState:seg->ctx->pso_attn_weighted];
+    [seg->enc setBuffer:out_buf->buffer offset:0 atIndex:0];
+    [seg->enc setBuffer:scores_buf->buffer offset:0 atIndex:1];
+    [seg->enc setBuffer:v_cache_buf->buffer offset:v_cache_offset_bytes atIndex:2];
+    struct AttnParams p = {
+        (uint32_t)n_heads, (uint32_t)n_kv_heads, (uint32_t)head_dim,
+        (uint32_t)seq_len, 0.0f,
+    };
+    [seg->enc setBytes:&p length:sizeof(p) atIndex:3];
+    // 2D grid: (n_heads, head_dim). Per-thread loop over seq_len.
+    NSUInteger tg_x = (n_heads <= 8) ? n_heads : 8;
+    NSUInteger tg_y = 8;
+    while (tg_x * tg_y > seg->ctx->pso_attn_weighted.maxTotalThreadsPerThreadgroup) tg_y /= 2;
+    [seg->enc dispatchThreads:MTLSizeMake(n_heads, head_dim, 1)
+              threadsPerThreadgroup:MTLSizeMake(tg_x, tg_y, 1)];
 }

@@ -212,6 +212,7 @@ fn generate(
         model.config.n_kv_heads,
         model.config.head_dim,
         model.config.max_seq,
+        metal_ptr,
     );
     defer cache.deinit(gpa);
 

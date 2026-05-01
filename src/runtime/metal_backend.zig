@@ -50,6 +50,13 @@ pub const MetalBackend = struct {
     ffn_out: ScratchBuf,
     logits: ScratchBuf,
 
+    // KV cache slab and attention scores scratch — owned here so the GPU
+    // attention kernels can read/write them directly. CPU keeps a host-slice
+    // alias via `KvCache` / `State.attn_scores`.
+    kv_k: ScratchBuf,         // n_layers * max_seq * n_kv_heads * head_dim
+    kv_v: ScratchBuf,         // n_layers * max_seq * n_kv_heads * head_dim
+    attn_scores: ScratchBuf,  // n_heads * max_seq
+
     pub fn init(
         allocator: Allocator,
         mapper: *const mapper_mod.ModelMapper,
@@ -91,6 +98,14 @@ pub const MetalBackend = struct {
         const logits = try allocScratch(dev, cfg.vocab_size);
         errdefer dev.release(logits.buf);
 
+        const kv_total = cfg.n_layers * cfg.max_seq * kv_dim;
+        const kv_k = try allocScratch(dev, kv_total);
+        errdefer dev.release(kv_k.buf);
+        const kv_v = try allocScratch(dev, kv_total);
+        errdefer dev.release(kv_v.buf);
+        const attn_scores = try allocScratch(dev, cfg.n_heads * cfg.max_seq);
+        errdefer dev.release(attn_scores.buf);
+
         return .{
             .dev = dev,
             .weights_buf = weights_buf,
@@ -107,10 +122,16 @@ pub const MetalBackend = struct {
             .up = up,
             .ffn_out = ffn_out,
             .logits = logits,
+            .kv_k = kv_k,
+            .kv_v = kv_v,
+            .attn_scores = attn_scores,
         };
     }
 
     pub fn deinit(self: *MetalBackend) void {
+        self.dev.release(self.attn_scores.buf);
+        self.dev.release(self.kv_v.buf);
+        self.dev.release(self.kv_k.buf);
         self.dev.release(self.logits.buf);
         self.dev.release(self.ffn_out.buf);
         self.dev.release(self.up.buf);

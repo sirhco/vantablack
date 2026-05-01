@@ -35,6 +35,10 @@ const c_api = if (metal_enabled) struct {
     extern "c" fn vtb_metal_segment_rope(seg: *Seg, x_buf: *Buf, n_heads: usize, head_dim: usize, pos: usize, base: f32) void;
     extern "c" fn vtb_metal_segment_swiglu(seg: *Seg, gate_buf: *Buf, up_buf: *Buf, n: usize) void;
     extern "c" fn vtb_metal_segment_residual_add(seg: *Seg, a_buf: *Buf, b_buf: *Buf, n: usize) void;
+    extern "c" fn vtb_metal_segment_copy(seg: *Seg, dst_buf: *Buf, dst_offset_bytes: usize, src_buf: *Buf, src_offset_bytes: usize, n_floats: usize) void;
+    extern "c" fn vtb_metal_segment_attn_scores(seg: *Seg, scores_buf: *Buf, q_buf: *Buf, k_cache_buf: *Buf, k_offset: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, seq_len: usize, inv_sqrt_hd: f32) void;
+    extern "c" fn vtb_metal_segment_softmax_rows(seg: *Seg, scores_buf: *Buf, n_heads: usize, n_kv_heads: usize, head_dim: usize, seq_len: usize) void;
+    extern "c" fn vtb_metal_segment_attn_weighted_sum(seg: *Seg, out_buf: *Buf, scores_buf: *Buf, v_cache_buf: *Buf, v_offset: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, seq_len: usize) void;
 } else struct {
     fn vtb_metal_init() ?*Ctx {
         return null;
@@ -61,6 +65,10 @@ const c_api = if (metal_enabled) struct {
     fn vtb_metal_segment_rope(_: *Seg, _: *Buf, _: usize, _: usize, _: usize, _: f32) void {}
     fn vtb_metal_segment_swiglu(_: *Seg, _: *Buf, _: *Buf, _: usize) void {}
     fn vtb_metal_segment_residual_add(_: *Seg, _: *Buf, _: *Buf, _: usize) void {}
+    fn vtb_metal_segment_copy(_: *Seg, _: *Buf, _: usize, _: *Buf, _: usize, _: usize) void {}
+    fn vtb_metal_segment_attn_scores(_: *Seg, _: *Buf, _: *Buf, _: *Buf, _: usize, _: usize, _: usize, _: usize, _: usize, _: f32) void {}
+    fn vtb_metal_segment_softmax_rows(_: *Seg, _: *Buf, _: usize, _: usize, _: usize, _: usize) void {}
+    fn vtb_metal_segment_attn_weighted_sum(_: *Seg, _: *Buf, _: *Buf, _: *Buf, _: usize, _: usize, _: usize, _: usize, _: usize) void {}
 };
 
 const vtb_metal_init = c_api.vtb_metal_init;
@@ -76,6 +84,10 @@ const vtb_metal_segment_rmsnorm = c_api.vtb_metal_segment_rmsnorm;
 const vtb_metal_segment_rope = c_api.vtb_metal_segment_rope;
 const vtb_metal_segment_swiglu = c_api.vtb_metal_segment_swiglu;
 const vtb_metal_segment_residual_add = c_api.vtb_metal_segment_residual_add;
+const vtb_metal_segment_copy = c_api.vtb_metal_segment_copy;
+const vtb_metal_segment_attn_scores = c_api.vtb_metal_segment_attn_scores;
+const vtb_metal_segment_softmax_rows = c_api.vtb_metal_segment_softmax_rows;
+const vtb_metal_segment_attn_weighted_sum = c_api.vtb_metal_segment_attn_weighted_sum;
 
 pub const InitError = error{MetalUnavailable};
 pub const AllocError = error{MetalAllocFailed};
@@ -153,5 +165,17 @@ pub const Segment = struct {
     }
     pub fn residualAdd(self: Segment, a_buf: *Buf, b_buf: *Buf, n: usize) void {
         vtb_metal_segment_residual_add(self.handle, a_buf, b_buf, n);
+    }
+    pub fn copy(self: Segment, dst_buf: *Buf, dst_offset_bytes: usize, src_buf: *Buf, src_offset_bytes: usize, n_floats: usize) void {
+        vtb_metal_segment_copy(self.handle, dst_buf, dst_offset_bytes, src_buf, src_offset_bytes, n_floats);
+    }
+    pub fn attnScores(self: Segment, scores_buf: *Buf, q_buf: *Buf, k_cache_buf: *Buf, k_offset: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, seq_len: usize, inv_sqrt_hd: f32) void {
+        vtb_metal_segment_attn_scores(self.handle, scores_buf, q_buf, k_cache_buf, k_offset, n_heads, n_kv_heads, head_dim, seq_len, inv_sqrt_hd);
+    }
+    pub fn softmaxRows(self: Segment, scores_buf: *Buf, n_heads: usize, n_kv_heads: usize, head_dim: usize, seq_len: usize) void {
+        vtb_metal_segment_softmax_rows(self.handle, scores_buf, n_heads, n_kv_heads, head_dim, seq_len);
+    }
+    pub fn attnWeightedSum(self: Segment, out_buf: *Buf, scores_buf: *Buf, v_cache_buf: *Buf, v_offset: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, seq_len: usize) void {
+        vtb_metal_segment_attn_weighted_sum(self.handle, out_buf, scores_buf, v_cache_buf, v_offset, n_heads, n_kv_heads, head_dim, seq_len);
     }
 };

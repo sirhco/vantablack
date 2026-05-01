@@ -15,6 +15,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const metal_backend_mod = @import("metal_backend.zig");
+
 pub const KvCache = struct {
     n_layers: usize,
     n_kv_heads: usize,
@@ -24,6 +26,9 @@ pub const KvCache = struct {
     k: []f32,
     v: []f32,
     pos: usize,
+    /// True when k/v are gpa-allocated; false when they alias GPU shared
+    /// MTLBuffers owned by `MetalBackend`.
+    owns_buffers: bool,
 
     pub fn init(
         allocator: Allocator,
@@ -31,9 +36,26 @@ pub const KvCache = struct {
         n_kv_heads: usize,
         head_dim: usize,
         max_seq: usize,
+        metal: ?*metal_backend_mod.MetalBackend,
     ) !KvCache {
         const per_layer = max_seq * n_kv_heads * head_dim;
         const total = n_layers * per_layer;
+
+        if (metal) |mb| {
+            std.debug.assert(mb.kv_k.cap >= total);
+            std.debug.assert(mb.kv_v.cap >= total);
+            return .{
+                .n_layers = n_layers,
+                .n_kv_heads = n_kv_heads,
+                .head_dim = head_dim,
+                .max_seq = max_seq,
+                .k = mb.kv_k.ptr[0..total],
+                .v = mb.kv_v.ptr[0..total],
+                .pos = 0,
+                .owns_buffers = false,
+            };
+        }
+
         const k = try allocator.alloc(f32, total);
         errdefer allocator.free(k);
         const v = try allocator.alloc(f32, total);
@@ -46,12 +68,15 @@ pub const KvCache = struct {
             .k = k,
             .v = v,
             .pos = 0,
+            .owns_buffers = true,
         };
     }
 
     pub fn deinit(self: *KvCache, allocator: Allocator) void {
-        allocator.free(self.k);
-        allocator.free(self.v);
+        if (self.owns_buffers) {
+            allocator.free(self.k);
+            allocator.free(self.v);
+        }
         self.* = undefined;
     }
 
@@ -110,7 +135,7 @@ pub const KvCache = struct {
 
 test "KvCache slot/advance round-trip" {
     const gpa = std.testing.allocator;
-    var cache = try KvCache.init(gpa, 2, 4, 8, 16);
+    var cache = try KvCache.init(gpa, 2, 4, 8, 16, null);
     defer cache.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 0), cache.pos);

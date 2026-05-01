@@ -50,9 +50,6 @@ pub const State = struct {
     pub fn init(allocator: Allocator, m: *const Model, metal: ?*MetalBackend) !State {
         const c = m.config;
         const kv_dim = c.n_kv_heads * c.head_dim;
-        // attn_scores stays CPU-only — attention is on the CPU thread pool.
-        const attn_scores = try allocator.alloc(f32, c.n_heads * c.max_seq);
-        errdefer allocator.free(attn_scores);
 
         if (metal) |mb| {
             // Alias the persistent shared-storage scratch buffers. Slices are
@@ -64,7 +61,7 @@ pub const State = struct {
                 .q = mb.q.ptr[0 .. c.n_heads * c.head_dim],
                 .k_cur = mb.k_cur.ptr[0..kv_dim],
                 .v_cur = mb.v_cur.ptr[0..kv_dim],
-                .attn_scores = attn_scores,
+                .attn_scores = mb.attn_scores.ptr[0 .. c.n_heads * c.max_seq],
                 .attn_out = mb.attn_out.ptr[0..c.dim],
                 .gate = mb.gate.ptr[0..c.ffn_dim],
                 .up = mb.up.ptr[0..c.ffn_dim],
@@ -73,6 +70,9 @@ pub const State = struct {
                 .owns_buffers = false,
             };
         }
+
+        const attn_scores = try allocator.alloc(f32, c.n_heads * c.max_seq);
+        errdefer allocator.free(attn_scores);
 
         return .{
             .x = try allocator.alloc(f32, c.dim),
@@ -92,8 +92,8 @@ pub const State = struct {
     }
 
     pub fn deinit(self: *State, allocator: Allocator) void {
-        allocator.free(self.attn_scores);
         if (self.owns_buffers) {
+            allocator.free(self.attn_scores);
             allocator.free(self.x);
             allocator.free(self.xb);
             allocator.free(self.xb2);
@@ -136,7 +136,7 @@ pub fn step(
 
     for (m.layers, 0..) |layer, l| {
         if (gpu_ready) |mb| {
-            try gpuLayerStep(mb, layer, state, cache, c, l);
+            try gpuLayerStep(mb, layer, cache, c, l);
         } else {
             try cpuLayerStep(pool, metal, layer, state, cache, c, l);
         }
@@ -250,53 +250,56 @@ fn modelGpuEligible(m: *const Model) bool {
 fn gpuLayerStep(
     mb: *MetalBackend,
     layer: model_mod.LayerWeights,
-    state: *State,
     cache: *KvCache,
     c: model_mod.LlamaConfig,
     l: usize,
 ) StepError!void {
     const kv_dim = c.n_kv_heads * c.head_dim;
+    const seq_len = cache.pos + 1;
+    const head_dim_f: f32 = @floatFromInt(c.head_dim);
+    const inv_sqrt_hd: f32 = 1.0 / @sqrt(head_dim_f);
 
-    // Two segments per layer: pre-attn (rmsnorm + QKV + RoPE) and the rest
-    // (O + residual + ffn_rmsnorm + gate/up + SwiGLU + ffn_down + residual).
-    // The CPU island between them is KV write + scalar attention; everything
-    // else is GPU-side, chained on a single MTLCommandBuffer with implicit
-    // serial barriers between dispatches. Two-buffer rmsnorm reads from one
-    // buffer and writes to another so we don't need a CPU memcpy to stage.
+    // Per-layer KV slab offset (bytes) into the shared cache buffer.
+    const layer_kv_floats = c.max_seq * kv_dim;
+    const layer_kv_off_bytes = l * layer_kv_floats * @sizeOf(f32);
+    const slot_off_bytes = layer_kv_off_bytes + cache.pos * kv_dim * @sizeOf(f32);
 
-    // Segment 1: attn_rmsnorm(xb ← x), Q/K/V matmul, RoPE on Q,K.
-    {
-        const seg = mb.dev.segmentBegin() catch return error.UnsupportedWeightType;
-        seg.rmsnorm(mb.xb.buf, mb.x.buf, mb.weights_buf, mb.weightOffset(layer.attn_norm.bytes), c.dim, c.rms_eps);
-        seg.matmulQ8_0(mb.q.buf, mb.weights_buf, mb.weightOffset(layer.attn_q.bytes), mb.xb.buf, c.dim, c.dim);
-        seg.matmulQ8_0(mb.k_cur.buf, mb.weights_buf, mb.weightOffset(layer.attn_k.bytes), mb.xb.buf, kv_dim, c.dim);
-        seg.matmulQ8_0(mb.v_cur.buf, mb.weights_buf, mb.weightOffset(layer.attn_v.bytes), mb.xb.buf, kv_dim, c.dim);
-        seg.rope(mb.q.buf, c.n_heads, c.head_dim, cache.pos, c.rope_base);
-        seg.rope(mb.k_cur.buf, c.n_kv_heads, c.head_dim, cache.pos, c.rope_base);
-        seg.commit() catch return error.UnsupportedWeightType;
-    }
+    // One MTLCommandBuffer per layer — every op (including attention) on GPU.
+    // 16 dispatches chained with implicit serial barriers; one commit/sync.
+    const seg = mb.dev.segmentBegin() catch return error.UnsupportedWeightType;
 
-    // CPU island: KV cache write + scalar causal attention. Reads q/k_cur/
-    // v_cur straight out of shared-storage MTLBuffers; no dequant/copy.
-    @memcpy(cache.keySlot(l), state.k_cur);
-    @memcpy(cache.valueSlot(l), state.v_cur);
-    cpuAttention(state, cache, c, l);
+    // Pre-attn: rmsnorm(xb ← x), QKV projection, RoPE on Q/K.
+    seg.rmsnorm(mb.xb.buf, mb.x.buf, mb.weights_buf, mb.weightOffset(layer.attn_norm.bytes), c.dim, c.rms_eps);
+    seg.matmulQ8_0(mb.q.buf, mb.weights_buf, mb.weightOffset(layer.attn_q.bytes), mb.xb.buf, c.dim, c.dim);
+    seg.matmulQ8_0(mb.k_cur.buf, mb.weights_buf, mb.weightOffset(layer.attn_k.bytes), mb.xb.buf, kv_dim, c.dim);
+    seg.matmulQ8_0(mb.v_cur.buf, mb.weights_buf, mb.weightOffset(layer.attn_v.bytes), mb.xb.buf, kv_dim, c.dim);
+    seg.rope(mb.q.buf, c.n_heads, c.head_dim, cache.pos, c.rope_base);
+    seg.rope(mb.k_cur.buf, c.n_kv_heads, c.head_dim, cache.pos, c.rope_base);
 
-    // Segment 2: O matmul → attn residual → ffn_rmsnorm(xb ← x) → gate/up →
-    // SwiGLU → ffn_down → ffn residual. One MTLCommandBuffer for the whole
-    // back half of the layer.
-    {
-        const seg = mb.dev.segmentBegin() catch return error.UnsupportedWeightType;
-        seg.matmulQ8_0(mb.xb2.buf, mb.weights_buf, mb.weightOffset(layer.attn_o.bytes), mb.attn_out.buf, c.dim, c.dim);
-        seg.residualAdd(mb.x.buf, mb.xb2.buf, c.dim);
-        seg.rmsnorm(mb.xb.buf, mb.x.buf, mb.weights_buf, mb.weightOffset(layer.ffn_norm.bytes), c.dim, c.rms_eps);
-        seg.matmulQ8_0(mb.gate.buf, mb.weights_buf, mb.weightOffset(layer.ffn_gate.bytes), mb.xb.buf, c.ffn_dim, c.dim);
-        seg.matmulQ8_0(mb.up.buf, mb.weights_buf, mb.weightOffset(layer.ffn_up.bytes), mb.xb.buf, c.ffn_dim, c.dim);
-        seg.swiglu(mb.gate.buf, mb.up.buf, c.ffn_dim);
-        seg.matmulQ8_0(mb.ffn_out.buf, mb.weights_buf, mb.weightOffset(layer.ffn_down.bytes), mb.gate.buf, c.dim, c.ffn_dim);
-        seg.residualAdd(mb.x.buf, mb.ffn_out.buf, c.dim);
-        seg.commit() catch return error.UnsupportedWeightType;
-    }
+    // Splice rotated K and V into the per-layer cache slot at the current pos.
+    seg.copy(mb.kv_k.buf, slot_off_bytes, mb.k_cur.buf, 0, kv_dim);
+    seg.copy(mb.kv_v.buf, slot_off_bytes, mb.v_cur.buf, 0, kv_dim);
+
+    // GQA self-attention on GPU: scores = Q · Kᵀ * inv_sqrt_hd, softmax,
+    // weighted V sum. No causal mask needed — decode reads exactly the
+    // populated prefix [0, seq_len) out of the cache.
+    seg.attnScores(mb.attn_scores.buf, mb.q.buf, mb.kv_k.buf, layer_kv_off_bytes, c.n_heads, c.n_kv_heads, c.head_dim, seq_len, inv_sqrt_hd);
+    seg.softmaxRows(mb.attn_scores.buf, c.n_heads, c.n_kv_heads, c.head_dim, seq_len);
+    seg.attnWeightedSum(mb.attn_out.buf, mb.attn_scores.buf, mb.kv_v.buf, layer_kv_off_bytes, c.n_heads, c.n_kv_heads, c.head_dim, seq_len);
+
+    // Post-attn: O proj + residual into x.
+    seg.matmulQ8_0(mb.xb2.buf, mb.weights_buf, mb.weightOffset(layer.attn_o.bytes), mb.attn_out.buf, c.dim, c.dim);
+    seg.residualAdd(mb.x.buf, mb.xb2.buf, c.dim);
+
+    // FFN: rmsnorm(xb ← x), gate/up matmul, SwiGLU, ffn_down, residual.
+    seg.rmsnorm(mb.xb.buf, mb.x.buf, mb.weights_buf, mb.weightOffset(layer.ffn_norm.bytes), c.dim, c.rms_eps);
+    seg.matmulQ8_0(mb.gate.buf, mb.weights_buf, mb.weightOffset(layer.ffn_gate.bytes), mb.xb.buf, c.ffn_dim, c.dim);
+    seg.matmulQ8_0(mb.up.buf, mb.weights_buf, mb.weightOffset(layer.ffn_up.bytes), mb.xb.buf, c.ffn_dim, c.dim);
+    seg.swiglu(mb.gate.buf, mb.up.buf, c.ffn_dim);
+    seg.matmulQ8_0(mb.ffn_out.buf, mb.weights_buf, mb.weightOffset(layer.ffn_down.bytes), mb.gate.buf, c.dim, c.ffn_dim);
+    seg.residualAdd(mb.x.buf, mb.ffn_out.buf, c.dim);
+
+    seg.commit() catch return error.UnsupportedWeightType;
 }
 
 fn gpuFinalStep(mb: *MetalBackend, m: *const Model, c: model_mod.LlamaConfig) StepError!void {

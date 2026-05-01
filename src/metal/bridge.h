@@ -106,6 +106,40 @@ void vtb_metal_segment_residual_add(
     VtbMetalBuf *b_buf,
     size_t n);
 
+// f32 copy: dst[dst_off + i] = src[src_off + i] for i in [0, n_floats).
+// Offsets are byte offsets, applied via setBuffer:offset: so they must be
+// 4-byte (f32) aligned.
+void vtb_metal_segment_copy(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *dst_buf, size_t dst_offset_bytes,
+    VtbMetalBuf *src_buf, size_t src_offset_bytes,
+    size_t n_floats);
+
+// scores[h, t] = (q[h] · K[t, kv_h]) * inv_sqrt_hd, for h ∈ n_heads,
+// t ∈ seq_len. K cache offset (bytes) selects the per-layer KV slab.
+void vtb_metal_segment_attn_scores(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *scores_buf,
+    VtbMetalBuf *q_buf,
+    VtbMetalBuf *k_cache_buf, size_t k_cache_offset_bytes,
+    size_t n_heads, size_t n_kv_heads, size_t head_dim, size_t seq_len,
+    float inv_sqrt_hd);
+
+// In-place row-wise numerically-stable softmax. One row per head, length
+// seq_len. Stride between rows is exactly seq_len (not max_seq).
+void vtb_metal_segment_softmax_rows(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *scores_buf,
+    size_t n_heads, size_t n_kv_heads, size_t head_dim, size_t seq_len);
+
+// out[h, d] = Σ_t scores[h, t] * V[t, kv_h, d].
+void vtb_metal_segment_attn_weighted_sum(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *out_buf,
+    VtbMetalBuf *scores_buf,
+    VtbMetalBuf *v_cache_buf, size_t v_cache_offset_bytes,
+    size_t n_heads, size_t n_kv_heads, size_t head_dim, size_t seq_len);
+
 #ifdef __cplusplus
 }
 #endif
