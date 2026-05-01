@@ -21,6 +21,7 @@ interpreter tax, no copy tax, no allocation tax — just weights and math.
 | SentencePiece BPE encode + decode       | shipped              |
 | Sampling: greedy / temp / top-k / top-p | shipped              |
 | Chat template (TinyLlama zephyr)        | shipped              |
+| HTTP server (Ollama-compatible subset)  | shipped              |
 | Q8_0 / Q4_K / Q5_K / Q6_K / F32 / F16   | shipped              |
 | TQ2_0 (1.58-bit ternary) plumbed        | dequant + matmul written, untested on real model |
 | Safetensors loader                      | not yet              |
@@ -209,6 +210,67 @@ vantablack ~/models/tinyllama.Q8_0.gguf chat \
   --temp 0.7 --top-k 40 --seed 7 \
   100 "Tell me a short joke about a cat"
 ```
+
+---
+
+## Server mode (Ollama-compatible)
+
+Long-running HTTP server that speaks a subset of the Ollama API. Use it as
+a drop-in backend for editor plugins, code-completion clients, LangChain,
+Open WebUI, or anything else that already targets Ollama.
+
+```sh
+vantablack ~/models/tinyllama.Q8_0.gguf serve [--host H] [--port P]
+# Default: 127.0.0.1:11434 (Ollama's default port)
+# vantablack: serving 'tinyllama-1.1b-chat-v1.0.Q8_0.gguf' at http://127.0.0.1:11434/
+```
+
+**Endpoints**
+
+| Method | Path             | Purpose                                              |
+|--------|------------------|------------------------------------------------------|
+| GET    | `/health`, `/`   | Liveness probe — `vantablack ok`                     |
+| GET    | `/api/tags`      | One-element model list for client model pickers      |
+| POST   | `/api/generate`  | Streamed NDJSON tokens (raw prompt)                  |
+| POST   | `/api/chat`      | Streamed NDJSON tokens (chat-template wrapped)       |
+
+**Example: streaming generate**
+```sh
+curl -N -X POST http://127.0.0.1:11434/api/generate -d '{
+  "model": "tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
+  "prompt": "fn main() {",
+  "stream": true,
+  "options": {"num_predict": 64}
+}'
+```
+
+**Example: streaming chat**
+```sh
+curl -N -X POST http://127.0.0.1:11434/api/chat -d '{
+  "model": "tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
+  "messages": [{"role": "user", "content": "Write hello world in Zig"}]
+}'
+```
+
+**Example: non-streaming (`stream: false`)**
+```sh
+curl -X POST http://127.0.0.1:11434/api/generate -d '{
+  "model": "tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
+  "prompt": "Once upon a time",
+  "stream": false
+}'
+```
+
+**Defaults & options**
+- `temperature = 0.0` (greedy / deterministic — chosen for code-gen)
+- `num_predict = 256`
+- Override per-request via `options: {temperature, top_k, top_p, seed, num_predict}`
+- The `model` field is validated against the loaded model's basename. Mismatches return HTTP 404.
+
+**Concurrency**
+- Serial: one request at a time, mutex-guarded. Concurrent clients queue.
+- Reuses Model + KvCache + ThreadPool across requests — no per-request mmap or state-init cost.
+- For multi-tenant deployments, run multiple `serve` processes on different ports.
 
 ---
 

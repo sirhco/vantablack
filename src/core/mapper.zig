@@ -39,7 +39,7 @@ pub const ModelMapper = struct {
         var arena: std.heap.ArenaAllocator = .init(allocator);
         errdefer arena.deinit();
 
-        const file = try Io.Dir.openFileAbsolute(io, abs_path, .{});
+        const file = try Io.Dir.openFileAbsolute(io, abs_path, .{ .allow_directory = false });
         defer file.close(io);
 
         const len = try file.length(io);

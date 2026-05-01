@@ -9,6 +9,7 @@ const usage =
     \\  vantablack <model.gguf> generate <n> <id> [id...]    generate n tokens
     \\  vantablack <model.gguf> prompt <n> <text>            encode text, generate n more tokens
     \\  vantablack <model.gguf> chat <n> <user-message>      wrap in TinyLlama-Chat (zephyr) template
+    \\  vantablack <model.gguf> serve [--host H] [--port P]  Ollama-compatible HTTP server (default 127.0.0.1:11434)
     \\
     \\generate / prompt / chat accept sampler flags BEFORE the n value:
     \\  --temp <f>     temperature (0.0 = greedy)
@@ -51,7 +52,31 @@ pub fn main(init: std.process.Init) !void {
     var mapper = try vantablack.ModelMapper.init(gpa, io, abs_path);
     defer mapper.deinit();
 
-    if (args.len >= 3 and (std.mem.eql(u8, args[2], "generate") or
+    if (args.len >= 3 and std.mem.eql(u8, args[2], "serve")) {
+        var host: []const u8 = "127.0.0.1";
+        var port: u16 = 11434;
+        var idx: usize = 3;
+        while (idx < args.len) : (idx += 1) {
+            const a = args[idx];
+            if (std.mem.eql(u8, a, "--host")) {
+                idx += 1;
+                host = args[idx];
+            } else if (std.mem.eql(u8, a, "--port")) {
+                idx += 1;
+                port = try std.fmt.parseInt(u16, args[idx], 10);
+            } else break;
+        }
+        const model_name = std.fs.path.basename(abs_path);
+        var srv = try vantablack.Server.init(gpa, io, &mapper, .{
+            .host = host,
+            .port = port,
+            .model_name = model_name,
+            .model_path = abs_path,
+        });
+        defer srv.deinit();
+        try srv.run();
+        return;
+    } else if (args.len >= 3 and (std.mem.eql(u8, args[2], "generate") or
         std.mem.eql(u8, args[2], "prompt") or
         std.mem.eql(u8, args[2], "chat")))
     {
@@ -126,11 +151,10 @@ pub fn main(init: std.process.Init) !void {
                     if (i != 0) try user_buf.append(arena, ' ');
                     try user_buf.appendSlice(arena, a);
                 }
-                // TinyLlama-Chat zephyr template.
-                const wrapped = try std.fmt.allocPrint(
+                const wrapped = try vantablack.chat_template.formatLlamaChatSingle(
                     arena,
-                    "<|system|>\n{s}</s>\n<|user|>\n{s}</s>\n<|assistant|>\n",
-                    .{ system_prompt, user_buf.items },
+                    system_prompt,
+                    user_buf.items,
                 );
                 var tok = try vantablack.Tokenizer.init(gpa, mapper.catalog);
                 defer tok.deinit(gpa);
