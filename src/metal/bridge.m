@@ -27,6 +27,15 @@ struct MMParams {
     uint w_offset_bytes; // byte offset into the weights buffer
 };
 
+// Q8_0 matmul, per-thread per-row.
+//
+// One thread = one output row. Inside each row, the 32-element Q8_0 block
+// loop is unrolled into 8 float4 FMAs. Apple's L2 cache absorbs the activation
+// re-reads across simdgroups, and the dot-product chain stays in registers,
+// so this simple layout already saturates the memory subsystem for TinyLlama-
+// scale matmuls. Empirically beats both shared-tile and simdgroup-per-row
+// variants on M-series — see project memory.
+
 kernel void matmul_q8_0(
     device float       *out      [[buffer(0)]],
     device const uchar *weights  [[buffer(1)]],
@@ -39,8 +48,6 @@ kernel void matmul_q8_0(
     uint row_bytes = blocks_per_row * Q8_BLOCK_BYTES;
     device const uchar *row = weights + p.w_offset_bytes + gid * row_bytes;
 
-    // Vectorized inner: one Q8_0 block = 32 elements = 8 char4 / 8 float4.
-    // float4 FMA + char4 -> float4 conversion is one ALU op each on M-series.
     float total = 0.0;
     for (uint b = 0; b < blocks_per_row; ++b) {
         device const uchar *blk = row + b * Q8_BLOCK_BYTES;
@@ -48,12 +55,11 @@ kernel void matmul_q8_0(
         float scale_f = (float)as_type<half>(scale_u16);
 
         // qs lives at byte offset 2 within the block — only 2-byte aligned,
-        // so packed_char4 (no alignment requirement) is required for the load.
+        // so packed_char4 (no alignment requirement) is required.
         device const packed_char4 *qs4 = (device const packed_char4 *)(blk + 2);
         device const float4 *x4 = (device const float4 *)(acts + b * Q8_BLOCK_ELEMS);
 
         float4 acc = float4(0.0);
-        // Unrolled: 8 iterations of float4 FMA covers the 32-element block.
         acc = fma(float4(char4(qs4[0])), x4[0], acc);
         acc = fma(float4(char4(qs4[1])), x4[1], acc);
         acc = fma(float4(char4(qs4[2])), x4[2], acc);
@@ -465,15 +471,12 @@ int vtb_metal_matmul_q8_0(
         params.w_offset_bytes = (uint32_t)w_offset;
         [enc setBytes:&params length:sizeof(params) atIndex:3];
 
-        // One thread per output row. Threadgroup of 64 is a reasonable
-        // default; tune later.
+        // One thread per output row. 64 threads per threadgroup.
         NSUInteger tg = 64;
-        if (tg > ctx->pso_q8_0.maxTotalThreadsPerThreadgroup) {
+        if (tg > ctx->pso_q8_0.maxTotalThreadsPerThreadgroup)
             tg = ctx->pso_q8_0.maxTotalThreadsPerThreadgroup;
-        }
-        MTLSize grid = MTLSizeMake(m, 1, 1);
-        MTLSize threads = MTLSizeMake(tg, 1, 1);
-        [enc dispatchThreads:grid threadsPerThreadgroup:threads];
+        [enc dispatchThreads:MTLSizeMake(m, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
         [cmd commit];
         [cmd waitUntilCompleted];
