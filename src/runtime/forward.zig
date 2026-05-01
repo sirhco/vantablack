@@ -1,0 +1,299 @@
+//! Per-token forward pass for a Llama-architecture model.
+//!
+//! Owns scratch buffers; reuses them across tokens. One call to `step` reads
+//! a single token id, advances the KV cache by one slot, and writes logits
+//! into `state.logits`.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+const parser = @import("../core/parser.zig");
+const simd = @import("../kernels/simd.zig");
+const math = @import("../kernels/math.zig");
+const kernels = @import("../kernels/comptime_gen.zig");
+const model_mod = @import("model.zig");
+const kv_cache_mod = @import("kv_cache.zig");
+
+const Model = model_mod.Model;
+const TypedTensor = model_mod.TypedTensor;
+const KvCache = kv_cache_mod.KvCache;
+
+pub const StepError = error{
+    UnsupportedWeightType,
+    KvCacheFull,
+    TokenOutOfRange,
+};
+
+pub const State = struct {
+    x: []f32,
+    xb: []f32,
+    xb2: []f32,
+    q: []f32,
+    k_cur: []f32,
+    v_cur: []f32,
+    attn_scores: []f32, // size: n_heads * max_seq
+    attn_out: []f32,
+    gate: []f32,
+    up: []f32,
+    ffn_out: []f32,
+    logits: []f32,
+
+    pub fn init(allocator: Allocator, m: *const Model) !State {
+        const c = m.config;
+        const kv_dim = c.n_kv_heads * c.head_dim;
+        return .{
+            .x = try allocator.alloc(f32, c.dim),
+            .xb = try allocator.alloc(f32, c.dim),
+            .xb2 = try allocator.alloc(f32, c.dim),
+            .q = try allocator.alloc(f32, c.n_heads * c.head_dim),
+            .k_cur = try allocator.alloc(f32, kv_dim),
+            .v_cur = try allocator.alloc(f32, kv_dim),
+            .attn_scores = try allocator.alloc(f32, c.n_heads * c.max_seq),
+            .attn_out = try allocator.alloc(f32, c.dim),
+            .gate = try allocator.alloc(f32, c.ffn_dim),
+            .up = try allocator.alloc(f32, c.ffn_dim),
+            .ffn_out = try allocator.alloc(f32, c.dim),
+            .logits = try allocator.alloc(f32, c.vocab_size),
+        };
+    }
+
+    pub fn deinit(self: *State, allocator: Allocator) void {
+        allocator.free(self.x);
+        allocator.free(self.xb);
+        allocator.free(self.xb2);
+        allocator.free(self.q);
+        allocator.free(self.k_cur);
+        allocator.free(self.v_cur);
+        allocator.free(self.attn_scores);
+        allocator.free(self.attn_out);
+        allocator.free(self.gate);
+        allocator.free(self.up);
+        allocator.free(self.ffn_out);
+        allocator.free(self.logits);
+        self.* = undefined;
+    }
+};
+
+pub fn step(
+    m: *const Model,
+    state: *State,
+    cache: *KvCache,
+    token_id: u32,
+) StepError!void {
+    const c = m.config;
+    if (token_id >= c.vocab_size) return error.TokenOutOfRange;
+    if (cache.pos >= c.max_seq) return error.KvCacheFull;
+
+    // Embed.
+    try gatherEmbedding(state.x, m.token_embd, token_id, c.dim);
+
+    const kv_dim = c.n_kv_heads * c.head_dim;
+    const head_dim_f: f32 = @floatFromInt(c.head_dim);
+    const inv_sqrt_hd: f32 = 1.0 / @sqrt(head_dim_f);
+
+    for (m.layers, 0..) |layer, l| {
+        // Attention RMSNorm.
+        @memcpy(state.xb, state.x);
+        try rmsNormTyped(state.xb, layer.attn_norm, c.rms_eps);
+
+        // QKV projections.
+        try matmulRuntime(state.q, layer.attn_q, state.xb, c.dim, c.dim);
+        try matmulRuntime(state.k_cur, layer.attn_k, state.xb, kv_dim, c.dim);
+        try matmulRuntime(state.v_cur, layer.attn_v, state.xb, kv_dim, c.dim);
+
+        // RoPE on Q (per head) and K (per kv head).
+        for (0..c.n_heads) |h| {
+            math.rope(state.q[h * c.head_dim ..][0..c.head_dim], cache.pos, c.rope_base);
+        }
+        for (0..c.n_kv_heads) |h| {
+            math.rope(state.k_cur[h * c.head_dim ..][0..c.head_dim], cache.pos, c.rope_base);
+        }
+
+        // Write into KV cache and bump pos.
+        @memcpy(cache.keySlot(l), state.k_cur);
+        @memcpy(cache.valueSlot(l), state.v_cur);
+        // Defer cache.advance() until all layers wrote — but pos is shared
+        // across layers for the SAME token, so advance once after the loop.
+
+        // Attention.
+        const seq_len = cache.pos + 1; // includes current
+        const kv_row = c.n_kv_heads * c.head_dim;
+        const k_buf = cache.keysFor(l, seq_len);
+        const v_buf = cache.valuesFor(l, seq_len);
+
+        @memset(state.attn_out, 0);
+        for (0..c.n_heads) |h| {
+            const kv_h = (h * c.n_kv_heads) / c.n_heads; // GQA fan-in
+            const q_h = state.q[h * c.head_dim ..][0..c.head_dim];
+            const scores = state.attn_scores[h * c.max_seq ..][0..seq_len];
+
+            for (0..seq_len) |t| {
+                const k_th = k_buf[t * kv_row + kv_h * c.head_dim ..][0..c.head_dim];
+                var s: f32 = 0;
+                for (q_h, k_th) |qv, kv| s += qv * kv;
+                scores[t] = s * inv_sqrt_hd;
+            }
+            math.softmax(scores);
+
+            // Weighted sum of V into attn_out_h.
+            const out_h = state.attn_out[h * c.head_dim ..][0..c.head_dim];
+            for (0..seq_len) |t| {
+                const v_th = v_buf[t * kv_row + kv_h * c.head_dim ..][0..c.head_dim];
+                const w = scores[t];
+                for (out_h, v_th) |*o, vv| o.* += w * vv;
+            }
+        }
+
+        // Output projection + residual.
+        try matmulRuntime(state.xb2, layer.attn_o, state.attn_out, c.dim, c.dim);
+        math.addInto(state.x, state.xb2);
+
+        // FFN RMSNorm.
+        @memcpy(state.xb, state.x);
+        try rmsNormTyped(state.xb, layer.ffn_norm, c.rms_eps);
+
+        // SwiGLU FFN.
+        try matmulRuntime(state.gate, layer.ffn_gate, state.xb, c.ffn_dim, c.dim);
+        try matmulRuntime(state.up, layer.ffn_up, state.xb, c.ffn_dim, c.dim);
+        math.swiglu(state.gate, state.up);
+        try matmulRuntime(state.ffn_out, layer.ffn_down, state.gate, c.dim, c.ffn_dim);
+        math.addInto(state.x, state.ffn_out);
+    }
+
+    cache.advance();
+
+    // Final norm + LM head.
+    try rmsNormTyped(state.x, m.output_norm, c.rms_eps);
+    try matmulRuntime(state.logits, m.output_w, state.x, c.vocab_size, c.dim);
+}
+
+// -------------------- helpers ---------------------------------------------
+
+fn matmulRuntime(out: []f32, w: TypedTensor, acts: []const f32, m: usize, k: usize) StepError!void {
+    const q = model_mod.quantOf(w.ggml_type) catch return error.UnsupportedWeightType;
+    switch (q) {
+        inline else => |qt| {
+            const kernel = comptime kernels.dispatch(qt);
+            kernel(out, w.bytes, acts, m, k);
+        },
+    }
+}
+
+/// RMSNorm where the weight tensor is stored in some ggml type. Most llamas
+/// keep norms in f32 but Q8_0 / f16 are also legal.
+fn rmsNormTyped(x: []f32, w: TypedTensor, eps: f32) StepError!void {
+    var stack_buf: [8192]f32 = undefined;
+    const dim = x.len;
+    if (dim > stack_buf.len) return error.UnsupportedWeightType;
+    const w_f32 = stack_buf[0..dim];
+    try dequantToF32(w_f32, w, dim);
+    math.rmsNorm(x, w_f32, eps);
+}
+
+fn dequantToF32(out: []f32, w: TypedTensor, n: usize) StepError!void {
+    const q = model_mod.quantOf(w.ggml_type) catch return error.UnsupportedWeightType;
+    switch (q) {
+        .f32 => {
+            const ptr: [*]align(1) const f32 = @ptrCast(w.bytes.ptr);
+            for (out[0..n], 0..) |*o, i| o.* = ptr[i];
+        },
+        .f16 => {
+            for (out[0..n], 0..) |*o, i| {
+                const bits = std.mem.readInt(u16, w.bytes[i * 2 ..][0..2], .little);
+                const h: f16 = @bitCast(bits);
+                o.* = @floatCast(h);
+            }
+        },
+        .q8_0 => {
+            std.debug.assert(n % simd.q8_0_block_elems == 0);
+            const blocks = n / simd.q8_0_block_elems;
+            for (0..blocks) |b| {
+                var tmp: [simd.q8_0_block_elems]f32 = undefined;
+                const blk: *const [simd.q8_0_block_bytes]u8 =
+                    w.bytes[b * simd.q8_0_block_bytes ..][0..simd.q8_0_block_bytes];
+                simd.dequantBlockQ8_0(blk, &tmp);
+                @memcpy(out[b * simd.q8_0_block_elems ..][0..simd.q8_0_block_elems], &tmp);
+            }
+        },
+        .q4_k => {
+            std.debug.assert(n % simd.q4_k_block_elems == 0);
+            const blocks = n / simd.q4_k_block_elems;
+            for (0..blocks) |b| {
+                var tmp: [simd.q4_k_block_elems]f32 = undefined;
+                const blk: *const [simd.q4_k_block_bytes]u8 =
+                    w.bytes[b * simd.q4_k_block_bytes ..][0..simd.q4_k_block_bytes];
+                simd.dequantBlockQ4_K(blk, &tmp);
+                @memcpy(out[b * simd.q4_k_block_elems ..][0..simd.q4_k_block_elems], &tmp);
+            }
+        },
+        .ternary158 => {
+            std.debug.assert(n % simd.tq2_0_block_elems == 0);
+            const blocks = n / simd.tq2_0_block_elems;
+            for (0..blocks) |b| {
+                var tmp: [simd.tq2_0_block_elems]f32 = undefined;
+                const blk: *const [simd.tq2_0_block_bytes]u8 =
+                    w.bytes[b * simd.tq2_0_block_bytes ..][0..simd.tq2_0_block_bytes];
+                simd.dequantBlockTQ2_0(blk, &tmp);
+                @memcpy(out[b * simd.tq2_0_block_elems ..][0..simd.tq2_0_block_elems], &tmp);
+            }
+        },
+    }
+}
+
+fn gatherEmbedding(out: []f32, table: TypedTensor, id: u32, dim: usize) StepError!void {
+    const q = model_mod.quantOf(table.ggml_type) catch return error.UnsupportedWeightType;
+    const id_us: usize = @intCast(id);
+    switch (q) {
+        .f32 => {
+            const ptr: [*]align(1) const f32 = @ptrCast(table.bytes.ptr);
+            for (out, 0..) |*o, i| o.* = ptr[id_us * dim + i];
+        },
+        .f16 => {
+            const off = id_us * dim * 2;
+            for (out, 0..) |*o, i| {
+                const bits = std.mem.readInt(u16, table.bytes[off + i * 2 ..][0..2], .little);
+                const h: f16 = @bitCast(bits);
+                o.* = @floatCast(h);
+            }
+        },
+        .q8_0 => {
+            std.debug.assert(dim % simd.q8_0_block_elems == 0);
+            const blocks = dim / simd.q8_0_block_elems;
+            const row_bytes = blocks * simd.q8_0_block_bytes;
+            const row = table.bytes[id_us * row_bytes ..][0..row_bytes];
+            for (0..blocks) |b| {
+                var tmp: [simd.q8_0_block_elems]f32 = undefined;
+                const blk: *const [simd.q8_0_block_bytes]u8 =
+                    row[b * simd.q8_0_block_bytes ..][0..simd.q8_0_block_bytes];
+                simd.dequantBlockQ8_0(blk, &tmp);
+                @memcpy(out[b * simd.q8_0_block_elems ..][0..simd.q8_0_block_elems], &tmp);
+            }
+        },
+        .q4_k => {
+            std.debug.assert(dim % simd.q4_k_block_elems == 0);
+            const blocks = dim / simd.q4_k_block_elems;
+            const row_bytes = blocks * simd.q4_k_block_bytes;
+            const row = table.bytes[id_us * row_bytes ..][0..row_bytes];
+            for (0..blocks) |b| {
+                var tmp: [simd.q4_k_block_elems]f32 = undefined;
+                const blk: *const [simd.q4_k_block_bytes]u8 =
+                    row[b * simd.q4_k_block_bytes ..][0..simd.q4_k_block_bytes];
+                simd.dequantBlockQ4_K(blk, &tmp);
+                @memcpy(out[b * simd.q4_k_block_elems ..][0..simd.q4_k_block_elems], &tmp);
+            }
+        },
+        .ternary158 => {
+            std.debug.assert(dim % simd.tq2_0_block_elems == 0);
+            const blocks = dim / simd.tq2_0_block_elems;
+            const row_bytes = blocks * simd.tq2_0_block_bytes;
+            const row = table.bytes[id_us * row_bytes ..][0..row_bytes];
+            for (0..blocks) |b| {
+                var tmp: [simd.tq2_0_block_elems]f32 = undefined;
+                const blk: *const [simd.tq2_0_block_bytes]u8 =
+                    row[b * simd.tq2_0_block_bytes ..][0..simd.tq2_0_block_bytes];
+                simd.dequantBlockTQ2_0(blk, &tmp);
+                @memcpy(out[b * simd.tq2_0_block_elems ..][0..simd.tq2_0_block_elems], &tmp);
+            }
+        },
+    }
+}
