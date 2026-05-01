@@ -53,43 +53,45 @@ Headroom: NEON-tuned int8 dot path, prompt prefill batching, M2/M3 AMX dispatch.
 ## Architecture
 
 ```
-                     argv: model.gguf [subcommand args]
-                                  |
-                                  v
-        +-------------------------+--------------------------+
-        |                  src/main.zig CLI                  |
-        |   (catalog | generate | prompt | chat dispatch)    |
-        +------+----------+-----------+---------+------------+
-               |          |           |         |
-               v          v           v         v
-        ModelMapper   Tokenizer    Sampler  ThreadPool
-       (mmap+catalog)  (BPE+SPM)  (temp/k/p) (N-1 workers)
-               |          |           |         |
-               +-----+----+-----+-----+----+----+
+   argv: model.gguf [subcommand args]              HTTP client (Ollama-compatible)
+                  |                                              |
+                  v                                              v
+   +--------------+--------------+              +----------------+----------------+
+   |       src/main.zig CLI      |              |     runtime/server.zig          |
+   |   catalog | generate |      |              |   accept loop + http.Server     |
+   |   prompt  | chat | serve   -+------------->+   GET /health, /api/tags        |
+   +-----------+-+-+-+-----------+              |   POST /api/generate, /api/chat |
+               | | | |                          +----------------+----------------+
+               | | | +------------ inference_mu (serial) --------+
+               v v v                                             v
+       ModelMapper  Tokenizer  Sampler  ThreadPool  KvCache   chat_template
+      (mmap+catalog)(BPE+SPM)(temp/k/p)(N-1 workers)(O(1) mem)(zephyr wrap)
+               \      \         \         |          /
+                +-----+----+----+----+----+----+----+
                      |          |          |
                      v          v          v
                 +----+----------+----------+----+
-                |       runtime/forward.zig       |
-                |  per-token Llama forward pass  |
-                |  (RMSNorm, QKV, RoPE, GQA-attn,|
-                |   SwiGLU FFN, residuals,       |
-                |   LM head -> logits)           |
-                +----+--------+--------+---------+
-                     |        |        |
-                     v        v        v
-                  KvCache   math/    kernels/
-                            simd     comptime_gen
-                                   (dispatch by quant)
-                                          |
-                                          v
-                              +-----------+--------+
-                              | matmul_q8_0        |
-                              | matmul_q4_k        |
-                              | matmul_q5_k        |
-                              | matmul_q6_k        |
-                              | matmul_f16/f32     |
-                              | matmul_ternary158  |
-                              +--------------------+
+                |     runtime/forward.zig       |
+                |  per-token Llama forward pass |
+                |  RMSNorm, QKV, RoPE, GQA-attn,|
+                |  SwiGLU FFN, residuals,       |
+                |  LM head -> logits            |
+                +----+--------+--------+--------+
+                                       |
+                                       v
+                                  kernels/
+                                  comptime_gen
+                                  (dispatch by quant)
+                                       |
+                                       v
+                          +------------+--------+
+                          | matmul_q8_0         |
+                          | matmul_q4_k         |
+                          | matmul_q5_k         |
+                          | matmul_q6_k         |
+                          | matmul_f16/f32      |
+                          | matmul_ternary158   |
+                          +---------------------+
 ```
 
 ### Module map
@@ -111,7 +113,9 @@ src/
     ├── forward.zig           per-token forward pass; matmul row-split via pool
     ├── pool.zig              persistent ThreadPool (epoch + spinLoopHint)
     ├── tokenizer.zig         SentencePiece BPE encode + decode
-    └── sampler.zig           temp/top-k/top-p + std.Random PRNG
+    ├── sampler.zig           temp/top-k/top-p + std.Random PRNG
+    ├── chat_template.zig     TinyLlama-Chat (zephyr) format helpers
+    └── server.zig            HTTP server, Ollama API subset, NDJSON streaming
 ```
 
 ---
@@ -135,7 +139,8 @@ These are not aesthetic — they shape every line:
 6. **No global state.** Allocators, file handles, pools, and caches are all
    passed explicitly.
 7. **ReleaseSmall stays under 5 MB stripped.** A forcing function. Currently
-   217 KB. Pulling in a dependency would feel as expensive as it actually is.
+   292 KB (includes the HTTP server, JSON parsing, and all kernels). Pulling
+   in a dependency would feel as expensive as it actually is.
 
 ### "Pure Zig" and GPU
 
@@ -154,8 +159,8 @@ Requires Zig 0.16.0+.
 ```sh
 zig build                         # Debug, default
 zig build -Doptimize=ReleaseFast  # multi-threaded, fast inference
-zig build -Doptimize=ReleaseSmall # single-threaded, ~217 KB stripped
-zig build test                    # all unit tests
+zig build -Doptimize=ReleaseSmall # single-threaded, ~292 KB stripped
+zig build test                    # all unit tests (32 tests)
 ```
 
 `build.zig` derives per-mode flags from `optimize`:
@@ -313,6 +318,39 @@ remapping in `runtime/model.zig`.
 - **No tokenizer encoder fallback.** SentencePiece BPE only. Tiktoken-style
   byte-level BPE (GPT-2/Llama-3) requires a different merge algorithm.
 - **CPU-only.** GPU path conflicts with no-FFI constraint.
+- **Server is serial.** One request at a time, mutex-guarded. Good for
+  single-user code-gen; multi-tenant requires multiple `serve` processes
+  on different ports.
+- **Server `created_at` is a placeholder** (`1970-01-01T00:00:00Z`) and
+  `digest`/`total_duration`/`eval_count` fields are omitted. Most clients
+  tolerate it; full Ollama parity would add real timestamps + sha256.
+
+---
+
+## Build history
+
+The engine grew in five tracked phases. Commit log mirrors this:
+
+1. **Task 1 — Foundation** — `build.zig` flags, `core/{mapper,parser}.zig`,
+   `kernels/comptime_gen.zig`, kernel stubs. CLI prints tensor catalog.
+   ReleaseSmall stripped < 5 MB constraint established.
+2. **Task 2 — End-to-end inference** — `kernels/{simd,math}.zig` real
+   Q8_0/Q4_K/TQ2_0/F16/F32 paths, `runtime/{kv_cache,model,forward,
+   tokenizer,sampler}.zig`. CLI gains `generate` (token IDs).
+3. **Task 3 — Real-model parity** — Smoke-tested on TinyLlama Q8_0;
+   added SentencePiece BPE encoder; sampler temperature/top-k/top-p +
+   seeded PRNG; CLI `prompt` (text) and chat-template wrapping.
+4. **Task 4 — Q5_K + Q6_K + thread pool + chat** — Closed K-quant family,
+   verified Q4_K_M / Q4_K_S on real model, added `runtime/pool.zig`
+   persistent worker pool (5–8× speedup on matmul), CLI `chat` subcommand.
+5. **Task 5 — HTTP server** — `runtime/server.zig` Ollama-compatible
+   subset (`/api/generate`, `/api/chat`, `/api/tags`, `/health`),
+   NDJSON streaming via `http.Server.respondStreaming`,
+   `runtime/chat_template.zig` reusable template helpers, CLI `serve`.
+
+Each phase preserved the hard constraints (pure Zig std, mmap-first,
+no-FFI, < 5 MB stripped, no global state) and shipped passing tests +
+real-model smoke before moving on.
 
 ---
 
