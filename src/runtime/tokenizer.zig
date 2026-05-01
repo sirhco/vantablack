@@ -229,6 +229,158 @@ pub const Tokenizer = struct {
         });
     }
 
+    /// Build a Tokenizer from a HuggingFace `tokenizer.json` payload (the
+    /// `tokenizers` crate JSON serialization that MLX checkpoints ship).
+    /// Targets Llama-family models — BPE with `byte_fallback`, SentencePiece
+    /// `▁` (U+2581) word-start marker, and a `Prepend ▁ + Replace ' '→'▁'`
+    /// normalizer pipeline. The existing greedy-BPE encoder above runs
+    /// unchanged once `pieces` and `scores` are populated correctly.
+    pub fn initFromHfJson(allocator: Allocator, json_bytes: []const u8) TokenizerError!Tokenizer {
+        var arena: std.heap.ArenaAllocator = .init(allocator);
+        const aalloc = arena.allocator();
+        defer arena.deinit();
+
+        const parsed = std.json.parseFromSlice(std.json.Value, aalloc, json_bytes, .{}) catch
+            return error.InvalidVocabPayload;
+        const root = parsed.value;
+        if (root != .object) return error.InvalidVocabPayload;
+
+        const model_v = root.object.get("model") orelse return error.MissingVocab;
+        if (model_v != .object) return error.InvalidVocabPayload;
+        const vocab_v = model_v.object.get("vocab") orelse return error.MissingVocab;
+        if (vocab_v != .object) return error.InvalidVocabPayload;
+        const merges_v = model_v.object.get("merges");
+
+        // First pass: highest token id, to size pieces/scores.
+        var max_id: usize = 0;
+        var vit = vocab_v.object.iterator();
+        while (vit.next()) |kv| {
+            if (kv.value_ptr.* != .integer) return error.InvalidVocabPayload;
+            const id = kv.value_ptr.*.integer;
+            if (id < 0) return error.InvalidVocabPayload;
+            const id_us: usize = @intCast(id);
+            if (id_us > max_id) max_id = id_us;
+        }
+        // Specials go through `added_tokens`; include them in the size.
+        if (root.object.get("added_tokens")) |at_v| {
+            if (at_v == .array) {
+                for (at_v.array.items) |entry| {
+                    if (entry != .object) continue;
+                    if (entry.object.get("id")) |id_v| {
+                        if (id_v == .integer and id_v.integer >= 0) {
+                            const id_us: usize = @intCast(id_v.integer);
+                            if (id_us > max_id) max_id = id_us;
+                        }
+                    }
+                }
+            }
+        }
+        const count = max_id + 1;
+
+        const pieces = try allocator.alloc([]const u8, count);
+        errdefer allocator.free(pieces);
+        for (pieces) |*p| p.* = "";
+        const scores = try allocator.alloc(f32, count);
+        errdefer allocator.free(scores);
+        // Default score so non-merge tokens never beat an actual merge in the
+        // bigram queue. `-1e9` is well below any merge index even for huge
+        // vocabularies.
+        @memset(scores, -1e9);
+
+        // Pieces: vocab. Strings live in arena; copy out so they outlive the
+        // arena's deinit at function exit.
+        vit = vocab_v.object.iterator();
+        while (vit.next()) |kv| {
+            const id_us: usize = @intCast(kv.value_ptr.*.integer);
+            pieces[id_us] = try allocator.dupe(u8, kv.key_ptr.*);
+        }
+
+        // added_tokens override (e.g., `<unk>`, `<s>`, `</s>`).
+        var bos: u32 = 1;
+        var eos: u32 = 2;
+        if (root.object.get("added_tokens")) |at_v| {
+            if (at_v == .array) {
+                for (at_v.array.items) |entry| {
+                    if (entry != .object) continue;
+                    const id_v = entry.object.get("id") orelse continue;
+                    const content_v = entry.object.get("content") orelse continue;
+                    if (id_v != .integer or content_v != .string) continue;
+                    const id_us: usize = @intCast(id_v.integer);
+                    pieces[id_us] = try allocator.dupe(u8, content_v.string);
+                    if (std.mem.eql(u8, content_v.string, "<s>")) bos = @intCast(id_us);
+                    if (std.mem.eql(u8, content_v.string, "</s>")) eos = @intCast(id_us);
+                }
+            }
+        }
+
+        // Scores: assign higher score to earlier merges so the greedy BPE
+        // encoder picks them first. Format is either a list of "A B" strings
+        // or a list of [A, B] arrays — handle both.
+        if (merges_v) |mv| if (mv == .array) {
+            for (mv.array.items, 0..) |m_entry, i| {
+                var a_str: []const u8 = "";
+                var b_str: []const u8 = "";
+                switch (m_entry) {
+                    .string => |s| {
+                        const sp = std.mem.indexOfScalar(u8, s, ' ') orelse continue;
+                        a_str = s[0..sp];
+                        b_str = s[sp + 1 ..];
+                    },
+                    .array => |arr| {
+                        if (arr.items.len != 2) continue;
+                        if (arr.items[0] != .string or arr.items[1] != .string) continue;
+                        a_str = arr.items[0].string;
+                        b_str = arr.items[1].string;
+                    },
+                    else => continue,
+                }
+                // Concatenate A+B and look up the resulting token's id.
+                var join_buf: [512]u8 = undefined;
+                if (a_str.len + b_str.len > join_buf.len) continue;
+                @memcpy(join_buf[0..a_str.len], a_str);
+                @memcpy(join_buf[a_str.len..][0..b_str.len], b_str);
+                const joined = join_buf[0 .. a_str.len + b_str.len];
+                const id_v = vocab_v.object.get(joined) orelse continue;
+                if (id_v != .integer) continue;
+                const id_us: usize = @intCast(id_v.integer);
+                if (id_us < scores.len) {
+                    scores[id_us] = -@as(f32, @floatFromInt(i));
+                }
+            }
+        };
+
+        // Build piece map for O(1) lookup.
+        var by_piece: PieceMap = .empty;
+        errdefer by_piece.deinit(allocator);
+        try by_piece.ensureTotalCapacity(allocator, @intCast(count));
+        for (pieces, scores, 0..) |piece, score, i| {
+            if (piece.len == 0) continue;
+            try by_piece.put(allocator, piece, .{ .id = @intCast(i), .score = score });
+        }
+
+        return .{
+            .pieces = pieces,
+            .scores = scores,
+            .by_piece = by_piece,
+            .bos = bos,
+            .eos = eos,
+        };
+    }
+
+    /// Like `deinit`, but additionally frees the per-piece arena-allocated
+    /// strings (HF init duplicates them out of the arena, so plain `deinit`
+    /// would leak). Use this when the Tokenizer was built with
+    /// `initFromHfJson`.
+    pub fn deinitOwnedPieces(self: *Tokenizer, allocator: Allocator) void {
+        for (self.pieces) |p| {
+            if (p.len > 0) allocator.free(p);
+        }
+        self.by_piece.deinit(allocator);
+        allocator.free(self.scores);
+        allocator.free(self.pieces);
+        self.* = undefined;
+    }
+
     /// Write the decoded bytes for `token_id` into `writer`. Handles:
     ///  * SentencePiece `▁` (U+2581 = bytes E2 96 81) → space
     ///  * Byte-fallback pieces of the form `<0xHH>` → raw byte 0xHH

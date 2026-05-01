@@ -52,6 +52,35 @@ pub fn rope(x: []f32, pos: usize, base: f32) void {
     }
 }
 
+/// Half-rotation RoPE (the "neox" / HuggingFace-transformers / MLX
+/// convention). Pair element `i` with element `i + head_dim/2`, both
+/// rotated by the same `theta_i`.
+///
+/// Mathematically equivalent to `rope` but for a different permutation of
+/// the head-dim axis. Some HF / MLX checkpoints store weights such that
+/// this convention is what produces the right cos/sin alignment with the
+/// trained model — converting them to interleaved layout would require
+/// re-permuting per-group quantized weights, which is fiddly, so we just
+/// apply the matching rotation here instead.
+pub fn ropeHalf(x: []f32, pos: usize, base: f32) void {
+    std.debug.assert(x.len % 2 == 0);
+    const head_dim = x.len;
+    const half = head_dim / 2;
+    const pos_f: f32 = @floatFromInt(pos);
+    var i: usize = 0;
+    while (i < half) : (i += 1) {
+        const exp: f32 = @as(f32, @floatFromInt(2 * i)) / @as(f32, @floatFromInt(head_dim));
+        const inv_freq = 1.0 / std.math.pow(f32, base, exp);
+        const theta = pos_f * inv_freq;
+        const c = @cos(theta);
+        const s = @sin(theta);
+        const x0 = x[i];
+        const x1 = x[i + half];
+        x[i] = x0 * c - x1 * s;
+        x[i + half] = x0 * s + x1 * c;
+    }
+}
+
 /// In-place numerically-stable softmax.
 pub fn softmax(x: []f32) void {
     if (x.len == 0) return;

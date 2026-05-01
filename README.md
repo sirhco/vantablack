@@ -32,12 +32,15 @@ tax, no framework tax. Just weights and math.
 | Chat template (TinyLlama zephyr)                        | shipped              |
 | HTTP server (Ollama-compatible subset)                  | shipped              |
 | Apple Metal GPU backend (full forward — see below)      | shipped (opt-in `-Dmetal=true`) |
-| Q8_0 / Q4_K / Q5_K / Q6_K / F32 / F16                   | shipped              |
+| Q8_0 / Q4_K / Q5_K / Q6_K / F32 / F16 / BF16            | shipped              |
 | TQ2_0 (1.58-bit ternary) plumbed                        | dequant + matmul written, untested on real model |
 | Safetensors v1 mmap parser                              | shipped              |
 | HuggingFace `config.json` → `LlamaConfig` adapter       | shipped              |
 | MLX 4-bit quant CPU kernels (dequant + GEMV)            | shipped              |
-| MLX model end-to-end (loader + tokenizer + forward)     | foundation only — see below |
+| **MLX model end-to-end (loader + tokenizer + forward)** | **shipped** — bit-perfect match with `mlx_lm` reference on TinyLlama-1.1B-Chat-v1.0-4bit |
+| MLX 4-bit Metal kernel (GPU path)                       | not yet              |
+| Multi-shard safetensors (`model.safetensors.index.json`) | not yet              |
+| Tiktoken-style tokenizer (Llama-3+, GPT-2)              | not yet              |
 | Vulkan / cross-vendor GPU                               | not yet              |
 | Prompt prefill batching                                 | not yet              |
 
@@ -56,34 +59,64 @@ criteria fall back to the per-op path (CPU + GPU Q8_0 matmul only).
 (ReleaseFast, macOS arm64). Coherent text generation, canonical SentencePiece
 tokenization, EOS-correct chat-template completions.
 
-### MLX-format models — foundation status
+### MLX-format models — end-to-end
 
 MLX (Apple's array framework) ships Llama-architecture models as a directory
-of `*.safetensors` shards + `config.json` + `tokenizer.{model,json}`, with
-weights packed in MLX's own 4-bit / 8-bit affine block-quant format
-(`mlx_lm.utils.quantize`). vantablack is being extended to load these
-natively so users on Apple Silicon can run mlx-community models without a
-GGUF conversion step.
+of `*.safetensors` files + `config.json` + `tokenizer.json`, with weights
+packed in MLX's own 4-bit / 8-bit affine block-quant format
+(`mlx_lm.utils.quantize`). vantablack now loads these natively — point the
+CLI at the directory:
 
-Shipped in this tree (covered by 9 unit tests):
-- `core/safetensors.zig` — single-file safetensors v1 parser; mmap-friendly,
+```sh
+vantablack ~/.cache/huggingface/hub/models--mlx-community--TinyLlama-1.1B-Chat-v1.0-4bit/snapshots/<rev> \
+  prompt 64 "Once upon a time"
+```
+
+Verified: bit-for-bit identical generation against the `mlx_lm` Python
+reference for `mlx-community/TinyLlama-1.1B-Chat-v1.0-4bit` (single shard,
+4-bit quant, group_size=64, BF16 scales/biases).
+
+What ships:
+- **`core/safetensors.zig`** — single-file safetensors v1 mmap parser,
   zero-copy descriptor extraction.
-- `core/hf_config.zig` — `config.json` → typed config struct (incl. the
-  `quantization: {bits, group_size}` block written by `mlx_lm`).
-- `kernels/mlx.zig` — MLX 4-bit row dequant + GEMV (CPU baseline).
+- **`core/hf_loader.zig`** — directory loader: mmaps every `.safetensors`,
+  reads `config.json` and `tokenizer.json` (and `tokenizer.model` if
+  present), exposes a unified tensor lookup across shards.
+- **`core/hf_config.zig`** — `config.json` → `HfConfig` struct including
+  the `quantization: {bits, group_size}` block.
+- **`kernels/mlx.zig`** — MLX 4-bit dequant + GEMV (CPU baseline). Handles
+  both BF16 and F16 scale/bias dtypes.
+- **`runtime/model.zig::Model.initFromHf`** — applies the HF tensor-name
+  remap (`model.layers.{i}.self_attn.q_proj.{weight,scales,biases}` →
+  `attn_q`, etc.), folds the 3-buffer MLX-quant layout into a single
+  `TypedTensor` via the new `mlx` aux pointer.
+- **`runtime/tokenizer.zig::Tokenizer.initFromHfJson`** — parses HF
+  `tokenizer.json` BPE format directly; merge priorities are recovered
+  from the `merges` array order so the existing greedy-BPE encoder runs
+  unchanged. Llama-family `▁`/byte-fallback semantics handled.
+- **HF/MLX RoPE convention** — neox-style half-rotation
+  (`math.ropeHalf`), gated by a `rope_half` flag on `LlamaConfig`. GGUF
+  models stay on the original interleaved-pair `math.rope`; the CLI sets
+  the flag automatically based on which loader picked the file.
+- **CLI dispatch** — if the path argument resolves to a directory, runs
+  the HF/MLX path; otherwise runs the GGUF path. Both `prompt` and `chat`
+  subcommands work in either mode; `serve` and `generate` (raw IDs) stay
+  GGUF-only for now.
 
-Still required for end-to-end MLX inference (separate sessions):
-- Multi-shard safetensors loader (`model.safetensors.index.json`).
-- `TypedTensor` refactor to carry the 3-buffer (weight + scales + biases)
-  layout MLX needs alongside the existing single-buffer GGUF tensors.
-- HF tensor-name → vantablack layer-binding remap
-  (`model.layers.{i}.self_attn.q_proj.weight` → `attn_q`, etc.).
-- CLI detection: directory path → MLX loader, file path → GGUF loader.
-- Tokenizer: many MLX llama checkpoints bundle `tokenizer.model`
-  (SentencePiece) alongside `tokenizer.json` — the existing SP encoder
-  works directly. Models that ship only `tokenizer.json` will need an HF
-  tokenizers.json reader.
-- MLX 4-bit Metal kernel for the GPU path (CPU kernel ships now).
+Caveats / not-yet:
+- MLX 4-bit on the GPU is **CPU-only** today. The Metal kernel for the MLX
+  3-buffer layout is the next push. `-Dmetal=true` keeps accelerating
+  Q8_0-GGUF models; MLX models on a `-Dmetal=true` build still execute on
+  the CPU thread pool.
+- Multi-shard safetensors (`model.safetensors.index.json` +
+  `model-NNNNN-of-MMMMM.safetensors`) — single-shard works; sharded
+  checkpoints (>1 GB models split across files) will load all shards
+  alphabetically but the descriptor lookup hasn't been verified for
+  cross-shard tensor names.
+- Tokenizer is BPE/SentencePiece (Llama 1/2 family). Llama 3+ and GPT-2
+  use a tiktoken-style byte-level BPE that needs a separate encoder.
+- Only 4-bit MLX is wired through; 2/3/6/8-bit MLX dequant is a
+  one-line bit-extraction change but isn't shipped.
 
 ---
 
@@ -213,9 +246,10 @@ src/
 ├── main.zig                  CLI entry point + subcommand dispatch
 ├── vantablack.zig            public module index (re-exports)
 ├── core/
-│   ├── mapper.zig            ModelMapper: open + std.posix.mmap + catalog
+│   ├── mapper.zig            ModelMapper: open + std.posix.mmap + catalog (GGUF)
 │   ├── parser.zig            GGUF v2/v3 parser, MetaValue union, BlockInfo table
 │   ├── safetensors.zig       safetensors v1 parser (mmap-friendly, zero-copy descriptors)
+│   ├── hf_loader.zig         HuggingFace / MLX directory loader (mmap shards + JSON)
 │   └── hf_config.zig         HuggingFace config.json → struct adapter (incl. MLX `quantization` block)
 ├── kernels/
 │   ├── simd.zig              real Q8_0/Q4_K/Q5_K/Q6_K/TQ2_0/F16/F32 dequant + matmul
@@ -524,14 +558,12 @@ root cause: pure CPU matmul saturates every core. The fixes:
 11. **Prompt prefill batching** — *planned*. Process N prompt tokens in
     one forward pass. Big speedup on long prompts (no effect on per-token
     decode rate).
-12. **MLX model loader (full integration)** — *partially shipped*. See the
-    "MLX-format models" section in Status: parser + config adapter + 4-bit
-    CPU kernel are in. Remaining work is the multi-shard loader, the
-    `TypedTensor` 3-buffer refactor, the HF tensor-name remap, and the
-    Metal kernel for the GPU path. Models from `mlx-community/*` that
-    bundle `tokenizer.model` (SentencePiece) will run end-to-end once
-    those land; models that only ship `tokenizer.json` additionally need
-    an HF tokenizers.json reader.
+12. **MLX model loader (full integration)** — *shipped*. End-to-end
+    inference on `mlx-community/*` Llama-1/2-family 4-bit models, verified
+    bit-perfect against `mlx_lm`. Remaining for full MLX coverage: Metal
+    kernel for the 3-buffer MLX-Q4 layout, multi-shard
+    `model.safetensors.index.json`, 2/3/6/8-bit MLX variants, and a
+    tiktoken-style tokenizer for Llama 3+ / GPT-2-family checkpoints.
 12. **Apple AMX matrix coprocessor** — *planned*. M1/M2/M3 ship a hidden
     matrix unit accessible via inline assembly. Pure-Zig + lower power
     than even GPU for some shapes. Useful as a CPU-only fallback path.

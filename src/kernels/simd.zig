@@ -85,6 +85,30 @@ pub fn matmul_f16(out: []f32, weights: []const u8, acts: []const f32, m: usize, 
     }
 }
 
+/// BF16 → f32: just zero-extend the 16-bit half into the high half of the f32
+/// bit pattern. No exponent/mantissa mangling required.
+pub inline fn bf16BitsToF32(bits: u16) f32 {
+    const w: u32 = @as(u32, bits) << 16;
+    return @bitCast(w);
+}
+
+pub fn matmul_bf16(out: []f32, weights: []const u8, acts: []const f32, m: usize, k: usize) void {
+    std.debug.assert(out.len == m);
+    std.debug.assert(acts.len == k);
+    std.debug.assert(weights.len >= m * k * 2);
+
+    const row_bytes = k * 2;
+    for (0..m) |i| {
+        const row = weights[i * row_bytes ..][0..row_bytes];
+        var acc: f32 = 0;
+        for (0..k) |j| {
+            const bits = std.mem.readInt(u16, row[j * 2 ..][0..2], .little);
+            acc += bf16BitsToF32(bits) * acts[j];
+        }
+        out[i] = acc;
+    }
+}
+
 // -------------------- Q8_0 ----------------------------------------------
 //
 // block_q8_0 = { f16 d; i8 qs[32]; }   // 34 bytes per 32 weights

@@ -26,18 +26,27 @@ const std = @import("std");
 
 pub const QuantBits = enum(u32) { q4 = 4, q8 = 8 };
 
-/// Decode a single fp16 (`half`) bit pattern into f32. We cannot rely on Zig's
-/// f16 to f32 cast going through hardware on every target, so do it via the
-/// `@bitCast` + widening route which all backends agree on.
+/// Whether `scales` and `biases` are stored as IEEE-754 binary16 (F16) or
+/// truncated f32 (BF16). MLX defaults to BF16; older mlx-lm versions emit F16.
+pub const ScaleDtype = enum { f16, bf16 };
+
 inline fn f16ToF32(bits: u16) f32 {
     const h: f16 = @bitCast(bits);
     return @floatCast(h);
 }
 
-inline fn loadF16(bytes: []const u8, idx: usize) f32 {
+inline fn bf16ToF32(bits: u16) f32 {
+    const w: u32 = @as(u32, bits) << 16;
+    return @bitCast(w);
+}
+
+inline fn loadScale(bytes: []const u8, idx: usize, dtype: ScaleDtype) f32 {
     const off = idx * 2;
     const bits = std.mem.readInt(u16, bytes[off..][0..2], .little);
-    return f16ToF32(bits);
+    return switch (dtype) {
+        .f16 => f16ToF32(bits),
+        .bf16 => bf16ToF32(bits),
+    };
 }
 
 inline fn loadU32(bytes: []const u8, idx: usize) u32 {
@@ -51,9 +60,10 @@ inline fn loadU32(bytes: []const u8, idx: usize) u32 {
 pub fn dequantRowQ4(
     out: []f32,
     weight_row: []const u8, // packed u32, in_features * 4 / 32 = in_features/8 u32s
-    scales_row: []const u8, // f16, in_features / G entries
-    biases_row: []const u8, // f16, in_features / G entries
+    scales_row: []const u8, // f16/bf16, in_features / G entries
+    biases_row: []const u8, // f16/bf16, in_features / G entries
     group_size: usize,
+    dtype: ScaleDtype,
 ) void {
     const k = out.len;
     std.debug.assert(k % group_size == 0);
@@ -63,9 +73,8 @@ pub fn dequantRowQ4(
     var col: usize = 0;
     var g: usize = 0;
     while (g < n_groups) : (g += 1) {
-        const scale = loadF16(scales_row, g);
-        const bias = loadF16(biases_row, g);
-        // Each group covers `group_size` columns. Each u32 packs 8 q4 values.
+        const scale = loadScale(scales_row, g, dtype);
+        const bias = loadScale(biases_row, g, dtype);
         const cols_left = group_size;
         var c: usize = 0;
         while (c < cols_left) : (c += 8) {
@@ -92,6 +101,7 @@ pub fn matmulQ4(
     m: usize,
     k: usize,
     group_size: usize,
+    dtype: ScaleDtype,
 ) void {
     std.debug.assert(out.len >= m);
     std.debug.assert(acts.len >= k);
@@ -101,7 +111,7 @@ pub fn matmulQ4(
     const u32_per_row = k / 8;
     const groups_per_row = k / group_size;
     const weight_row_bytes = u32_per_row * 4;
-    const scale_row_bytes = groups_per_row * 2; // f16
+    const scale_row_bytes = groups_per_row * 2; // 16-bit (f16 or bf16)
 
     var r: usize = 0;
     while (r < m) : (r += 1) {
@@ -113,8 +123,8 @@ pub fn matmulQ4(
         var col: usize = 0;
         var g: usize = 0;
         while (g < groups_per_row) : (g += 1) {
-            const scale = loadF16(s_row, g);
-            const bias = loadF16(b_row, g);
+            const scale = loadScale(s_row, g, dtype);
+            const bias = loadScale(b_row, g, dtype);
             // Σ_{c in group} (q*scale + bias) * x[c]
             //   = scale * Σ q*x[c] + bias * Σ x[c]
             var q_dot: f32 = 0;
@@ -160,7 +170,7 @@ test "dequantRowQ4: identity scale + zero bias recovers nibbles" {
     std.mem.writeInt(u32, weight[4..8], w1, .little);
 
     var out: [k]f32 = undefined;
-    dequantRowQ4(&out, &weight, &scales, &biases, group_size);
+    dequantRowQ4(&out, &weight, &scales, &biases, group_size, .f16);
 
     inline for (0..16) |i| {
         try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(i)), out[i], 1e-6);
@@ -195,7 +205,7 @@ test "matmulQ4: scalar reference matches direct dot product" {
     for (&acts) |*a| a.* = 1.0;
 
     var out: [m]f32 = undefined;
-    matmulQ4(&out, &weight, &scales, &biases, &acts, m, k, group_size);
+    matmulQ4(&out, &weight, &scales, &biases, &acts, m, k, group_size, .f16);
     try std.testing.expectApproxEqAbs(@as(f32, 64.0), out[0], 1e-4);
 
     // Activations: alternating +1, -1 → Σ x = 0, Σ q*x = -8
@@ -203,6 +213,6 @@ test "matmulQ4: scalar reference matches direct dot product" {
     //   Σ q*x = 0 - 1 + 2 - 3 + … + 14 - 15 = -8
     //   total = 0.5 * -8 + 0.25 * 0 = -4.0
     for (&acts, 0..) |*a, i| a.* = if (i % 2 == 0) 1.0 else -1.0;
-    matmulQ4(&out, &weight, &scales, &biases, &acts, m, k, group_size);
+    matmulQ4(&out, &weight, &scales, &biases, &acts, m, k, group_size, .f16);
     try std.testing.expectApproxEqAbs(@as(f32, -4.0), out[0], 1e-4);
 }

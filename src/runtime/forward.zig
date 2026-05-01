@@ -204,11 +204,20 @@ fn cpuLayerStep(
     try matmulRuntime(pool, metal, state.v_cur, layer.attn_v, state.xb, kv_dim, c.dim);
 
     // RoPE on Q (per head) and K (per kv head).
-    for (0..c.n_heads) |h| {
-        math.rope(state.q[h * c.head_dim ..][0..c.head_dim], cache.pos, c.rope_base);
-    }
-    for (0..c.n_kv_heads) |h| {
-        math.rope(state.k_cur[h * c.head_dim ..][0..c.head_dim], cache.pos, c.rope_base);
+    if (c.rope_half) {
+        for (0..c.n_heads) |h| {
+            math.ropeHalf(state.q[h * c.head_dim ..][0..c.head_dim], cache.pos, c.rope_base);
+        }
+        for (0..c.n_kv_heads) |h| {
+            math.ropeHalf(state.k_cur[h * c.head_dim ..][0..c.head_dim], cache.pos, c.rope_base);
+        }
+    } else {
+        for (0..c.n_heads) |h| {
+            math.rope(state.q[h * c.head_dim ..][0..c.head_dim], cache.pos, c.rope_base);
+        }
+        for (0..c.n_kv_heads) |h| {
+            math.rope(state.k_cur[h * c.head_dim ..][0..c.head_dim], cache.pos, c.rope_base);
+        }
     }
 
     // KV cache write + attention.
@@ -231,16 +240,16 @@ fn cpuLayerStep(
 }
 
 fn modelGpuEligible(m: *const Model) bool {
-    if (m.output_norm.ggml_type != .f32) return false;
-    if (m.output_w.ggml_type != .q8_0) return false;
+    if (m.output_norm.quant != .f32) return false;
+    if (m.output_w.quant != .q8_0) return false;
     for (m.layers) |lw| {
-        if (lw.attn_norm.ggml_type != .f32) return false;
-        if (lw.ffn_norm.ggml_type != .f32) return false;
-        const projs = [_]parser.GgmlType{
-            lw.attn_q.ggml_type,    lw.attn_k.ggml_type,
-            lw.attn_v.ggml_type,    lw.attn_o.ggml_type,
-            lw.ffn_gate.ggml_type,  lw.ffn_up.ggml_type,
-            lw.ffn_down.ggml_type,
+        if (lw.attn_norm.quant != .f32) return false;
+        if (lw.ffn_norm.quant != .f32) return false;
+        const projs = [_]kernels.QuantType{
+            lw.attn_q.quant,    lw.attn_k.quant,
+            lw.attn_v.quant,    lw.attn_o.quant,
+            lw.ffn_gate.quant,  lw.ffn_up.quant,
+            lw.ffn_down.quant,
         };
         for (projs) |p| if (p != .q8_0) return false;
     }
@@ -331,6 +340,7 @@ fn matmulWorker(worker_id: usize, n_workers: usize, ctx_ptr: *anyopaque) void {
     const out_chunk = ctx.out[start..end];
     const w_chunk = ctx.weights[start * ctx.row_bytes ..][0 .. m_chunk * ctx.row_bytes];
     switch (ctx.quant) {
+        .mlx_q4 => unreachable, // handled before pool dispatch in matmulRuntime
         inline else => |qt| {
             const kernel = comptime kernels.dispatch(qt);
             kernel(out_chunk, w_chunk, ctx.acts, m_chunk, ctx.k);
@@ -347,7 +357,17 @@ fn matmulRuntime(
     m: usize,
     k: usize,
 ) StepError!void {
-    const q = model_mod.quantOf(w.ggml_type) catch return error.UnsupportedWeightType;
+    const q = w.quant;
+
+    // MLX-Q4: 3-buffer kernel, CPU only for now.
+    if (q == .mlx_q4) {
+        const aux = w.mlx orelse return error.UnsupportedWeightType;
+        @import("../kernels/mlx.zig").matmulQ4(
+            out, w.bytes, aux.scales, aux.biases, acts,
+            m, k, aux.group_size, aux.scale_dtype,
+        );
+        return;
+    }
 
     // GPU fast path: Q8_0 only for now. Other quants stay on CPU.
     // Both `out` and `acts` must alias persistent ScratchBufs so the
@@ -375,6 +395,8 @@ fn rowBytes(q: kernels.QuantType, k: usize) usize {
     return switch (q) {
         .f32 => k * 4,
         .f16 => k * 2,
+        .bf16 => k * 2,
+        .mlx_q4 => unreachable, // handled separately in matmulRuntime
         .q8_0 => (k / simd.q8_0_block_elems) * simd.q8_0_block_bytes,
         .q4_k => (k / simd.q4_k_block_elems) * simd.q4_k_block_bytes,
         .q5_k => (k / simd.q5_k_block_elems) * simd.q5_k_block_bytes,
@@ -395,7 +417,7 @@ fn rmsNormTyped(x: []f32, w: TypedTensor, eps: f32) StepError!void {
 }
 
 fn dequantToF32(out: []f32, w: TypedTensor, n: usize) StepError!void {
-    const q = model_mod.quantOf(w.ggml_type) catch return error.UnsupportedWeightType;
+    const q = w.quant;
     switch (q) {
         .f32 => {
             const ptr: [*]align(1) const f32 = @ptrCast(w.bytes.ptr);
@@ -407,6 +429,19 @@ fn dequantToF32(out: []f32, w: TypedTensor, n: usize) StepError!void {
                 const h: f16 = @bitCast(bits);
                 o.* = @floatCast(h);
             }
+        },
+        .bf16 => {
+            for (out[0..n], 0..) |*o, i| {
+                const bits = std.mem.readInt(u16, w.bytes[i * 2 ..][0..2], .little);
+                o.* = simd.bf16BitsToF32(bits);
+            }
+        },
+        .mlx_q4 => {
+            const aux = w.mlx orelse return error.UnsupportedWeightType;
+            // Single-row dequant: norms and embedding rows are k entries each.
+            @import("../kernels/mlx.zig").dequantRowQ4(
+                out[0..n], w.bytes, aux.scales, aux.biases, aux.group_size, aux.scale_dtype,
+            );
         },
         .q8_0 => {
             std.debug.assert(n % simd.q8_0_block_elems == 0);
@@ -467,12 +502,34 @@ fn dequantToF32(out: []f32, w: TypedTensor, n: usize) StepError!void {
 }
 
 fn gatherEmbedding(out: []f32, table: TypedTensor, id: u32, dim: usize) StepError!void {
-    const q = model_mod.quantOf(table.ggml_type) catch return error.UnsupportedWeightType;
+    const q = table.quant;
     const id_us: usize = @intCast(id);
     switch (q) {
+        .mlx_q4 => {
+            // Embedding row of an MLX-quantized table: same packed layout
+            // (out_features rows × in_features quant cols), so reuse the
+            // single-row dequant for row `id`.
+            const aux = table.mlx orelse return error.UnsupportedWeightType;
+            const u32_per_row = dim / 8;
+            const row_bytes = u32_per_row * 4;
+            const groups_per_row = dim / aux.group_size;
+            const scale_row_bytes = groups_per_row * 2;
+            const w_row = table.bytes[id_us * row_bytes ..][0..row_bytes];
+            const s_row = aux.scales[id_us * scale_row_bytes ..][0..scale_row_bytes];
+            const b_row = aux.biases[id_us * scale_row_bytes ..][0..scale_row_bytes];
+            @import("../kernels/mlx.zig").dequantRowQ4(out, w_row, s_row, b_row, aux.group_size, aux.scale_dtype);
+            return;
+        },
         .f32 => {
             const ptr: [*]align(1) const f32 = @ptrCast(table.bytes.ptr);
             for (out, 0..) |*o, i| o.* = ptr[id_us * dim + i];
+        },
+        .bf16 => {
+            const off = id_us * dim * 2;
+            for (out, 0..) |*o, i| {
+                const bits = std.mem.readInt(u16, table.bytes[off + i * 2 ..][0..2], .little);
+                o.* = simd.bf16BitsToF32(bits);
+            }
         },
         .f16 => {
             const off = id_us * dim * 2;

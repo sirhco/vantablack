@@ -50,6 +50,16 @@ pub fn main(init: std.process.Init) !void {
         break :blk try std.fs.path.resolve(arena, &.{ cwd_path, input_path });
     };
 
+    // If the path points at a directory, treat it as a HuggingFace / MLX
+    // model bundle (config.json + weights.NN.safetensors + tokenizer.json).
+    // Otherwise fall through to the GGUF mmap loader. Directory mode supports
+    // `prompt` and `chat` subcommands; `generate` (raw token IDs) and
+    // `serve` remain GGUF-only for now.
+    if (isDirectory(io, abs_path)) {
+        try runHfCli(gpa, arena, io, abs_path, args, out, err);
+        return;
+    }
+
     var mapper = try vantablack.ModelMapper.init(gpa, io, abs_path);
     defer mapper.deinit();
 
@@ -322,6 +332,139 @@ fn ggmlTypeName(t: vantablack.GgmlType) []const u8 {
         .tq2_0 => "TQ2_0",
         _ => "?",
     };
+}
+
+// ----- HuggingFace / MLX directory mode -----------------------------------
+
+fn isDirectory(io: Io, abs_path: []const u8) bool {
+    const dir = Io.Dir.openDirAbsolute(io, abs_path, .{ .iterate = false }) catch return false;
+    var d = dir;
+    d.close(io);
+    return true;
+}
+
+fn runHfCli(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: Io,
+    dir_path: []const u8,
+    args: []const []const u8,
+    out: *Io.Writer,
+    err: *Io.Writer,
+) !void {
+    if (args.len < 3 or !(std.mem.eql(u8, args[2], "prompt") or std.mem.eql(u8, args[2], "chat"))) {
+        try err.writeAll(
+            "MLX/HF directory mode supports only:\n" ++
+                "  vantablack <model_dir> prompt <n> <text>\n" ++
+                "  vantablack <model_dir> chat   <n> <user-message>\n" ++
+                "Sampler flags (--temp / --top-k / --top-p / --seed / --threads / --system) work as in GGUF mode.\n",
+        );
+        try err.flush();
+        return error.MissingArgs;
+    }
+    const is_chat = std.mem.eql(u8, args[2], "chat");
+
+    var sampler_cfg: vantablack.SamplerConfig = .{};
+    var system_prompt: []const u8 = "You are a helpful assistant.";
+    var threads: usize = 0;
+    var idx: usize = 3;
+    while (idx < args.len) {
+        const a = args[idx];
+        if (std.mem.eql(u8, a, "--temp")) {
+            idx += 1;
+            sampler_cfg.temperature = try std.fmt.parseFloat(f32, args[idx]);
+        } else if (std.mem.eql(u8, a, "--top-k")) {
+            idx += 1;
+            sampler_cfg.top_k = try std.fmt.parseInt(usize, args[idx], 10);
+        } else if (std.mem.eql(u8, a, "--top-p")) {
+            idx += 1;
+            sampler_cfg.top_p = try std.fmt.parseFloat(f32, args[idx]);
+        } else if (std.mem.eql(u8, a, "--seed")) {
+            idx += 1;
+            sampler_cfg.seed = try std.fmt.parseInt(u64, args[idx], 10);
+        } else if (std.mem.eql(u8, a, "--system")) {
+            idx += 1;
+            system_prompt = args[idx];
+        } else if (std.mem.eql(u8, a, "--threads")) {
+            idx += 1;
+            threads = try std.fmt.parseInt(usize, args[idx], 10);
+        } else break;
+        idx += 1;
+    }
+
+    if (idx + 1 >= args.len) {
+        try err.writeAll("missing <n> or <text>\n");
+        try err.flush();
+        return error.MissingArgs;
+    }
+    const n_steps = try std.fmt.parseInt(u32, args[idx], 10);
+    const user_text = args[idx + 1];
+
+    var bundle = try vantablack.hf_loader.HfBundle.init(gpa, io, dir_path);
+    defer bundle.deinit();
+
+    const cfg = try vantablack.hf_config.parse(arena, bundle.config_json);
+
+    var model = try vantablack.Model.initFromHf(gpa, &bundle, cfg);
+    defer model.deinit(gpa);
+
+
+    if (bundle.tokenizer_json == null) {
+        try err.writeAll("error: tokenizer.json missing in directory; vantablack cannot encode without it\n");
+        try err.flush();
+        return error.MissingArgs;
+    }
+    var tok = try vantablack.Tokenizer.initFromHfJson(gpa, bundle.tokenizer_json.?);
+    defer tok.deinitOwnedPieces(gpa);
+
+    var sampler = try vantablack.Sampler.init(gpa, sampler_cfg, model.config.vocab_size);
+    defer sampler.deinit(gpa);
+
+    var state = try vantablack.forward.State.init(gpa, &model, null);
+    defer state.deinit(gpa);
+
+    var cache = try vantablack.KvCache.init(
+        gpa,
+        model.config.n_layers,
+        model.config.n_kv_heads,
+        model.config.head_dim,
+        model.config.max_seq,
+        null,
+    );
+    defer cache.deinit(gpa);
+
+    var pool = try vantablack.ThreadPool.init(gpa, threads);
+    defer pool.deinit(gpa);
+
+    // Build prompt: chat mode wraps in TinyLlama zephyr template.
+    const prompt_text: []const u8 = if (is_chat)
+        try vantablack.chat_template.formatLlamaChatSingle(arena, system_prompt, user_text)
+    else
+        user_text;
+
+    const prompt_ids = try tok.encode(arena, prompt_text, true);
+
+    try out.print("[encoded {d} tokens]\n", .{prompt_ids.len});
+    try out.flush();
+
+    if (prompt_ids.len == 0) return;
+    for (prompt_ids) |id| {
+        try vantablack.forward.step(&model, &state, &cache, pool, null, id);
+        try tok.decodeTo(out, id);
+    }
+    try out.flush();
+
+    var produced: u32 = 0;
+    var next: u32 = sampler.sample(state.logits);
+    while (produced < n_steps) : (produced += 1) {
+        if (next == tok.eos) break;
+        try tok.decodeTo(out, next);
+        try out.flush();
+        try vantablack.forward.step(&model, &state, &cache, pool, null, next);
+        next = sampler.sample(state.logits);
+    }
+    try out.writeByte('\n');
+    try out.flush();
 }
 
 test "simple test" {

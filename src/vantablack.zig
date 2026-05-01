@@ -4,6 +4,7 @@ pub const mapper = @import("core/mapper.zig");
 pub const parser = @import("core/parser.zig");
 pub const safetensors = @import("core/safetensors.zig");
 pub const hf_config = @import("core/hf_config.zig");
+pub const hf_loader = @import("core/hf_loader.zig");
 pub const kernels = @import("kernels/comptime_gen.zig");
 pub const simd = @import("kernels/simd.zig");
 pub const math = @import("kernels/math.zig");

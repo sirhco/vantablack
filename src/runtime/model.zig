@@ -10,6 +10,11 @@ const Allocator = std.mem.Allocator;
 const parser = @import("../core/parser.zig");
 const mapper_mod = @import("../core/mapper.zig");
 const ModelMapper = mapper_mod.ModelMapper;
+const kernels = @import("../kernels/comptime_gen.zig");
+const mlx_kernels = @import("../kernels/mlx.zig");
+const hf_config_mod = @import("../core/hf_config.zig");
+const hf_loader_mod = @import("../core/hf_loader.zig");
+const safetensors = @import("../core/safetensors.zig");
 
 pub const ConfigError = error{
     MissingMetadata,
@@ -33,6 +38,12 @@ pub const LlamaConfig = struct {
     max_seq: usize,
     rope_base: f32 = 10000.0,
     rms_eps: f32 = 1e-5,
+    /// True for HF / MLX checkpoints (neox / "half-rotation" RoPE convention);
+    /// false for GGUF / llama.cpp (interleaved-pair convention). The two
+    /// produce identical math after a head-dim permutation of weights, but
+    /// since vantablack consumes both formats unchanged we apply the
+    /// matching rotation at runtime.
+    rope_half: bool = false,
 
     pub fn fromCatalog(catalog: parser.Catalog) ConfigError!LlamaConfig {
         const arch_v = findValue(catalog, "general.architecture") orelse return error.MissingMetadata;
@@ -79,9 +90,25 @@ pub const LlamaConfig = struct {
     }
 };
 
+/// MLX-style multi-buffer tensor extras. Present when `quant == .mlx_q4`.
+pub const MlxAux = struct {
+    scales: []const u8,
+    biases: []const u8,
+    bits: u32,
+    group_size: u32,
+    scale_dtype: mlx_kernels.ScaleDtype,
+};
+
 pub const TypedTensor = struct {
+    /// Primary weight buffer. For MLX-Q4 this is the packed `weight` (U32);
+    /// for everything else it's the dense / dequant-able payload.
     bytes: []const u8,
-    ggml_type: parser.GgmlType,
+    quant: kernels.QuantType,
+    /// Source-format raw type tag. Only meaningful for GGUF tensors; HF
+    /// tensors set this to `.f32` as a placeholder. `quant` is what consumers
+    /// should actually branch on.
+    ggml_type: parser.GgmlType = .f32,
+    mlx: ?MlxAux = null,
 };
 
 pub const LayerWeights = struct {
@@ -142,7 +169,150 @@ pub const Model = struct {
         allocator.free(self.layers);
         self.* = undefined;
     }
+
+    /// Build a `Model` from a HuggingFace / MLX directory bundle. Tensor
+    /// name remapping mirrors the mlx_lm + transformers conventions:
+    ///
+    ///   model.embed_tokens.weight                       → token_embd
+    ///   model.norm.weight                                → output_norm
+    ///   lm_head.weight (or tied to embed_tokens)         → output
+    ///   model.layers.{i}.input_layernorm.weight          → attn_norm
+    ///   model.layers.{i}.self_attn.{q,k,v,o}_proj.weight → attn_{q,k,v,o}
+    ///   model.layers.{i}.post_attention_layernorm.weight → ffn_norm
+    ///   model.layers.{i}.mlp.{gate,up,down}_proj.weight  → ffn_{gate,up,down}
+    ///
+    /// MLX-quantized linears come as a 3-tensor group (`weight`, `scales`,
+    /// `biases`); they're folded into a single `TypedTensor` with the
+    /// scales/biases routed via the `mlx` aux pointer.
+    pub fn initFromHf(
+        allocator: Allocator,
+        bundle: *const hf_loader_mod.HfBundle,
+        cfg: hf_config_mod.HfConfig,
+    ) ModelError!Model {
+        const head_dim = cfg.head_dim orelse (cfg.hidden_size / cfg.num_attention_heads);
+
+        const llama_cfg: LlamaConfig = .{
+            .dim = cfg.hidden_size,
+            .n_layers = cfg.num_hidden_layers,
+            .n_heads = cfg.num_attention_heads,
+            .n_kv_heads = cfg.num_key_value_heads,
+            .head_dim = head_dim,
+            .ffn_dim = cfg.intermediate_size,
+            .vocab_size = cfg.vocab_size,
+            .max_seq = cfg.max_position_embeddings,
+            .rope_base = cfg.rope_theta,
+            .rms_eps = cfg.rms_norm_eps,
+            .rope_half = true,
+        };
+
+        const layers = try allocator.alloc(LayerWeights, cfg.num_hidden_layers);
+        errdefer allocator.free(layers);
+
+        var name_buf: [128]u8 = undefined;
+        for (layers, 0..) |*lw, i| {
+            lw.* = .{
+                .attn_norm = try fetchHfNorm(bundle, fmt(&name_buf, "model.layers.{d}.input_layernorm.weight", .{i})),
+                .attn_q = try fetchHfLinear(bundle, cfg, fmt(&name_buf, "model.layers.{d}.self_attn.q_proj", .{i})),
+                .attn_k = try fetchHfLinear(bundle, cfg, fmt(&name_buf, "model.layers.{d}.self_attn.k_proj", .{i})),
+                .attn_v = try fetchHfLinear(bundle, cfg, fmt(&name_buf, "model.layers.{d}.self_attn.v_proj", .{i})),
+                .attn_o = try fetchHfLinear(bundle, cfg, fmt(&name_buf, "model.layers.{d}.self_attn.o_proj", .{i})),
+                .ffn_norm = try fetchHfNorm(bundle, fmt(&name_buf, "model.layers.{d}.post_attention_layernorm.weight", .{i})),
+                .ffn_gate = try fetchHfLinear(bundle, cfg, fmt(&name_buf, "model.layers.{d}.mlp.gate_proj", .{i})),
+                .ffn_up = try fetchHfLinear(bundle, cfg, fmt(&name_buf, "model.layers.{d}.mlp.up_proj", .{i})),
+                .ffn_down = try fetchHfLinear(bundle, cfg, fmt(&name_buf, "model.layers.{d}.mlp.down_proj", .{i})),
+            };
+        }
+
+        // Embedding may be quantized too in some MLX variants.
+        const token_embd = try fetchHfEmbedding(bundle, cfg, "model.embed_tokens");
+        const output_norm = try fetchHfNorm(bundle, "model.norm.weight");
+        const output_w = if (cfg.tie_word_embeddings)
+            token_embd
+        else
+            fetchHfLinear(bundle, cfg, "lm_head") catch token_embd;
+
+        return .{
+            .config = llama_cfg,
+            .token_embd = token_embd,
+            .output_norm = output_norm,
+            .output_w = output_w,
+            .layers = layers,
+        };
+    }
 };
+
+fn quantOfHfDtype(d: safetensors.Dtype) ConfigError!kernels.QuantType {
+    return switch (d) {
+        .f32 => .f32,
+        .f16 => .f16,
+        .bf16 => .bf16,
+        else => error.UnsupportedWeightType,
+    };
+}
+
+fn fetchHfNorm(bundle: *const hf_loader_mod.HfBundle, name: []const u8) ModelError!TypedTensor {
+    const loc = bundle.find(name) orelse return error.MissingTensor;
+    const bytes = bundle.tensorBytes(name) orelse return error.MissingTensor;
+    const q = try quantOfHfDtype(loc.desc.dtype);
+    return .{ .bytes = bytes, .quant = q };
+}
+
+/// Fetch a (possibly MLX-quantized) linear-layer weight under the HF base
+/// name `<base>` (no `.weight` suffix). Tries:
+///   1. `<base>.weight` + `<base>.scales` + `<base>.biases` → MLX-Q4 if all
+///      three exist and `cfg.quantization` says bits == 4.
+///   2. `<base>.weight` alone → plain dense (F32 / F16 / BF16).
+fn fetchHfLinear(
+    bundle: *const hf_loader_mod.HfBundle,
+    cfg: hf_config_mod.HfConfig,
+    base: []const u8,
+) ModelError!TypedTensor {
+    var name_buf: [192]u8 = undefined;
+    const w_name = std.fmt.bufPrint(&name_buf, "{s}.weight", .{base}) catch return error.UnsupportedWeightType;
+    const w_loc = bundle.find(w_name) orelse return error.MissingTensor;
+    const w_bytes = bundle.tensorBytes(w_name) orelse return error.MissingTensor;
+
+    if (cfg.quantization) |qcfg| if (qcfg.bits == 4) {
+        // Try scales/biases. mlx_lm leaves embedding (and sometimes lm_head)
+        // unquantized, so missing scales just means "fall through to plain
+        // dense" rather than a hard error.
+        var s_buf: [192]u8 = undefined;
+        var b_buf: [192]u8 = undefined;
+        const s_name = std.fmt.bufPrint(&s_buf, "{s}.scales", .{base}) catch return error.UnsupportedWeightType;
+        const b_name = std.fmt.bufPrint(&b_buf, "{s}.biases", .{base}) catch return error.UnsupportedWeightType;
+        if (bundle.find(s_name)) |s_loc| {
+            const s_bytes = bundle.tensorBytes(s_name) orelse return error.MissingTensor;
+            const b_bytes = bundle.tensorBytes(b_name) orelse return error.MissingTensor;
+            const scale_dt: mlx_kernels.ScaleDtype = switch (s_loc.desc.dtype) {
+                .f16 => .f16,
+                .bf16 => .bf16,
+                else => return error.UnsupportedWeightType,
+            };
+            return .{
+                .bytes = w_bytes,
+                .quant = .mlx_q4,
+                .mlx = .{
+                    .scales = s_bytes,
+                    .biases = b_bytes,
+                    .bits = qcfg.bits,
+                    .group_size = qcfg.group_size,
+                    .scale_dtype = scale_dt,
+                },
+            };
+        }
+    };
+
+    const q = try quantOfHfDtype(w_loc.desc.dtype);
+    return .{ .bytes = w_bytes, .quant = q };
+}
+
+fn fetchHfEmbedding(
+    bundle: *const hf_loader_mod.HfBundle,
+    cfg: hf_config_mod.HfConfig,
+    base: []const u8,
+) ModelError!TypedTensor {
+    return fetchHfLinear(bundle, cfg, base);
+}
 
 fn fmt(buf: []u8, comptime template: []const u8, args: anytype) []const u8 {
     return std.fmt.bufPrint(buf, template, args) catch unreachable;
@@ -151,7 +321,8 @@ fn fmt(buf: []u8, comptime template: []const u8, args: anytype) []const u8 {
 fn fetch(m: *const ModelMapper, name: []const u8) ModelError!TypedTensor {
     const desc = m.catalog.find(name) orelse return error.MissingTensor;
     const bytes = try m.tensorSliceFromDesc(desc);
-    return .{ .bytes = bytes, .ggml_type = desc.ggml_type };
+    const q = try quantOf(desc.ggml_type);
+    return .{ .bytes = bytes, .quant = q, .ggml_type = desc.ggml_type };
 }
 
 fn findValue(catalog: parser.Catalog, key: []const u8) ?parser.MetaValue {
