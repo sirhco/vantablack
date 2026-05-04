@@ -146,7 +146,7 @@ pub const MetalBackend = struct {
         errdefer for (ws[0..wrapped]) |*s| dev.release(s.buf);
 
         for (shards, 0..) |sh, i| {
-            const len_aligned = std.mem.alignBackward(usize, sh.bytes.len, std.heap.pageSize());
+            const len_aligned = std.mem.alignForward(usize, sh.bytes.len, std.heap.pageSize());
             if (len_aligned == 0) return InitError.OutOfMemory;
             const buf = dev.wrap(sh.bytes[0..len_aligned]) catch return InitError.OutOfMemory;
             ws[i] = .{ .buf = buf, .base = sh.bytes.ptr, .len = len_aligned };

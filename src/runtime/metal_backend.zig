@@ -88,15 +88,16 @@ pub const MetalBackend = struct {
     }
 
     /// Multi-shard entry point. Each `ShardInput.bytes` must be a
-    /// page-aligned mmap region; lengths are rounded down to a page multiple
-    /// before being handed to Metal.
+    /// page-aligned mmap region; lengths are rounded up to a page multiple
+    /// before being handed to Metal (mmap zero-fills the trailing partial
+    /// page, so the rounded length stays inside the kernel mapping).
     pub fn initShards(
         allocator: Allocator,
         shards: []const ShardInput,
         cfg: model_mod.LlamaConfig,
     ) InitError!MetalBackend {
         if (!metal.metal_enabled) return error.MetalUnavailable;
-        std.debug.assert(shards.len >= 1);
+        if (shards.len == 0) return InitError.MetalUnavailable;
 
         var dev = metal.Device.init() catch return error.MetalUnavailable;
         errdefer dev.deinit();
@@ -115,8 +116,14 @@ pub const MetalBackend = struct {
 
         const page = std.heap.pageSize();
         for (shards, 0..) |sh, i| {
-            const len_aligned = std.mem.alignBackward(usize, sh.bytes.len, page);
-            const buf = dev.wrap(sh.bytes[0..len_aligned]) catch
+            // Round the wrap length up to a page multiple. mmap implicitly
+            // zero-fills the trailing partial page, so the rounded length is
+            // safe to hand to Metal. We can't index `sh.bytes[0..len_aligned]`
+            // because the caller-supplied slice has `len == file size` (not
+            // page-rounded) — build the wider slice from the raw pointer.
+            const len_aligned = std.mem.alignForward(usize, sh.bytes.len, page);
+            const wide: []const u8 = sh.bytes.ptr[0..len_aligned];
+            const buf = dev.wrap(wide) catch
                 return error.MetalAllocFailed;
             weight_shards[i] = .{
                 .buf = buf,
@@ -316,4 +323,30 @@ test "MetalBackend.resolveWeight: two shards, pointer routes to correct buffer" 
     try std.testing.expect(loc0.buf != loc1.buf);
 
     try std.testing.expect(be.resolveWeight(@as([*]const u8, @ptrFromInt(0xdead0000))) == null);
+}
+
+test "MetalBackend.resolveWeight: shard with non-page-aligned length covers trailing partial page" {
+    if (!metal.metal_enabled) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const page = std.heap.pageSize();
+
+    // mmap two pages, but advertise a length of (page + 7) — i.e. a partial
+    // trailing page, exactly the layout real safetensors / GGUF files have.
+    const region = try std.posix.mmap(null, 2 * page,
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    defer std.posix.munmap(region);
+
+    const shard_len = page + 7;
+    const shards = [_]ShardInput{ .{ .bytes = region[0..shard_len] } };
+
+    var be = try MetalBackend.initShards(allocator, &shards, fakeCfg());
+    defer be.deinit(allocator);
+
+    // Pointer 3 bytes into the trailing partial page — alignBackward would
+    // have truncated this off and resolveWeight would return null.
+    const probe = region.ptr + page + 3;
+    const loc = be.resolveWeight(probe) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(usize, page + 3), loc.offset);
 }
