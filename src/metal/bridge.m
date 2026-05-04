@@ -209,10 +209,12 @@ inline float bf16_to_f32(ushort bits) {
 // section at `8 + json_header_len`, and the JSON header length is rarely a
 // multiple of 4). A direct `(device const ushort *)` cast on a misaligned
 // pointer returns garbage on Apple GPUs.
+// LE byte order: matches safetensors + Apple GPU native order.
 inline ushort load_u16_unaligned(device const uchar *p) {
     return (ushort)p[0] | ((ushort)p[1] << 8);
 }
 
+// LE byte order: matches safetensors + Apple GPU native order.
 inline uint load_u32_unaligned(device const uchar *p) {
     return (uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24);
 }
@@ -590,9 +592,12 @@ int vtb_metal_matmul_q8_0(
 
 // ----------------- MLX 4-bit matmul (one-shot) -------------------------------
 
-// Param block must match `MlxQ4Params` in the MSL source. Per-tensor byte
-// offsets are baked into setBuffer:offset: at bind time, so the kernel reads
-// 0 for all three *_offset_bytes fields.
+// Param block must match `MlxQ4Params` in the MSL source. Metal requires
+// setBuffer:offset: to be 4-byte aligned, so the host snaps each per-tensor
+// offset down to a 4-byte boundary (`& ~3`) and passes the 0..3-byte residual
+// through *_offset_bytes; the kernel re-adds the residual via byte-wise
+// pointer arithmetic. These fields are NOT zero in general — they hold the
+// unaligned-residual byte count for each of weights/scales/biases.
 struct MlxQ4ParamsHost {
     uint32_t m;
     uint32_t k;
@@ -637,6 +642,7 @@ int vtb_metal_matmul_mlx_q4(
         [enc setBuffer:weight_buf->buffer offset:w_aligned   atIndex:1];
         [enc setBuffer:scales_buf->buffer offset:s_aligned   atIndex:2];
         [enc setBuffer:biases_buf->buffer offset:b_aligned   atIndex:3];
+        // acts buffer is f32 scratch — always 4-byte aligned, no snap needed.
         [enc setBuffer:acts_buf->buffer   offset:acts_offset atIndex:4];
 
         struct MlxQ4ParamsHost p = {
@@ -930,6 +936,7 @@ void vtb_metal_segment_matmul_mlx_q4(
     [seg->enc setBuffer:weight_buf->buffer offset:w_aligned   atIndex:1];
     [seg->enc setBuffer:scales_buf->buffer offset:s_aligned   atIndex:2];
     [seg->enc setBuffer:biases_buf->buffer offset:b_aligned   atIndex:3];
+    // acts buffer is f32 scratch — always 4-byte aligned, no snap needed.
     [seg->enc setBuffer:acts_buf->buffer   offset:acts_offset atIndex:4];
 
     struct MlxQ4ParamsHost p = {

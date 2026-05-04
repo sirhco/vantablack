@@ -153,9 +153,14 @@ void vtb_metal_segment_attn_weighted_sum(
 //   group_size:        quant group (typically 64)
 //   scale_dtype_is_bf16: 0 = f16, 1 = bf16
 //
-// Per-tensor offsets are baked into the underlying setBuffer:offset: bind
-// calls; the kernel's internal MlxQ4Params.*_offset_bytes are therefore set
-// to 0 by the wrapper.
+// Metal compute encoders require setBuffer:offset: to be 4-byte aligned, but
+// safetensors data sections begin at `8 + json_header_len` and the JSON
+// header length is rarely a multiple of 4 — so absolute tensor offsets are
+// commonly 1 or 3 mod 4. The wrapper snaps each offset down to the nearest
+// 4-byte boundary (`& ~3`) for the bind, then passes the 0..3-byte residual
+// through MlxQ4Params.{w,scales,biases}_offset_bytes; the kernel adds the
+// residual back in via byte-wise pointer arithmetic. The acts buffer is f32
+// scratch and is always 4-byte aligned, so it's bound at its raw offset.
 void vtb_metal_segment_matmul_mlx_q4(
     VtbMetalSeg *seg,
     VtbMetalBuf *out_buf,
