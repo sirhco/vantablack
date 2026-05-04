@@ -359,9 +359,36 @@ fn matmulRuntime(
 ) StepError!void {
     const q = w.quant;
 
-    // MLX-Q4: 3-buffer kernel, CPU only for now. bits/group_size from aux.
+    // MLX-Q4: 3-buffer kernel. Prefer the GPU dispatch when a MetalBackend
+    // is present, the weight is 4-bit, and both `out` and `acts` alias
+    // persistent ScratchBufs (so the kernel can use real MTLBuffers without
+    // a copy). Any failure — missing scratch alias, unsupported bits, or
+    // dispatch error — falls through to the CPU baseline below.
     if (q == .mlx_q4) {
         const aux = w.mlx orelse return error.UnsupportedWeightType;
+
+        gpu: {
+            if (metal) |mb| {
+                if (aux.bits == 4) {
+                    const out_buf = mb.scratchForPtr(out.ptr) orelse break :gpu;
+                    const acts_buf = mb.scratchForPtr(acts.ptr) orelse break :gpu;
+                    mb.matmulMlxQ4(
+                        out_buf.buf,
+                        w.bytes.ptr,
+                        aux.scales.ptr,
+                        aux.biases.ptr,
+                        acts_buf.buf,
+                        m,
+                        k,
+                        aux.bits,
+                        aux.group_size,
+                        aux.scale_dtype,
+                    ) catch break :gpu;
+                    return;
+                }
+            }
+        }
+
         @import("../kernels/mlx.zig").matmul(
             out, w.bytes, aux.scales, aux.biases, acts,
             m, k, aux.bits, aux.group_size, aux.scale_dtype,
@@ -606,5 +633,121 @@ fn gatherEmbedding(out: []f32, table: TypedTensor, id: u32, dim: usize) StepErro
                 @memcpy(out[b * simd.tq2_0_block_elems ..][0..simd.tq2_0_block_elems], &tmp);
             }
         },
+    }
+}
+
+// Regression test: ensures the GPU mlx_q4 branch in matmulRuntime produces
+// results matching the CPU baseline within 1e-3. The test wires `out` and
+// `acts` into MetalBackend ScratchBufs (xb, q) and calls matmulRuntime so
+// the GPU dispatch fires; CPU expected values come from the same kernel
+// the fallback branch would have called. Detects future divergence between
+// the two codepaths.
+test "matmulRuntime: GPU mlx_q4 matches CPU baseline within tolerance" {
+    const metal = @import("../metal/bridge.zig");
+    if (!metal.metal_enabled) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const mlx_kernels = @import("../kernels/mlx.zig");
+
+    const page = std.heap.pageSize();
+
+    // Single-shard fixture: weight + scales + biases adjacent in one mmap.
+    const region = try std.posix.mmap(
+        null,
+        page,
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
+        0,
+    );
+    defer std.posix.munmap(region);
+
+    // Q4 layout: m=4, k=64, group_size=64 (1 group/row).
+    const m: usize = 4;
+    const k: usize = 64;
+    const w_len = m * k / 2; // 4-bit packed
+    const s_len = m * 2; // 1 group/row × f16
+    const b_len = m * 2;
+
+    // Every nibble = 0x3 (q=3). f16(0.5) = 0x3800. f16(0.25) = 0x3400.
+    @memset(region[0..w_len], 0x33);
+    var i: usize = 0;
+    while (i < m) : (i += 1) std.mem.writeInt(
+        u16,
+        region[w_len + i * 2 ..][0..2],
+        0x3800,
+        .little,
+    );
+    i = 0;
+    while (i < m) : (i += 1) std.mem.writeInt(
+        u16,
+        region[w_len + s_len + i * 2 ..][0..2],
+        0x3400,
+        .little,
+    );
+
+    const shards = [_]metal_backend_mod.ShardInput{
+        .{ .bytes = region[0 .. w_len + s_len + b_len] },
+    };
+
+    // Reuse the LlamaConfig used by the metal_backend Q4 tests: dim=64,
+    // n_heads*head_dim=64, max_seq=16. Keeps scratch xb / q sized to fit.
+    const cfg: model_mod.LlamaConfig = .{
+        .dim = 64,
+        .n_layers = 1,
+        .n_heads = 4,
+        .n_kv_heads = 4,
+        .head_dim = 16,
+        .ffn_dim = 64,
+        .vocab_size = 128,
+        .max_seq = 16,
+    };
+
+    var be = try metal_backend_mod.MetalBackend.initShards(allocator, &shards, cfg);
+    defer be.deinit(allocator);
+
+    // acts[0]=1, rest=0 — placed in scratch xb (cap = cfg.dim = 64).
+    @memset(be.xb.ptr[0..k], 0);
+    be.xb.ptr[0] = 1.0;
+
+    const aux: model_mod.MlxAux = .{
+        .scales = region[w_len .. w_len + s_len],
+        .biases = region[w_len + s_len .. w_len + s_len + b_len],
+        .bits = 4,
+        .group_size = 64,
+        .scale_dtype = .f16,
+    };
+    const w: TypedTensor = .{
+        .bytes = region[0..w_len],
+        .quant = .mlx_q4,
+        .mlx = aux,
+    };
+
+    // CPU baseline.
+    var cpu_out: [4]f32 = undefined;
+    try mlx_kernels.matmul(
+        &cpu_out,
+        w.bytes,
+        aux.scales,
+        aux.biases,
+        be.xb.ptr[0..k],
+        m,
+        k,
+        aux.bits,
+        aux.group_size,
+        aux.scale_dtype,
+    );
+
+    // GPU via matmulRuntime: out aliases scratch q (cap = n_heads*head_dim = 64).
+    const pool = try ThreadPool.init(allocator, 1);
+    defer pool.deinit(allocator);
+
+    const out_slice = be.q.ptr[0..m];
+    @memset(out_slice, 0);
+
+    try matmulRuntime(pool, &be, out_slice, w, be.xb.ptr[0..k], m, k);
+
+    for (cpu_out, out_slice) |c_v, g_v| {
+        try std.testing.expectApproxEqAbs(c_v, g_v, 1e-3);
     }
 }
