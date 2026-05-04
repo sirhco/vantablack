@@ -210,7 +210,7 @@ fn generate(
         if (!vantablack.metal.metal_enabled) break :blk null;
         break :blk vantablack.MetalBackend.init(gpa, mapper, model.config) catch null;
     };
-    defer if (maybe_metal) |*mb| mb.deinit();
+    defer if (maybe_metal) |*mb| mb.deinit(gpa);
     const metal_ptr: ?*vantablack.MetalBackend = if (maybe_metal != null) &maybe_metal.? else null;
 
     var state = try vantablack.forward.State.init(gpa, &model, metal_ptr);

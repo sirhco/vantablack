@@ -103,7 +103,7 @@ pub const Server = struct {
             const mb = MetalBackend.init(gpa, mapper, model.config) catch break :blk null;
             break :blk mb;
         };
-        errdefer if (maybe_metal) |*mb| mb.deinit();
+        errdefer if (maybe_metal) |*mb| mb.deinit(gpa);
 
         // Take a stable pointer into the local optional. Once this Server is
         // moved into the caller's slot the backend's Metal-heap pointers do
@@ -225,7 +225,7 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
-        if (self.metal) |*mb| mb.deinit();
+        if (self.metal) |*mb| mb.deinit(self.gpa);
         self.pool.deinit(self.gpa);
         if (self.tok_owns_pieces) self.tok.deinitOwnedPieces(self.gpa) else self.tok.deinit(self.gpa);
         self.cache.deinit(self.gpa);

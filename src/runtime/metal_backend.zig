@@ -27,13 +27,32 @@ pub const ScratchBuf = struct {
     cap: usize,
 };
 
+/// One page-aligned mmap region to register with the GPU as a no-copy
+/// MTLBuffer. Multi-shard HF/MLX bundles supply one of these per shard.
+pub const ShardInput = struct {
+    bytes: []const u8,
+};
+
+/// One wrapped MTLBuffer plus the host-pointer extents that resolve to it.
+pub const WeightShard = struct {
+    buf: *metal.Buf,
+    base: [*]const u8,
+    len: usize,
+};
+
+/// Result of `resolveWeight`: which shard a host pointer belongs to and the
+/// byte offset within that shard's wrapped buffer.
+pub const WeightLoc = struct {
+    buf: *metal.Buf,
+    offset: usize,
+};
+
 pub const MetalBackend = struct {
     dev: metal.Device,
 
-    // Whole-mmap weight buffer (no-copy wrap).
-    weights_buf: *metal.Buf,
-    weights_base: [*]const u8,
-    weights_len: usize,
+    // One wrapped MTLBuffer per source mmap region. GGUF puts one shard
+    // here; HF / MLX bundles can have many.
+    weight_shards: []WeightShard,
 
     // Per-token persistent state. All shared-storage MTLBuffers; both CPU
     // and GPU read/write them (Apple Silicon unified memory means same
@@ -57,22 +76,55 @@ pub const MetalBackend = struct {
     kv_v: ScratchBuf,         // n_layers * max_seq * n_kv_heads * head_dim
     attn_scores: ScratchBuf,  // n_heads * max_seq
 
+    /// GGUF call-site convenience: wraps the mapper's single mmap region as
+    /// a one-shard backend.
     pub fn init(
         allocator: Allocator,
         mapper: *const mapper_mod.ModelMapper,
         cfg: model_mod.LlamaConfig,
     ) InitError!MetalBackend {
-        _ = allocator;
+        const shards = [_]ShardInput{.{ .bytes = mapper.mapped }};
+        return initShards(allocator, &shards, cfg);
+    }
+
+    /// Multi-shard entry point. Each `ShardInput.bytes` must be a
+    /// page-aligned mmap region; lengths are rounded down to a page multiple
+    /// before being handed to Metal.
+    pub fn initShards(
+        allocator: Allocator,
+        shards: []const ShardInput,
+        cfg: model_mod.LlamaConfig,
+    ) InitError!MetalBackend {
         if (!metal.metal_enabled) return error.MetalUnavailable;
+        std.debug.assert(shards.len >= 1);
 
         var dev = metal.Device.init() catch return error.MetalUnavailable;
         errdefer dev.deinit();
 
-        const page = std.heap.pageSize();
-        const len_aligned = std.mem.alignForward(usize, mapper.mapped.len, page);
-        const weights_buf = dev.wrap(@as([*]const u8, @ptrCast(mapper.mapped.ptr))[0..len_aligned]) catch
+        const weight_shards = allocator.alloc(WeightShard, shards.len) catch
             return error.MetalAllocFailed;
-        errdefer dev.release(weights_buf);
+        errdefer allocator.free(weight_shards);
+
+        // Number of shards successfully wrapped; on error path we release
+        // exactly that many.
+        var wrapped: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < wrapped) : (i += 1) dev.release(weight_shards[i].buf);
+        }
+
+        const page = std.heap.pageSize();
+        for (shards, 0..) |sh, i| {
+            const len_aligned = std.mem.alignBackward(usize, sh.bytes.len, page);
+            const buf = dev.wrap(sh.bytes[0..len_aligned]) catch
+                return error.MetalAllocFailed;
+            weight_shards[i] = .{
+                .buf = buf,
+                .base = sh.bytes.ptr,
+                .len = len_aligned,
+            };
+            wrapped = i + 1;
+        }
 
         const kv_dim = cfg.n_kv_heads * cfg.head_dim;
         const x = try allocScratch(dev, cfg.dim);
@@ -108,9 +160,7 @@ pub const MetalBackend = struct {
 
         return .{
             .dev = dev,
-            .weights_buf = weights_buf,
-            .weights_base = @ptrCast(mapper.mapped.ptr),
-            .weights_len = len_aligned,
+            .weight_shards = weight_shards,
             .x = x,
             .xb = xb,
             .xb2 = xb2,
@@ -128,7 +178,7 @@ pub const MetalBackend = struct {
         };
     }
 
-    pub fn deinit(self: *MetalBackend) void {
+    pub fn deinit(self: *MetalBackend, allocator: Allocator) void {
         self.dev.release(self.attn_scores.buf);
         self.dev.release(self.kv_v.buf);
         self.dev.release(self.kv_k.buf);
@@ -143,19 +193,42 @@ pub const MetalBackend = struct {
         self.dev.release(self.xb2.buf);
         self.dev.release(self.xb.buf);
         self.dev.release(self.x.buf);
-        self.dev.release(self.weights_buf);
+        for (self.weight_shards) |sh| self.dev.release(sh.buf);
+        allocator.free(self.weight_shards);
         self.dev.deinit();
         self.* = undefined;
     }
 
-    /// Byte offset of `weight_bytes.ptr` inside the wrapped weight buffer.
-    /// Caller must ensure the slice is within the mmap region.
+    /// Linear-scan the registered shards and return the one containing
+    /// `host_ptr`, or null if it lies outside every shard.
+    pub fn resolveWeight(self: *const MetalBackend, host_ptr: [*]const u8) ?WeightLoc {
+        const p = @intFromPtr(host_ptr);
+        for (self.weight_shards) |sh| {
+            const base = @intFromPtr(sh.base);
+            if (p >= base and p < base + sh.len) {
+                return .{ .buf = sh.buf, .offset = p - base };
+            }
+        }
+        return null;
+    }
+
+    /// Legacy single-shard accessor for the GGUF forward path. Asserts there
+    /// is at least one shard registered.
+    pub fn weightsBuf(self: *const MetalBackend) *metal.Buf {
+        std.debug.assert(self.weight_shards.len >= 1);
+        return self.weight_shards[0].buf;
+    }
+
+    /// Byte offset of `weight_bytes.ptr` inside the FIRST wrapped weight
+    /// buffer. GGUF-only — multi-shard callers must use `resolveWeight`.
     pub fn weightOffset(self: *const MetalBackend, weight_bytes: []const u8) usize {
+        std.debug.assert(self.weight_shards.len >= 1);
+        const sh = self.weight_shards[0];
         const w_ptr_int = @intFromPtr(weight_bytes.ptr);
-        const base_int = @intFromPtr(self.weights_base);
+        const base_int = @intFromPtr(sh.base);
         std.debug.assert(w_ptr_int >= base_int);
         const off = w_ptr_int - base_int;
-        std.debug.assert(off + weight_bytes.len <= self.weights_len);
+        std.debug.assert(off + weight_bytes.len <= sh.len);
         return off;
     }
 
@@ -173,7 +246,7 @@ pub const MetalBackend = struct {
         std.debug.assert(m <= out_buf.cap);
         std.debug.assert(k <= in_buf.cap);
         const off = self.weightOffset(weight_bytes);
-        try self.dev.matmulQ8_0(out_buf.buf, self.weights_buf, off, in_buf.buf, m, k);
+        try self.dev.matmulQ8_0(out_buf.buf, self.weightsBuf(), off, in_buf.buf, m, k);
     }
 
     /// Returns the ScratchBuf whose shared-storage pointer matches `p`, or
@@ -197,4 +270,50 @@ fn allocScratch(dev: metal.Device, n: usize) !ScratchBuf {
         .ptr = @ptrCast(@alignCast(raw.?)),
         .cap = n,
     };
+}
+
+fn fakeCfg() model_mod.LlamaConfig {
+    return .{
+        .dim = 32,
+        .n_layers = 1,
+        .n_heads = 4,
+        .n_kv_heads = 4,
+        .head_dim = 8,
+        .ffn_dim = 64,
+        .vocab_size = 128,
+        .max_seq = 16,
+    };
+}
+
+test "MetalBackend.resolveWeight: two shards, pointer routes to correct buffer" {
+    if (!metal.metal_enabled) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    // Two page-aligned dummy shards.
+    const page = std.heap.pageSize();
+    const shard0 = try std.posix.mmap(null, page, .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    defer std.posix.munmap(shard0);
+    const shard1 = try std.posix.mmap(null, page, .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    defer std.posix.munmap(shard1);
+    shard0[0] = 0xAA;
+    shard1[0] = 0xBB;
+
+    const shards = [_]ShardInput{
+        .{ .bytes = shard0 },
+        .{ .bytes = shard1 },
+    };
+
+    var be = try MetalBackend.initShards(allocator, &shards, fakeCfg());
+    defer be.deinit(allocator);
+
+    const loc0 = be.resolveWeight(shard0.ptr).?;
+    const loc1 = be.resolveWeight(shard1.ptr + 64).?;
+    try std.testing.expectEqual(@as(usize, 0), loc0.offset);
+    try std.testing.expectEqual(@as(usize, 64), loc1.offset);
+    try std.testing.expect(loc0.buf != loc1.buf);
+
+    try std.testing.expect(be.resolveWeight(@as([*]const u8, @ptrFromInt(0xdead0000))) == null);
 }
