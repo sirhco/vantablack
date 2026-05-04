@@ -15,6 +15,8 @@ const Allocator = std.mem.Allocator;
 const metal = @import("../metal/bridge.zig");
 const model_mod = @import("model.zig");
 const mapper_mod = @import("../core/mapper.zig");
+const hf_loader_mod = @import("../core/hf_loader.zig");
+const safetensors = @import("../core/safetensors.zig");
 
 pub const InitError = error{
     MetalUnavailable,
@@ -85,6 +87,22 @@ pub const MetalBackend = struct {
     ) InitError!MetalBackend {
         const shards = [_]ShardInput{.{ .bytes = mapper.mapped }};
         return initShards(allocator, &shards, cfg);
+    }
+
+    /// HF / MLX call-site convenience: builds a ShardInput per safetensors
+    /// shard in `bundle` and delegates to `initShards`. Used by the multi-
+    /// shard runner to attach Metal acceleration without each call site
+    /// having to know the bundle's internal shape.
+    pub fn initFromHf(
+        allocator: Allocator,
+        bundle: *const hf_loader_mod.HfBundle,
+        cfg: model_mod.LlamaConfig,
+    ) InitError!MetalBackend {
+        const ins = allocator.alloc(ShardInput, bundle.shards.len) catch
+            return error.MetalAllocFailed;
+        defer allocator.free(ins);
+        for (bundle.shards, 0..) |sh, i| ins[i] = .{ .bytes = sh.mapped };
+        return initShards(allocator, ins, cfg);
     }
 
     /// Multi-shard entry point. Each `ShardInput.bytes` must be a
@@ -323,6 +341,55 @@ test "MetalBackend.resolveWeight: two shards, pointer routes to correct buffer" 
     try std.testing.expect(loc0.buf != loc1.buf);
 
     try std.testing.expect(be.resolveWeight(@as([*]const u8, @ptrFromInt(0xdead0000))) == null);
+}
+
+test "MetalBackend.initFromHf: wraps every HF shard's mmap" {
+    if (!metal.metal_enabled) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const page = std.heap.pageSize();
+
+    // Build a minimal HfBundle stub with two page-aligned anonymous mmap
+    // regions standing in for safetensors shards. We don't need real
+    // catalogs because initFromHf only reads `shards[i].mapped`.
+    const region0 = try std.posix.mmap(null, page,
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    defer std.posix.munmap(region0);
+    const region1 = try std.posix.mmap(null, page,
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    defer std.posix.munmap(region1);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const empty_cat: safetensors.Catalog = .{ .data_segment_start = 0, .descs = &.{} };
+    const Shard = hf_loader_mod.Shard;
+    var shards = try arena.allocator().alloc(Shard, 2);
+    shards[0] = .{ .mapped = region0, .catalog = empty_cat };
+    shards[1] = .{ .mapped = region1, .catalog = empty_cat };
+
+    const bundle: hf_loader_mod.HfBundle = .{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .shards = shards,
+        .config_json = "",
+        .tokenizer_json = null,
+        .tokenizer_model = null,
+    };
+    // Don't call bundle.deinit() — that would munmap our test regions and
+    // free `shards`, both of which are owned by this test's arena and defers.
+    var bundle_arena = bundle.arena;
+    defer bundle_arena.deinit();
+
+    var be = try MetalBackend.initFromHf(allocator, &bundle, fakeCfg());
+    defer be.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), be.weight_shards.len);
+    // Spot-check that pointers from shard 1 resolve to a different MTLBuffer.
+    const loc0 = be.resolveWeight(region0.ptr).?;
+    const loc1 = be.resolveWeight(region1.ptr).?;
+    try std.testing.expect(loc0.buf != loc1.buf);
 }
 
 test "MetalBackend.resolveWeight: shard with non-page-aligned length covers trailing partial page" {
