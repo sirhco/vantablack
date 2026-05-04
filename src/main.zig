@@ -424,7 +424,21 @@ fn runHfCli(
     var sampler = try vantablack.Sampler.init(gpa, sampler_cfg, model.config.vocab_size);
     defer sampler.deinit(gpa);
 
-    var state = try vantablack.forward.State.init(gpa, &model, null);
+    // Metal first so State can alias persistent shared-storage scratch into
+    // the backend's MTLBuffers. The bundle's mmap'd shard memory must outlive
+    // `maybe_metal` — `bundle.deinit()` runs after this defer because of LIFO
+    // order, so that's already correct.
+    var maybe_metal: ?vantablack.MetalBackend = blk: {
+        if (!vantablack.metal.metal_enabled) break :blk null;
+        break :blk vantablack.MetalBackend.initFromHf(gpa, &bundle, model.config) catch |e| {
+            std.log.warn("MetalBackend.initFromHf failed: {s}; falling back to CPU", .{@errorName(e)});
+            break :blk null;
+        };
+    };
+    defer if (maybe_metal) |*mb| mb.deinit(gpa);
+    const metal_ptr: ?*vantablack.MetalBackend = if (maybe_metal != null) &maybe_metal.? else null;
+
+    var state = try vantablack.forward.State.init(gpa, &model, metal_ptr);
     defer state.deinit(gpa);
 
     var cache = try vantablack.KvCache.init(
@@ -433,11 +447,13 @@ fn runHfCli(
         model.config.n_kv_heads,
         model.config.head_dim,
         model.config.max_seq,
-        null,
+        metal_ptr,
     );
     defer cache.deinit(gpa);
 
-    var pool = try vantablack.ThreadPool.init(gpa, threads);
+    // Metal handles matmuls; extra CPU workers just spin on GPU sync.
+    const effective_threads = if (metal_ptr != null and threads == 0) @as(usize, 1) else threads;
+    var pool = try vantablack.ThreadPool.init(gpa, effective_threads);
     defer pool.deinit(gpa);
 
     // Build prompt: chat mode wraps in TinyLlama zephyr template.
@@ -453,7 +469,7 @@ fn runHfCli(
 
     if (prompt_ids.len == 0) return;
     for (prompt_ids) |id| {
-        try vantablack.forward.step(&model, &state, &cache, pool, null, id);
+        try vantablack.forward.step(&model, &state, &cache, pool, metal_ptr, id);
         try tok.decodeTo(out, id);
     }
     try out.flush();
@@ -464,7 +480,7 @@ fn runHfCli(
         if (next == tok.eos) break;
         try tok.decodeTo(out, next);
         try out.flush();
-        try vantablack.forward.step(&model, &state, &cache, pool, null, next);
+        try vantablack.forward.step(&model, &state, &cache, pool, metal_ptr, next);
         next = sampler.sample(state.logits);
     }
     try out.writeByte('\n');
