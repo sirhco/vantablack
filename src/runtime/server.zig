@@ -103,7 +103,7 @@ pub const Server = struct {
             const mb = MetalBackend.init(gpa, mapper, model.config) catch break :blk null;
             break :blk mb;
         };
-        errdefer if (maybe_metal) |*mb| mb.deinit();
+        errdefer if (maybe_metal) |*mb| mb.deinit(gpa);
 
         // Take a stable pointer into the local optional. Once this Server is
         // moved into the caller's slot the backend's Metal-heap pointers do
@@ -160,10 +160,9 @@ pub const Server = struct {
 
     /// Build a `Server` against a HuggingFace / MLX directory bundle. The
     /// `Server` takes ownership of `bundle_owned` and frees it via `deinit`.
-    /// Metal is **not** wired up for MLX models in this path yet — the GPU
-    /// matmul kernel exists (`bridge.m::matmul_mlx_q4`) but the
-    /// `MetalBackend` plumbing for the 3-buffer layout is the next push.
-    /// Q8_0 GGUF `serve` keeps full GPU acceleration; MLX `serve` is CPU.
+    /// When built with `-Dmetal=true`, a per-shard `MetalBackend` is wired in
+    /// so MLX-Q4 matmuls dispatch to the GPU. Failure is logged and the path
+    /// silently falls back to CPU.
     pub fn initFromHf(
         gpa: Allocator,
         io: Io,
@@ -179,7 +178,24 @@ pub const Server = struct {
         var model = try Model.initFromHf(gpa, bundle_owned, hf_cfg);
         errdefer model.deinit(gpa);
 
-        var state = try forward_mod.State.init(gpa, &model, null);
+        // Metal is built before State so State can alias the backend's
+        // persistent shared-storage scratch buffers (zero-copy GPU dispatch).
+        // The bundle's mmap'd shard memory outlives this backend because the
+        // Server owns `bundle_owned` and `deinit` frees the metal backend
+        // before the bundle.
+        var maybe_metal: ?MetalBackend = blk: {
+            if (!metal_bridge.metal_enabled) break :blk null;
+            const mb = MetalBackend.initFromHf(gpa, bundle_owned, model.config) catch |e| {
+                std.log.warn("MetalBackend.initFromHf failed: {s}; falling back to CPU", .{@errorName(e)});
+                break :blk null;
+            };
+            break :blk mb;
+        };
+        errdefer if (maybe_metal) |*mb| mb.deinit(gpa);
+
+        const metal_ptr_init: ?*MetalBackend = if (maybe_metal != null) &maybe_metal.? else null;
+
+        var state = try forward_mod.State.init(gpa, &model, metal_ptr_init);
         errdefer state.deinit(gpa);
 
         var cache = try KvCache.init(
@@ -188,7 +204,7 @@ pub const Server = struct {
             model.config.n_kv_heads,
             model.config.head_dim,
             model.config.max_seq,
-            null,
+            metal_ptr_init,
         );
         errdefer cache.deinit(gpa);
 
@@ -196,7 +212,9 @@ pub const Server = struct {
         var tok = try Tokenizer.initFromHfJson(gpa, bundle_owned.tokenizer_json.?);
         errdefer tok.deinitOwnedPieces(gpa);
 
-        const pool = try ThreadPool.init(gpa, cfg.threads);
+        // When Metal handles matmuls, CPU workers just spin on GPU sync.
+        const effective_threads = if (maybe_metal != null and cfg.threads == 0) @as(usize, 1) else cfg.threads;
+        const pool = try ThreadPool.init(gpa, effective_threads);
         errdefer pool.deinit(gpa);
 
         // model_path may point at a directory; report 0 size if stat fails.
@@ -218,14 +236,14 @@ pub const Server = struct {
             .tok = tok,
             .tok_owns_pieces = true,
             .pool = pool,
-            .metal = null,
+            .metal = maybe_metal,
             .inference_mu = .init(0),
             .model_size_bytes = model_size,
         };
     }
 
     pub fn deinit(self: *Server) void {
-        if (self.metal) |*mb| mb.deinit();
+        if (self.metal) |*mb| mb.deinit(self.gpa);
         self.pool.deinit(self.gpa);
         if (self.tok_owns_pieces) self.tok.deinitOwnedPieces(self.gpa) else self.tok.deinit(self.gpa);
         self.cache.deinit(self.gpa);

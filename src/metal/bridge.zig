@@ -39,6 +39,38 @@ const c_api = if (metal_enabled) struct {
     extern "c" fn vtb_metal_segment_attn_scores(seg: *Seg, scores_buf: *Buf, q_buf: *Buf, k_cache_buf: *Buf, k_offset: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, seq_len: usize, inv_sqrt_hd: f32) void;
     extern "c" fn vtb_metal_segment_softmax_rows(seg: *Seg, scores_buf: *Buf, n_heads: usize, n_kv_heads: usize, head_dim: usize, seq_len: usize) void;
     extern "c" fn vtb_metal_segment_attn_weighted_sum(seg: *Seg, out_buf: *Buf, scores_buf: *Buf, v_cache_buf: *Buf, v_offset: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, seq_len: usize) void;
+    extern "c" fn vtb_metal_matmul_mlx_q4(
+        ctx: *Ctx,
+        out_buf: *Buf,
+        w_buf: *Buf,
+        w_offset: usize,
+        s_buf: *Buf,
+        s_offset: usize,
+        b_buf: *Buf,
+        b_offset: usize,
+        a_buf: *Buf,
+        a_offset: usize,
+        m: usize,
+        k: usize,
+        group_size: u32,
+        scale_dtype_is_bf16: u32,
+    ) c_int;
+    extern "c" fn vtb_metal_segment_matmul_mlx_q4(
+        seg: *Seg,
+        out_buf: *Buf,
+        w_buf: *Buf,
+        w_offset: usize,
+        s_buf: *Buf,
+        s_offset: usize,
+        b_buf: *Buf,
+        b_offset: usize,
+        a_buf: *Buf,
+        a_offset: usize,
+        m: usize,
+        k: usize,
+        group_size: u32,
+        scale_dtype_is_bf16: u32,
+    ) void;
 } else struct {
     fn vtb_metal_init() ?*Ctx {
         return null;
@@ -69,6 +101,40 @@ const c_api = if (metal_enabled) struct {
     fn vtb_metal_segment_attn_scores(_: *Seg, _: *Buf, _: *Buf, _: *Buf, _: usize, _: usize, _: usize, _: usize, _: usize, _: f32) void {}
     fn vtb_metal_segment_softmax_rows(_: *Seg, _: *Buf, _: usize, _: usize, _: usize, _: usize) void {}
     fn vtb_metal_segment_attn_weighted_sum(_: *Seg, _: *Buf, _: *Buf, _: *Buf, _: usize, _: usize, _: usize, _: usize, _: usize) void {}
+    fn vtb_metal_matmul_mlx_q4(
+        _: *Ctx,
+        _: *Buf,
+        _: *Buf,
+        _: usize,
+        _: *Buf,
+        _: usize,
+        _: *Buf,
+        _: usize,
+        _: *Buf,
+        _: usize,
+        _: usize,
+        _: usize,
+        _: u32,
+        _: u32,
+    ) c_int {
+        return 1;
+    }
+    fn vtb_metal_segment_matmul_mlx_q4(
+        _: *Seg,
+        _: *Buf,
+        _: *Buf,
+        _: usize,
+        _: *Buf,
+        _: usize,
+        _: *Buf,
+        _: usize,
+        _: *Buf,
+        _: usize,
+        _: usize,
+        _: usize,
+        _: u32,
+        _: u32,
+    ) void {}
 };
 
 const vtb_metal_init = c_api.vtb_metal_init;
@@ -88,6 +154,8 @@ const vtb_metal_segment_copy = c_api.vtb_metal_segment_copy;
 const vtb_metal_segment_attn_scores = c_api.vtb_metal_segment_attn_scores;
 const vtb_metal_segment_softmax_rows = c_api.vtb_metal_segment_softmax_rows;
 const vtb_metal_segment_attn_weighted_sum = c_api.vtb_metal_segment_attn_weighted_sum;
+const vtb_metal_matmul_mlx_q4 = c_api.vtb_metal_matmul_mlx_q4;
+const vtb_metal_segment_matmul_mlx_q4 = c_api.vtb_metal_segment_matmul_mlx_q4;
 
 pub const InitError = error{MetalUnavailable};
 pub const AllocError = error{MetalAllocFailed};
@@ -137,6 +205,41 @@ pub const Device = struct {
         if (rc != 0) return error.MetalDispatchFailed;
     }
 
+    pub fn matmulMlxQ4(
+        self: Device,
+        out_buf: *Buf,
+        w_buf: *Buf,
+        w_offset: usize,
+        s_buf: *Buf,
+        s_offset: usize,
+        b_buf: *Buf,
+        b_offset: usize,
+        a_buf: *Buf,
+        a_offset: usize,
+        m: usize,
+        k: usize,
+        group_size: u32,
+        scale_is_bf16: bool,
+    ) DispatchError!void {
+        const rc = vtb_metal_matmul_mlx_q4(
+            self.handle,
+            out_buf,
+            w_buf,
+            w_offset,
+            s_buf,
+            s_offset,
+            b_buf,
+            b_offset,
+            a_buf,
+            a_offset,
+            m,
+            k,
+            group_size,
+            if (scale_is_bf16) 1 else 0,
+        );
+        if (rc != 0) return error.MetalDispatchFailed;
+    }
+
     pub fn segmentBegin(self: Device) DispatchError!Segment {
         const seg = vtb_metal_segment_begin(self.handle) orelse return error.MetalDispatchFailed;
         return .{ .handle = seg };
@@ -153,6 +256,39 @@ pub const Segment = struct {
 
     pub fn matmulQ8_0(self: Segment, out_buf: *Buf, w_buf: *Buf, w_offset: usize, acts_buf: *Buf, m: usize, k: usize) void {
         vtb_metal_segment_matmul_q8_0(self.handle, out_buf, w_buf, w_offset, acts_buf, m, k);
+    }
+    pub fn matmulMlxQ4(
+        self: Segment,
+        out_buf: *Buf,
+        w_buf: *Buf,
+        w_offset: usize,
+        s_buf: *Buf,
+        s_offset: usize,
+        b_buf: *Buf,
+        b_offset: usize,
+        a_buf: *Buf,
+        a_offset: usize,
+        m: usize,
+        k: usize,
+        group_size: u32,
+        scale_is_bf16: bool,
+    ) void {
+        vtb_metal_segment_matmul_mlx_q4(
+            self.handle,
+            out_buf,
+            w_buf,
+            w_offset,
+            s_buf,
+            s_offset,
+            b_buf,
+            b_offset,
+            a_buf,
+            a_offset,
+            m,
+            k,
+            group_size,
+            if (scale_is_bf16) 1 else 0,
+        );
     }
     pub fn rmsnorm(self: Segment, out_buf: *Buf, in_buf: *Buf, weight_buf: *Buf, weight_offset: usize, n: usize, eps: f32) void {
         vtb_metal_segment_rmsnorm(self.handle, out_buf, in_buf, weight_buf, weight_offset, n, eps);
@@ -179,3 +315,55 @@ pub const Segment = struct {
         vtb_metal_segment_attn_weighted_sum(self.handle, out_buf, scores_buf, v_cache_buf, v_offset, n_heads, n_kv_heads, head_dim, seq_len);
     }
 };
+
+test "Device.matmulMlxQ4 dispatches without error" {
+    if (!metal_enabled) return error.SkipZigTest;
+
+    var dev = try Device.init();
+    defer dev.deinit();
+
+    // 4-row x 64-col Q4 matmul fixture (group_size = 64 -> 1 group/row).
+    const m: usize = 4;
+    const k: usize = 64;
+    const group_size: u32 = 64;
+
+    // Packed weights: m * k / 2 bytes (4 bits each, 2 per byte).
+    var w_raw: ?*anyopaque = null;
+    const w_buf = try dev.alloc(m * k / 2, &w_raw);
+    defer dev.release(w_buf);
+    const w_ptr: [*]u8 = @ptrCast(w_raw.?);
+    @memset(w_ptr[0 .. m * k / 2], 0x11); // every nibble = 0x1
+
+    // Scales: 1 group/row x m rows x 2 bytes (f16). All set to f16(1.0) = 0x3C00.
+    var s_raw: ?*anyopaque = null;
+    const s_buf = try dev.alloc(m * 2, &s_raw);
+    defer dev.release(s_buf);
+    const s_ptr: [*]u8 = @ptrCast(s_raw.?);
+    var i: usize = 0;
+    while (i < m) : (i += 1) std.mem.writeInt(u16, s_ptr[i * 2 ..][0..2], 0x3C00, .little);
+
+    // Biases: same shape as scales, all zero.
+    var b_raw: ?*anyopaque = null;
+    const b_buf = try dev.alloc(m * 2, &b_raw);
+    defer dev.release(b_buf);
+    const b_ptr: [*]u8 = @ptrCast(b_raw.?);
+    @memset(b_ptr[0 .. m * 2], 0);
+
+    // Acts: f32 x k. Slot 0 = 1.0, rest = 0.
+    var a_raw: ?*anyopaque = null;
+    const a_buf = try dev.alloc(@sizeOf(f32) * k, &a_raw);
+    defer dev.release(a_buf);
+    const a_ptr: [*]f32 = @ptrCast(@alignCast(a_raw.?));
+    @memset(a_ptr[0..k], 0);
+    a_ptr[0] = 1.0;
+
+    // Out: f32 x m.
+    var out_raw: ?*anyopaque = null;
+    const out_buf = try dev.alloc(@sizeOf(f32) * m, &out_raw);
+    defer dev.release(out_buf);
+
+    try dev.matmulMlxQ4(out_buf, w_buf, 0, s_buf, 0, b_buf, 0, a_buf, 0, m, k, group_size, false);
+
+    const out: [*]const f32 = @ptrCast(@alignCast(out_raw.?));
+    for (out[0..m]) |v| try std.testing.expect(std.math.isFinite(v));
+}

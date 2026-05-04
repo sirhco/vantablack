@@ -203,8 +203,24 @@ inline float bf16_to_f32(ushort bits) {
     return as_type<float>(w);
 }
 
-inline float scale_load(device const ushort *p, uint i, bool is_bf16) {
-    ushort bits = p[i];
+// Byte-wise unaligned u16 load. The MLX-Q4 host helper baked the per-row
+// pointer arithmetic into the kernel via `*_offset_bytes`, so the resulting
+// address is only guaranteed 1-byte-aligned (safetensors stores the data
+// section at `8 + json_header_len`, and the JSON header length is rarely a
+// multiple of 4). A direct `(device const ushort *)` cast on a misaligned
+// pointer returns garbage on Apple GPUs.
+// LE byte order: matches safetensors + Apple GPU native order.
+inline ushort load_u16_unaligned(device const uchar *p) {
+    return (ushort)p[0] | ((ushort)p[1] << 8);
+}
+
+// LE byte order: matches safetensors + Apple GPU native order.
+inline uint load_u32_unaligned(device const uchar *p) {
+    return (uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24);
+}
+
+inline float scale_load_bytes(device const uchar *base, uint byte_idx, bool is_bf16) {
+    ushort bits = load_u16_unaligned(base + byte_idx);
     if (is_bf16) return bf16_to_f32(bits);
     half h = as_type<half>(bits);
     return (float)h;
@@ -228,23 +244,22 @@ kernel void matmul_mlx_q4(
     uint scale_row_bytes = groups_per_row * 2;
 
     device const uchar *w_row = weights + p.w_offset_bytes + gid * weight_row_bytes;
-    device const ushort *s_row = (device const ushort *)(scales + p.scales_offset_bytes + gid * scale_row_bytes);
-    device const ushort *b_row = (device const ushort *)(biases + p.biases_offset_bytes + gid * scale_row_bytes);
+    device const uchar *s_row = scales + p.scales_offset_bytes + gid * scale_row_bytes;
+    device const uchar *b_row = biases + p.biases_offset_bytes + gid * scale_row_bytes;
 
     float total = 0.0;
     uint col = 0;
     for (uint g = 0; g < groups_per_row; ++g) {
-        float scale = scale_load(s_row, g, is_bf16);
-        float bias = scale_load(b_row, g, is_bf16);
+        float scale = scale_load_bytes(s_row, g * 2, is_bf16);
+        float bias = scale_load_bytes(b_row, g * 2, is_bf16);
         float q_dot = 0.0;
         float x_sum = 0.0;
         uint end = col + p.group_size;
         for (uint c = col; c < end; c += 8) {
-            // (c / 8) * 4 is always 4-byte aligned, so a plain `uint *`
-            // load is valid even though the underlying buffer has no
-            // higher alignment guarantee.
-            device const uint *wp = (device const uint *)(w_row + (c / 8) * 4);
-            uint word = wp[0];
+            // Byte-wise u32 load: w_row may be 1-byte-aligned (safetensors
+            // data section starts mid-page on real bundles), so a direct
+            // `device const uint *` cast can return garbage on AGX hardware.
+            uint word = load_u32_unaligned(w_row + (c / 8) * 4);
             for (uint i = 0; i < 8; ++i) {
                 uint q = (word >> (i * 4)) & 0xF;
                 float xv = acts[c + i];
@@ -575,6 +590,89 @@ int vtb_metal_matmul_q8_0(
     }
 }
 
+// ----------------- MLX 4-bit matmul (one-shot) -------------------------------
+
+// Param block must match `MlxQ4Params` in the MSL source. Metal requires
+// setBuffer:offset: to be 4-byte aligned, so the host snaps each per-tensor
+// offset down to a 4-byte boundary (`& ~3`) and passes the 0..3-byte residual
+// through *_offset_bytes; the kernel re-adds the residual via byte-wise
+// pointer arithmetic. These fields are NOT zero in general — they hold the
+// unaligned-residual byte count for each of weights/scales/biases.
+struct MlxQ4ParamsHost {
+    uint32_t m;
+    uint32_t k;
+    uint32_t w_offset_bytes;
+    uint32_t scales_offset_bytes;
+    uint32_t biases_offset_bytes;
+    uint32_t group_size;
+    uint32_t scale_dtype_is_bf16;
+};
+
+int vtb_metal_matmul_mlx_q4(
+    VtbMetalCtx *ctx,
+    VtbMetalBuf *out_buf,
+    VtbMetalBuf *weight_buf, size_t weight_offset,
+    VtbMetalBuf *scales_buf, size_t scales_offset,
+    VtbMetalBuf *biases_buf, size_t biases_offset,
+    VtbMetalBuf *acts_buf,   size_t acts_offset,
+    size_t m, size_t k,
+    uint32_t group_size,
+    uint32_t scale_dtype_is_bf16)
+{
+    if (!ctx || !out_buf || !weight_buf || !scales_buf || !biases_buf || !acts_buf) return 1;
+    @autoreleasepool {
+        // Metal compute encoders require setBuffer:offset: offsets to be a
+        // multiple of 4. Real safetensors bundles place the data section at
+        // `8 + json_header_len`, and the JSON header length is rarely a
+        // multiple of 4 — so absolute tensor offsets within the wrapped
+        // buffer are routinely 1 or 3 mod 4. Snap each offset down to the
+        // nearest 4-byte boundary, hand the residual (0..3) to the kernel
+        // via the params struct, and let the kernel do byte-wise reads.
+        const size_t w_aligned  = weight_offset & ~(size_t)3;
+        const size_t s_aligned  = scales_offset & ~(size_t)3;
+        const size_t b_aligned  = biases_offset & ~(size_t)3;
+        const uint32_t w_resid  = (uint32_t)(weight_offset - w_aligned);
+        const uint32_t s_resid  = (uint32_t)(scales_offset - s_aligned);
+        const uint32_t b_resid  = (uint32_t)(biases_offset - b_aligned);
+
+        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:ctx->pso_mlx_q4];
+        [enc setBuffer:out_buf->buffer    offset:0           atIndex:0];
+        [enc setBuffer:weight_buf->buffer offset:w_aligned   atIndex:1];
+        [enc setBuffer:scales_buf->buffer offset:s_aligned   atIndex:2];
+        [enc setBuffer:biases_buf->buffer offset:b_aligned   atIndex:3];
+        // acts buffer is f32 scratch — always 4-byte aligned, no snap needed.
+        [enc setBuffer:acts_buf->buffer   offset:acts_offset atIndex:4];
+
+        struct MlxQ4ParamsHost p = {
+            .m = (uint32_t)m,
+            .k = (uint32_t)k,
+            .w_offset_bytes = w_resid,
+            .scales_offset_bytes = s_resid,
+            .biases_offset_bytes = b_resid,
+            .group_size = group_size,
+            .scale_dtype_is_bf16 = scale_dtype_is_bf16,
+        };
+        [enc setBytes:&p length:sizeof(p) atIndex:5];
+
+        NSUInteger tg = 64;
+        if (tg > ctx->pso_mlx_q4.maxTotalThreadsPerThreadgroup)
+            tg = ctx->pso_mlx_q4.maxTotalThreadsPerThreadgroup;
+        [enc dispatchThreads:MTLSizeMake(m, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        if (cmd.status == MTLCommandBufferStatusError) {
+            NSLog(@"vtb_metal_matmul_mlx_q4: cmd failed: %@", cmd.error);
+            return 2;
+        }
+        return 0;
+    }
+}
+
 // ----------------- Segment (batched) dispatch --------------------------------
 
 VtbMetalSeg *vtb_metal_segment_begin(VtbMetalCtx *ctx) {
@@ -809,4 +907,52 @@ void vtb_metal_segment_attn_weighted_sum(
     while (tg_x * tg_y > seg->ctx->pso_attn_weighted.maxTotalThreadsPerThreadgroup) tg_y /= 2;
     [seg->enc dispatchThreads:MTLSizeMake(n_heads, head_dim, 1)
               threadsPerThreadgroup:MTLSizeMake(tg_x, tg_y, 1)];
+}
+
+void vtb_metal_segment_matmul_mlx_q4(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *out_buf,
+    VtbMetalBuf *weight_buf, size_t weight_offset,
+    VtbMetalBuf *scales_buf, size_t scales_offset,
+    VtbMetalBuf *biases_buf, size_t biases_offset,
+    VtbMetalBuf *acts_buf,   size_t acts_offset,
+    size_t m, size_t k,
+    uint32_t group_size,
+    uint32_t scale_dtype_is_bf16)
+{
+    if (!seg) return;
+    // Snap weight/scales/biases offsets to 4-byte alignment; pass remainder
+    // bytes via the params struct. Mirrors `vtb_metal_matmul_mlx_q4` — see
+    // that function for the safetensors-misalignment rationale.
+    const size_t w_aligned  = weight_offset & ~(size_t)3;
+    const size_t s_aligned  = scales_offset & ~(size_t)3;
+    const size_t b_aligned  = biases_offset & ~(size_t)3;
+    const uint32_t w_resid  = (uint32_t)(weight_offset - w_aligned);
+    const uint32_t s_resid  = (uint32_t)(scales_offset - s_aligned);
+    const uint32_t b_resid  = (uint32_t)(biases_offset - b_aligned);
+
+    [seg->enc setComputePipelineState:seg->ctx->pso_mlx_q4];
+    [seg->enc setBuffer:out_buf->buffer    offset:0           atIndex:0];
+    [seg->enc setBuffer:weight_buf->buffer offset:w_aligned   atIndex:1];
+    [seg->enc setBuffer:scales_buf->buffer offset:s_aligned   atIndex:2];
+    [seg->enc setBuffer:biases_buf->buffer offset:b_aligned   atIndex:3];
+    // acts buffer is f32 scratch — always 4-byte aligned, no snap needed.
+    [seg->enc setBuffer:acts_buf->buffer   offset:acts_offset atIndex:4];
+
+    struct MlxQ4ParamsHost p = {
+        .m = (uint32_t)m,
+        .k = (uint32_t)k,
+        .w_offset_bytes = w_resid,
+        .scales_offset_bytes = s_resid,
+        .biases_offset_bytes = b_resid,
+        .group_size = group_size,
+        .scale_dtype_is_bf16 = scale_dtype_is_bf16,
+    };
+    [seg->enc setBytes:&p length:sizeof(p) atIndex:5];
+
+    NSUInteger tg = 64;
+    if (tg > seg->ctx->pso_mlx_q4.maxTotalThreadsPerThreadgroup)
+        tg = seg->ctx->pso_mlx_q4.maxTotalThreadsPerThreadgroup;
+    [seg->enc dispatchThreads:MTLSizeMake(m, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
 }
