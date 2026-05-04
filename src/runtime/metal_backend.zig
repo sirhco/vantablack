@@ -17,10 +17,17 @@ const model_mod = @import("model.zig");
 const mapper_mod = @import("../core/mapper.zig");
 const hf_loader_mod = @import("../core/hf_loader.zig");
 const safetensors = @import("../core/safetensors.zig");
+const mlx_kernels = @import("../kernels/mlx.zig");
 
 pub const InitError = error{
     MetalUnavailable,
     MetalAllocFailed,
+};
+
+pub const MatmulError = error{
+    UnsupportedBits,
+    WeightNotMapped,
+    MetalDispatchFailed,
 };
 
 pub const ScratchBuf = struct {
@@ -274,6 +281,43 @@ pub const MetalBackend = struct {
         try self.dev.matmulQ8_0(out_buf.buf, self.weightsBuf(), off, in_buf.buf, m, k);
     }
 
+    /// MLX-Q4 matmul host helper: resolves raw weight/scales/biases pointers
+    /// (which point into mmap'd shard regions) to (buf, offset) tuples via
+    /// `resolveWeight`, then dispatches the 4-buffer Metal kernel via
+    /// `Device.matmulMlxQ4`. Plan C only handles 4-bit on GPU; other bit
+    /// widths are rejected with `error.UnsupportedBits` so the caller can
+    /// fall back to CPU.
+    pub fn matmulMlxQ4(
+        self: *MetalBackend,
+        out: *metal.Buf,
+        weight_ptr: [*]const u8,
+        scales_ptr: [*]const u8,
+        biases_ptr: [*]const u8,
+        acts: *metal.Buf,
+        m: usize,
+        k: usize,
+        bits: u32,
+        group_size: u32,
+        scale_dtype: mlx_kernels.ScaleDtype,
+    ) MatmulError!void {
+        if (bits != 4) return error.UnsupportedBits;
+
+        const w = self.resolveWeight(weight_ptr) orelse return error.WeightNotMapped;
+        const s = self.resolveWeight(scales_ptr) orelse return error.WeightNotMapped;
+        const b = self.resolveWeight(biases_ptr) orelse return error.WeightNotMapped;
+
+        try self.dev.matmulMlxQ4(
+            out,
+            w.buf, w.offset,
+            s.buf, s.offset,
+            b.buf, b.offset,
+            acts, 0,
+            m, k,
+            group_size,
+            scale_dtype == .bf16,
+        );
+    }
+
     /// Returns the ScratchBuf whose shared-storage pointer matches `p`, or
     /// null if `p` was allocated outside the backend (e.g. in CPU-only mode).
     /// Lets `forward.zig` map a plain `[]f32` view back to its GPU buffer
@@ -416,4 +460,137 @@ test "MetalBackend.resolveWeight: shard with non-page-aligned length covers trai
     const probe = region.ptr + page + 3;
     const loc = be.resolveWeight(probe) orelse return error.TestFailed;
     try std.testing.expectEqual(@as(usize, page + 3), loc.offset);
+}
+
+fn fakeCfgQ4() model_mod.LlamaConfig {
+    // Wide enough that scratch xb (cap=dim) holds k=64 floats and
+    // scratch q (cap=n_heads*head_dim) holds m=4 floats.
+    return .{
+        .dim = 64,
+        .n_layers = 1,
+        .n_heads = 4,
+        .n_kv_heads = 4,
+        .head_dim = 16,
+        .ffn_dim = 64,
+        .vocab_size = 128,
+        .max_seq = 16,
+    };
+}
+
+test "MetalBackend.matmulMlxQ4: routes weight + scales + biases across two shards" {
+    if (!metal.metal_enabled) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const page = std.heap.pageSize();
+
+    // Two anonymous mmap shards. Weight in shard 0, scales+biases in shard 1.
+    const shard0_region = try std.posix.mmap(null, page,
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    defer std.posix.munmap(shard0_region);
+    const shard1_region = try std.posix.mmap(null, page,
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    defer std.posix.munmap(shard1_region);
+
+    // Q4 layout: m=4, k=64, group_size=64 (1 group/row).
+    const m: usize = 4;
+    const k: usize = 64;
+    const group_size: u32 = 64;
+
+    // Weight: m * k / 2 bytes packed; every nibble = 0x1 (q=1, dequant = (1-8) = -7).
+    const w_bytes_len = m * k / 2;
+    @memset(shard0_region[0..w_bytes_len], 0x11);
+
+    // Scales: m * 1 group/row × 2 bytes = m*2 bytes. f16(1.0) = 0x3C00.
+    const s_bytes_len = m * 2;
+    var i: usize = 0;
+    while (i < m) : (i += 1) std.mem.writeInt(u16, shard1_region[i * 2 ..][0..2], 0x3C00, .little);
+
+    // Biases: same shape as scales, placed AFTER scales in shard 1. The
+    // kernel computes `scale * Σ q*x + bias * Σ x` (MLX affine-block
+    // dequant — bias absorbs the -zero_point*scale offset rather than
+    // the kernel subtracting 8). To produce dequant = -7 with q=1 and
+    // scale=1.0, set bias = -8.0. f16(-8.0) = 0xC800.
+    const b_bytes_len = m * 2;
+    var bi: usize = 0;
+    while (bi < m) : (bi += 1) std.mem.writeInt(
+        u16,
+        shard1_region[s_bytes_len + bi * 2 ..][0..2],
+        0xC800,
+        .little,
+    );
+
+    const shards = [_]ShardInput{
+        .{ .bytes = shard0_region[0..w_bytes_len] },
+        .{ .bytes = shard1_region[0 .. s_bytes_len + b_bytes_len] },
+    };
+
+    var be = try MetalBackend.initShards(allocator, &shards, fakeCfgQ4());
+    defer be.deinit(allocator);
+
+    // acts (k=64 f32 slots) lives in scratch xb (cap = cfg.dim = 64).
+    @memset(be.xb.ptr[0..k], 0);
+    be.xb.ptr[0] = 1.0;
+
+    // out (m=4 f32 slots) lives in scratch q (cap = n_heads*head_dim = 64).
+    @memset(be.q.ptr[0..m], 0);
+
+    const w_ptr: [*]const u8 = shard0_region.ptr;
+    const s_ptr: [*]const u8 = shard1_region.ptr;
+    const b_ptr: [*]const u8 = shard1_region.ptr + s_bytes_len;
+
+    try be.matmulMlxQ4(
+        be.q.buf, w_ptr, s_ptr, b_ptr, be.xb.buf,
+        m, k, 4, group_size, mlx_kernels.ScaleDtype.f16,
+    );
+
+    // Expected: every nibble = 1, scale = 1.0, bias = -8.0, acts[0] = 1.0.
+    // Per-row: scale * Σ q*x + bias * Σ x = 1.0*1.0 + (-8.0)*1.0 = -7.0.
+    for (be.q.ptr[0..m]) |v| {
+        try std.testing.expectApproxEqAbs(@as(f32, -7.0), v, 1e-3);
+    }
+}
+
+test "MetalBackend.matmulMlxQ4: rejects bits != 4 with UnsupportedBits" {
+    if (!metal.metal_enabled) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const page = std.heap.pageSize();
+    const region = try std.posix.mmap(null, page,
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    defer std.posix.munmap(region);
+
+    const shards = [_]ShardInput{.{ .bytes = region }};
+    var be = try MetalBackend.initShards(allocator, &shards, fakeCfgQ4());
+    defer be.deinit(allocator);
+
+    const err = be.matmulMlxQ4(
+        be.q.buf, region.ptr, region.ptr, region.ptr, be.xb.buf,
+        4, 64, 8, 64, mlx_kernels.ScaleDtype.f16,
+    );
+    try std.testing.expectError(error.UnsupportedBits, err);
+}
+
+test "MetalBackend.matmulMlxQ4: returns WeightNotMapped for stray pointer" {
+    if (!metal.metal_enabled) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const page = std.heap.pageSize();
+    const region = try std.posix.mmap(null, page,
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    defer std.posix.munmap(region);
+
+    const shards = [_]ShardInput{.{ .bytes = region }};
+    var be = try MetalBackend.initShards(allocator, &shards, fakeCfgQ4());
+    defer be.deinit(allocator);
+
+    const stray: [*]const u8 = @ptrFromInt(0xdead0000);
+    const err = be.matmulMlxQ4(
+        be.q.buf, stray, region.ptr, region.ptr, be.xb.buf,
+        4, 64, 4, 64, mlx_kernels.ScaleDtype.f16,
+    );
+    try std.testing.expectError(error.WeightNotMapped, err);
 }
