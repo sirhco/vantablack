@@ -24,7 +24,7 @@ tax, no framework tax. Just weights and math.
 | Capability                                              | State                |
 |---------------------------------------------------------|----------------------|
 | GGUF v2/v3 parsing (zero-copy mmap)                     | shipped              |
-| Llama / Mistral / Gemma architectures                   | shipped (CPU). Llama: full GPU forward path. Mistral: sliding-window attention (`mistral.attention.sliding_window` GGUF key, default 4096). Gemma: `gelu_approx` (tanh-approx GELU) FFN. Phi (parallel-block forward): refused at load until segment-API redesign lands |
+| Llama / Mistral / Gemma architectures                   | shipped — Llama, Mistral, and Gemma all run the full GPU forward path. Mistral SWA reuses existing `attn_scores` via K/V cache offset shift. Gemma uses a new `gelu_approx` MSL kernel. Phi (parallel-block forward): refused at load until segment-API redesign lands |
 | KV cache (fixed-size, layer-major)                      | shipped              |
 | Persistent thread pool (N-1 workers)                    | shipped              |
 | SentencePiece BPE encode + decode                       | shipped              |
@@ -41,7 +41,7 @@ tax, no framework tax. Just weights and math.
 | MLX 2 / 3 / 4 / 5 / 6 / 8-bit dispatch                  | shipped — 4-bit verified on real model; others covered by unit tests |
 | Multi-shard safetensors directory loading               | shipped (covered by `core/hf_loader.zig` test) |
 | MLX 4-bit MSL kernel                                    | compiled + cached; runtime dispatch from forward.zig pending |
-| Tiktoken-style tokenizer (GPT-2 + cl100k-style)         | shipped — byte→Unicode alphabet, GPT-2 pre-tokenizer split, byte-level encode/decode; `Tokenizer.initFromHfJson` auto-detects `ByteLevel` in `tokenizer.json::pre_tokenizer` and switches flavor. Llama-3 contraction-aware split deferred until reference fixtures available |
+| Tiktoken-style tokenizer (GPT-2 / Llama-3 / cl100k)     | shipped — byte→Unicode alphabet, byte-level encode/decode, `splitGpt2` + `splitLlama3` (contractions, optional-leading-space binding, 1-3 digit chunks); `Tokenizer.initFromHfJson` auto-detects `ByteLevel` and switches flavor. Llama-3 split structurally matches the cl100k regex; HF reference fixtures still recommended before claiming byte-equality on novel inputs |
 | CPU SIMD: `dot_f32` + `dot_i8` primitives               | shipped — both portable @Vector implementations. `dot_f32` lowers to NEON `fmla`. `dot_i8` widens i8 lanes to i32 and reduces; on aarch64+dotprod it stays in NEON `mul.4s + add.4s` rather than the fused `sdot.4s` (Zig 0.16 codegen does not yet pattern-match the chain into `sdot`). Plumbing for a Q8_0 × Q8_0 matmul kernel with dynamically-quantized activations. AMX path explicitly out of scope (undocumented, register layout shifts between M1/M2/M3) |
 | Vulkan / cross-vendor GPU                               | not yet              |
 | Prompt prefill batching                                 | shipped (CPU) — `runtime/prefill.zig` runs the prompt as one B-wide pass: each weight row is dequantized once and dot-multiplied against B activation rows via `simd.dot_f32`. ~2.3× faster than per-token CPU forward on an 87-token TinyLlama prompt. Metal builds keep the per-token GPU loop pending a batched MSL kernel |
