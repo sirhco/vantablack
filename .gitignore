@@ -2,3 +2,11 @@
 zig-out/
 *.o
 .worktrees/
+
+# Local roadmap plans (Plans A/B/D/E/F/G). Untracked.
+docs/superpowers/plans/2026-05-03-cpu-simd-neon-amx.md
+docs/superpowers/plans/2026-05-03-gpu-async-pipelining-fusion.md
+docs/superpowers/plans/2026-05-03-k-quant-msl-kernels.md
+docs/superpowers/plans/2026-05-03-multi-arch-mistral-phi-gemma.md
+docs/superpowers/plans/2026-05-03-prompt-prefill-batching.md
+docs/superpowers/plans/2026-05-03-tiktoken-bpe-tokenizer.md
