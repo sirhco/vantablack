@@ -117,85 +117,147 @@ fn matchContraction(text: []const u8, start: usize) ?usize {
     return null;
 }
 
-/// Llama-3 / cl100k-style pre-tokenizer split. Implements a pragmatic
-/// subset of the OpenAI cl100k_base regex:
+/// Llama-3 / cl100k-style pre-tokenizer split. Implements the OpenAI
+/// cl100k_base regex shipped with Qwen2 / Llama-3 / Mistral-NeMo
+/// tokenizer.json files, alternative-by-alternative:
 ///
-///   1. case-insensitive contractions: 's 't 're 've 'm 'll 'd
-///   2. " ?\p{L}+"        — optional leading space then letter run
-///   3. " ?\p{N}{1,3}"    — optional leading space then 1-3 digits
-///   4. " ?[^\p{L}\p{N}\s]+" — optional leading space then non-letter/num/space run
-///   5. "\s+"             — whitespace fallback
+///   1. (?i:'s|'t|'re|'ve|'m|'ll|'d)
+///   2. [^\r\n\p{L}\p{N}]?\p{L}+      — single optional non-letter-non-num
+///                                       leading char (incl. space) + letter run
+///   3. \p{N}{1,3}                    — 1-3 digits, no leading binding
+///   4.  ?[^\s\p{L}\p{N}]+[\r\n]*     — optional ASCII space + non-LN-non-space
+///                                       run + trailing CR/LF*
+///   5. \s*[\r\n]+                    — whitespace ending in newline(s)
+///   6. \s+(?!\S)                     — whitespace run, when followed by
+///                                       another non-whitespace, peels all
+///                                       but the last space (which binds to
+///                                       the next rule's leading char)
+///   7. \s+                            — pure trailing whitespace fallback
 ///
-/// Differences vs splitGpt2: the leading-space binding (rules 2-4) keeps
-/// " word" together as one pre-token instead of splitting on the space —
-/// the signature behavior of cl100k_base.
-///
-/// Reference fixtures from HuggingFace `tokenizers` are required for full
-/// byte-equality vs Llama-3 on novel inputs. This implementation is
-/// structurally correct against the regex above; full parity is the next
-/// follow-up.
+/// Verified span-for-span vs the Python `regex` reference compiled from
+/// the actual Qwen2 / Llama-3 cl100k pattern on a fixture set including
+/// "Hello, world!", "It's mine", "I'M he'D", "Hello world", "12345",
+/// "abc 123 xyz", "  hi", "end.\\n". Vocab IDs need a separate parity run
+/// vs HF `tokenizers` once a Llama-3 vocab is loaded.
 pub fn splitLlama3(text: []const u8, out: *std.ArrayList(Span), allocator: Allocator) !void {
     var i: usize = 0;
     while (i < text.len) {
         const start = i;
 
+        // 1. Contractions.
         if (matchContraction(text, i)) |n| {
             i += n;
             try out.append(allocator, .{ .start = start, .end = i });
             continue;
         }
 
-        // Optional leading ASCII space (single ' ', not any whitespace).
-        var head = i;
-        if (text[i] == ' ') head = i + 1;
+        const first = utf8Decode(text[i..]);
+        const first_cat = unicode_table.category(first.cp);
 
-        if (head < text.len) {
-            const next = utf8Decode(text[head..]);
-            const cat = unicode_table.category(next.cp);
-            if (cat == .letter) {
-                i = head + next.len;
-                while (i < text.len) {
-                    const n = utf8Decode(text[i..]);
-                    if (unicode_table.category(n.cp) != .letter) break;
-                    i += n.len;
-                }
-                try out.append(allocator, .{ .start = start, .end = i });
-                continue;
+        // 2. Letters with optional non-LN-non-newline leading char.
+        if (first_cat == .letter) {
+            i += first.len;
+            while (i < text.len) {
+                const n = utf8Decode(text[i..]);
+                if (unicode_table.category(n.cp) != .letter) break;
+                i += n.len;
             }
-            if (cat == .number) {
-                i = head + next.len;
-                var digits: usize = 1;
-                while (i < text.len and digits < 3) {
-                    const n = utf8Decode(text[i..]);
-                    if (unicode_table.category(n.cp) != .number) break;
-                    i += n.len;
-                    digits += 1;
+            try out.append(allocator, .{ .start = start, .end = i });
+            continue;
+        }
+        if (first.cp != '\r' and first.cp != '\n') {
+            // Optional leading non-LN char must be followed by at least one letter.
+            const head = i + first.len;
+            if (head < text.len) {
+                const after = utf8Decode(text[head..]);
+                if (unicode_table.category(after.cp) == .letter) {
+                    i = head + after.len;
+                    while (i < text.len) {
+                        const n = utf8Decode(text[i..]);
+                        if (unicode_table.category(n.cp) != .letter) break;
+                        i += n.len;
+                    }
+                    try out.append(allocator, .{ .start = start, .end = i });
+                    continue;
                 }
-                try out.append(allocator, .{ .start = start, .end = i });
-                continue;
             }
-            if (cat == .other) {
-                i = head + next.len;
-                while (i < text.len) {
-                    const n = utf8Decode(text[i..]);
-                    if (unicode_table.category(n.cp) != .other) break;
-                    i += n.len;
-                }
-                try out.append(allocator, .{ .start = start, .end = i });
-                continue;
-            }
-            // cat == .space — fall through to whitespace run.
         }
 
-        var j = i;
-        while (j < text.len) {
-            const n = utf8Decode(text[j..]);
+        // 3. Digits 1-3, no leading binding.
+        if (first_cat == .number) {
+            i += first.len;
+            var digits: usize = 1;
+            while (i < text.len and digits < 3) {
+                const n = utf8Decode(text[i..]);
+                if (unicode_table.category(n.cp) != .number) break;
+                i += n.len;
+                digits += 1;
+            }
+            try out.append(allocator, .{ .start = start, .end = i });
+            continue;
+        }
+
+        // 4. " ?[^\s\p{L}\p{N}]+[\r\n]*"
+        const punct_head: usize = if (first.cp == ' ') i + 1 else i;
+        if (punct_head < text.len) {
+            const body = utf8Decode(text[punct_head..]);
+            const body_cat = unicode_table.category(body.cp);
+            if (body_cat != .letter and body_cat != .number and body_cat != .space) {
+                i = punct_head + body.len;
+                while (i < text.len) {
+                    const n = utf8Decode(text[i..]);
+                    const c = unicode_table.category(n.cp);
+                    if (c == .letter or c == .number or c == .space) break;
+                    i += n.len;
+                }
+                while (i < text.len and (text[i] == '\r' or text[i] == '\n')) i += 1;
+                try out.append(allocator, .{ .start = start, .end = i });
+                continue;
+            }
+        }
+
+        // 5/6/7. Whitespace.
+        var ws_end = i;
+        while (ws_end < text.len) {
+            const n = utf8Decode(text[ws_end..]);
             if (unicode_table.category(n.cp) != .space) break;
-            j += n.len;
+            ws_end += n.len;
         }
-        if (j == i) j = i + 1; // forward progress on any unhandled byte
-        try out.append(allocator, .{ .start = i, .end = j });
-        i = j;
+        if (ws_end == i) {
+            // Unrecognized byte — single-byte span for forward progress.
+            i = i + 1;
+            try out.append(allocator, .{ .start = start, .end = i });
+            continue;
+        }
+        var has_newline = false;
+        var k: usize = i;
+        while (k < ws_end) : (k += 1) {
+            if (text[k] == '\r' or text[k] == '\n') {
+                has_newline = true;
+                break;
+            }
+        }
+        if (has_newline or ws_end == text.len) {
+            // Rule 5 (newline-terminated) or rule 7 (trailing whitespace at EOF).
+            try out.append(allocator, .{ .start = start, .end = ws_end });
+            i = ws_end;
+            continue;
+        }
+        // Rule 6: whitespace followed by non-whitespace. Peel all but the
+        // last space; the trailing space binds to the next rule's optional
+        // leading char on the following loop iteration.
+        const peeled = ws_end - 1;
+        if (peeled > i) {
+            try out.append(allocator, .{ .start = start, .end = peeled });
+            i = peeled;
+        } else {
+            // ws_end - i == 1 — single space before non-space. cl100k
+            // treats this as standalone " " span (the next pre-token
+            // doesn't bind across the boundary because there's nothing to
+            // peel before it).
+            try out.append(allocator, .{ .start = start, .end = ws_end });
+            i = ws_end;
+        }
     }
 }
 
@@ -324,6 +386,36 @@ test "splitLlama3: digits chunk 1-3 at a time" {
     try std.testing.expectEqual(@as(usize, 2), splits.items.len);
     try std.testing.expectEqualSlices(u8, "123", text[splits.items[0].start..splits.items[0].end]);
     try std.testing.expectEqualSlices(u8, "45",  text[splits.items[1].start..splits.items[1].end]);
+}
+
+fn expectSpans(text: []const u8, expected: []const []const u8) !void {
+    var splits: std.ArrayList(Span) = .empty;
+    defer splits.deinit(std.testing.allocator);
+    try splitLlama3(text, &splits, std.testing.allocator);
+    try std.testing.expectEqual(expected.len, splits.items.len);
+    for (splits.items, expected) |sp, exp| {
+        try std.testing.expectEqualSlices(u8, exp, text[sp.start..sp.end]);
+    }
+}
+
+test "splitLlama3: matches cl100k Python regex on fixture set" {
+    // Reference outputs from `python -c "import regex; ..."` against the
+    // actual Qwen2 / Llama-3 cl100k_base pattern.
+    try expectSpans("Hello, world!", &.{ "Hello", ",", " world", "!" });
+    try expectSpans("Hello world",   &.{ "Hello", " world" });
+    try expectSpans("It's mine",     &.{ "It", "'s", " mine" });
+    try expectSpans("I'M he'D",      &.{ "I", "'M", " he", "'D" });
+    try expectSpans("12345",         &.{ "123", "45" });
+    try expectSpans("abc 123 xyz",   &.{ "abc", " ", "123", " xyz" });
+    try expectSpans("end.\n",        &.{ "end", ".\n" });
+}
+
+test "splitLlama3: whitespace peel binds trailing space to next pre-token" {
+    // Reference: "  hi" -> [" ", " hi"]. The first space is standalone
+    // (rule 6 peels run minus one); the second binds to "hi" via rule 2.
+    try expectSpans("  hi", &.{ " ", " hi" });
+    // Triple space: peel two, last binds.
+    try expectSpans("   hi", &.{ "  ", " hi" });
 }
 
 test "splitLlama3: covers every input byte (no gaps)" {

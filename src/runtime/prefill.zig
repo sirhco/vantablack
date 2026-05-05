@@ -298,7 +298,19 @@ fn attentionCausal(
 // Parallelism: rows are striped across the persistent thread pool. Each
 // worker keeps its own dequant scratch on the stack (capped at MAX_K).
 
-const MAX_K: usize = 8192; // Covers TinyLlama / Llama-3-8B / Mistral-7B widths.
+// Per-worker dequant scratch is stack-allocated, sized for the largest k a
+// prefill matmul will see. Practical widths (from `ffn_down`, which is the
+// widest matmul in every Llama-family model):
+//   TinyLlama:    k = 5632
+//   Gemma-2-2B:   k = 9216
+//   Llama-2-13B:  k = 13824
+//   Mistral-7B:   k = 14336
+//   Llama-3-8B:   k = 14336
+// 32768 floats = 128 KB on the stack per worker. Default ThreadPool worker
+// stacks (8 MB) accommodate this with plenty of headroom. Models that
+// exceed this width return DimTooLarge from matmulBatched; callers fall
+// back to the per-token loop.
+const MAX_K: usize = 32768;
 
 const BatchedCtx = struct {
     out: []f32,

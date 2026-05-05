@@ -78,6 +78,11 @@ pub const LlamaConfig = struct {
         const arch: Architecture = blk: {
             if (std.mem.eql(u8, arch_s, "llama")) break :blk .llama;
             if (std.mem.eql(u8, arch_s, "mistral")) break :blk .mistral;
+            // gemma2 / gemma3 are distinct architectures with per-layer
+            // alternating global/local sliding-window attention + logit
+            // softcap; neither is modeled here. Refused so callers don't
+            // get silently wrong outputs. gemma (v1) loads via the gelu +
+            // tied-embeddings path.
             if (std.mem.eql(u8, arch_s, "gemma")) break :blk .gemma;
             if (std.mem.eql(u8, arch_s, "phi") or std.mem.eql(u8, arch_s, "phi2") or std.mem.eql(u8, arch_s, "phi3")) break :blk .phi;
             return error.UnsupportedArchitecture;
