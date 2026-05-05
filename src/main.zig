@@ -42,6 +42,42 @@ pub fn main(init: std.process.Init) !void {
         return error.MissingPath;
     }
 
+    // tokenize <tokenizer.json> <text>: load HF tokenizer.json, run encode,
+    // print token IDs as space-separated ints. Useful for fixture parity
+    // checks against HF `tokenizers` without needing a full model load.
+    if (std.mem.eql(u8, args[1], "tokenize")) {
+        if (args.len < 4) {
+            try err.writeAll("usage: vantablack tokenize <tokenizer.json> <text>\n");
+            try err.flush();
+            return error.MissingArgs;
+        }
+        const tj_bytes = blk: {
+            const tj_abs = if (std.fs.path.isAbsolute(args[2]))
+                try arena.dupe(u8, args[2])
+            else cwd_blk: {
+                const cwd = try std.process.currentPathAlloc(io, arena);
+                break :cwd_blk try std.fs.path.resolve(arena, &.{ cwd, args[2] });
+            };
+            var f = try Io.Dir.cwd().openFile(io, tj_abs, .{});
+            defer f.close(io);
+            const st = try f.stat(io);
+            const buf = try arena.alloc(u8, st.size);
+            _ = try f.readPositionalAll(io, buf, 0);
+            break :blk buf;
+        };
+        var tok = try vantablack.Tokenizer.initFromHfJson(gpa, tj_bytes);
+        defer tok.deinitOwnedPieces(gpa);
+        try out.print("flavor={s} byte_split={s} vocab={d}\n", .{ @tagName(tok.flavor), @tagName(tok.byte_split), tok.pieces.len });
+        const ids = try tok.encode(arena, args[3], false);
+        for (ids, 0..) |id, i| {
+            if (i > 0) try out.writeByte(' ');
+            try out.print("{d}", .{id});
+        }
+        try out.writeByte('\n');
+        try out.flush();
+        return;
+    }
+
     const input_path = args[1];
     const abs_path = if (std.fs.path.isAbsolute(input_path))
         try arena.dupe(u8, input_path)
