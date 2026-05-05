@@ -31,6 +31,9 @@ pub fn build(b: *std.Build) void {
         .error_tracing = error_tracing,
     });
     mod.addOptions("build_options", build_options);
+    if (metal) {
+        attachMetal(b, mod);
+    }
 
     const exe = b.addExecutable(.{
         .name = "vantablack",
@@ -48,9 +51,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addOptions("build_options", build_options);
-    if (metal) {
-        attachMetal(b, exe.root_module);
-    }
 
     b.installArtifact(exe);
 

@@ -146,6 +146,10 @@ pub fn step(
 
     if (gpu_ready) |mb| {
         try gpuFinalStep(mb, m, c);
+        // Single per-token barrier: every prior segment commit was async, so
+        // the CPU must wait here before the sampler reads `state.logits` (a
+        // view over the shared-storage logits buffer the GPU just wrote).
+        mb.dev.waitIdle();
     } else {
         try rmsNormTyped(state.x, m.output_norm, c.rms_eps);
         try matmulRuntime(pool, metal, state.logits, m.output_w, state.x, c.vocab_size, c.dim);

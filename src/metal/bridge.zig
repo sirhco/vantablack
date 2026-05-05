@@ -30,6 +30,7 @@ const c_api = if (metal_enabled) struct {
     ) c_int;
     extern "c" fn vtb_metal_segment_begin(ctx: *Ctx) ?*Seg;
     extern "c" fn vtb_metal_segment_commit(seg: *Seg) c_int;
+    extern "c" fn vtb_metal_wait_idle(ctx: *Ctx) void;
     extern "c" fn vtb_metal_segment_matmul_q8_0(seg: *Seg, out_buf: *Buf, w_buf: *Buf, w_offset: usize, acts_buf: *Buf, m: usize, k: usize) void;
     extern "c" fn vtb_metal_segment_rmsnorm(seg: *Seg, out_buf: *Buf, in_buf: *Buf, weight_buf: *Buf, weight_offset: usize, n: usize, eps: f32) void;
     extern "c" fn vtb_metal_segment_rope(seg: *Seg, x_buf: *Buf, n_heads: usize, head_dim: usize, pos: usize, base: f32) void;
@@ -60,6 +61,7 @@ const c_api = if (metal_enabled) struct {
     fn vtb_metal_segment_commit(_: *Seg) c_int {
         return 1;
     }
+    fn vtb_metal_wait_idle(_: *Ctx) void {}
     fn vtb_metal_segment_matmul_q8_0(_: *Seg, _: *Buf, _: *Buf, _: usize, _: *Buf, _: usize, _: usize) void {}
     fn vtb_metal_segment_rmsnorm(_: *Seg, _: *Buf, _: *Buf, _: *Buf, _: usize, _: usize, _: f32) void {}
     fn vtb_metal_segment_rope(_: *Seg, _: *Buf, _: usize, _: usize, _: usize, _: f32) void {}
@@ -79,6 +81,7 @@ const vtb_metal_release = c_api.vtb_metal_release;
 const vtb_metal_matmul_q8_0 = c_api.vtb_metal_matmul_q8_0;
 const vtb_metal_segment_begin = c_api.vtb_metal_segment_begin;
 const vtb_metal_segment_commit = c_api.vtb_metal_segment_commit;
+const vtb_metal_wait_idle = c_api.vtb_metal_wait_idle;
 const vtb_metal_segment_matmul_q8_0 = c_api.vtb_metal_segment_matmul_q8_0;
 const vtb_metal_segment_rmsnorm = c_api.vtb_metal_segment_rmsnorm;
 const vtb_metal_segment_rope = c_api.vtb_metal_segment_rope;
@@ -140,6 +143,13 @@ pub const Device = struct {
     pub fn segmentBegin(self: Device) DispatchError!Segment {
         const seg = vtb_metal_segment_begin(self.handle) orelse return error.MetalDispatchFailed;
         return .{ .handle = seg };
+    }
+
+    /// Block until every previously-committed command buffer has finished.
+    /// Must be called before the CPU reads any shared-storage buffer that an
+    /// async segment wrote.
+    pub fn waitIdle(self: Device) void {
+        vtb_metal_wait_idle(self.handle);
     }
 };
 

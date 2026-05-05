@@ -594,13 +594,23 @@ int vtb_metal_segment_commit(VtbMetalSeg *seg) {
     @autoreleasepool {
         [seg->enc endEncoding];
         [seg->cmd commit];
-        [seg->cmd waitUntilCompleted];
-        int rc = (seg->cmd.status == MTLCommandBufferStatusError) ? 2 : 0;
-        if (rc != 0) NSLog(@"vtb_metal_segment_commit: %@", seg->cmd.error);
+        // No waitUntilCompleted. The serial command queue chains this segment
+        // after every prior submission, so subsequent segments observe its
+        // writes without explicit fences. CPU reads of shared-storage buffers
+        // must call vtb_metal_wait_idle first.
         seg->enc = nil;
         seg->cmd = nil;
         free(seg);
-        return rc;
+        return 0;
+    }
+}
+
+void vtb_metal_wait_idle(VtbMetalCtx *ctx) {
+    if (!ctx) return;
+    @autoreleasepool {
+        id<MTLCommandBuffer> drain = [ctx->queue commandBuffer];
+        [drain commit];
+        [drain waitUntilCompleted];
     }
 }
 

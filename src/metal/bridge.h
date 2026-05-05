@@ -63,8 +63,15 @@ int vtb_metal_matmul_q8_0(
 typedef struct VtbMetalSeg VtbMetalSeg;
 
 VtbMetalSeg *vtb_metal_segment_begin(VtbMetalCtx *ctx);
-// Commits the segment and waits for completion. Returns 0 on success.
+// Commits the segment without waiting. Caller must invoke vtb_metal_wait_idle
+// before reading any shared-storage buffer the segment wrote. Returns 0 on
+// success.
 int vtb_metal_segment_commit(VtbMetalSeg *seg);
+
+// Drain the serial command queue. Blocks until every command buffer enqueued
+// before this call has finished executing. Required before the CPU reads
+// shared-storage buffers written by async segments.
+void vtb_metal_wait_idle(VtbMetalCtx *ctx);
 
 // All segment_* fns enqueue into `seg`. Buffer dimensions must already match.
 
