@@ -17,9 +17,14 @@ pub fn build(b: *std.Build) void {
     // CoreGraphics frameworks and compiles the Objective-C bridge in
     // src/metal/bridge.m. Requires macOS host.
     const metal = b.option(bool, "metal", "build with Apple Metal GPU backend (macOS only)") orelse false;
+    // Pre-concatenate Q/K/V and gate/up weights at Model.init so each fused
+    // matmul reads activations once. Adds ~660 MB residency for TinyLlama
+    // Q8_0 (~2x for the fused groups). Off by default.
+    const weight_fusion = b.option(bool, "weight_fusion", "pre-concatenate Q/K/V + gate/up weights at init") orelse false;
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "metal", metal);
+    build_options.addOption(bool, "weight_fusion", weight_fusion);
 
     const mod = b.addModule("vantablack", .{
         .root_source_file = b.path("src/vantablack.zig"),

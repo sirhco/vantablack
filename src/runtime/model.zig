@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const build_options = @import("build_options");
 
 const parser = @import("../core/parser.zig");
 const mapper_mod = @import("../core/mapper.zig");
@@ -15,6 +16,7 @@ const mlx_kernels = @import("../kernels/mlx.zig");
 const hf_config_mod = @import("../core/hf_config.zig");
 const hf_loader_mod = @import("../core/hf_loader.zig");
 const safetensors = @import("../core/safetensors.zig");
+const simd = @import("../kernels/simd.zig");
 
 pub const ConfigError = error{
     MissingMetadata,
@@ -116,10 +118,17 @@ pub const LayerWeights = struct {
     attn_q: TypedTensor,
     attn_k: TypedTensor,
     attn_v: TypedTensor,
+    /// Concatenation of attn_q | attn_k | attn_v rows. Populated only when
+    /// `-Dweight_fusion=true` AND all three projections share quant + cols.
+    /// Heap-allocated; freed by `Model.deinit`. Consumed by the GPU fused
+    /// matmul path; CPU path keeps using the originals.
+    attn_qkv_fused: ?TypedTensor = null,
     attn_o: TypedTensor,
     ffn_norm: TypedTensor,
     ffn_gate: TypedTensor,
     ffn_up: TypedTensor,
+    /// Concatenation of ffn_gate | ffn_up rows. Same gating as `attn_qkv_fused`.
+    ffn_gate_up_fused: ?TypedTensor = null,
     ffn_down: TypedTensor,
 };
 
@@ -129,6 +138,9 @@ pub const Model = struct {
     output_norm: TypedTensor,
     output_w: TypedTensor,
     layers: []LayerWeights,
+    /// Heap allocations owned by this Model (e.g. fused weight buffers).
+    /// Freed by `deinit`.
+    owned_buffers: std.ArrayList([]u8) = .empty,
 
     pub fn init(allocator: Allocator, m: *const ModelMapper) ModelError!Model {
         const config = try LlamaConfig.fromCatalog(m.catalog);
@@ -156,16 +168,22 @@ pub const Model = struct {
         // Some llamas tie output to token_embd (no `output.weight`); fall back.
         const output_w = fetch(m, "output.weight") catch token_embd;
 
-        return .{
+        var model: Model = .{
             .config = config,
             .token_embd = token_embd,
             .output_norm = output_norm,
             .output_w = output_w,
             .layers = layers,
         };
+        if (build_options.weight_fusion) {
+            try fuseLayerWeights(&model, allocator, config);
+        }
+        return model;
     }
 
     pub fn deinit(self: *Model, allocator: Allocator) void {
+        for (self.owned_buffers.items) |buf| allocator.free(buf);
+        self.owned_buffers.deinit(allocator);
         allocator.free(self.layers);
         self.* = undefined;
     }
@@ -231,15 +249,85 @@ pub const Model = struct {
         else
             fetchHfLinear(bundle, cfg, "lm_head") catch token_embd;
 
-        return .{
+        var model: Model = .{
             .config = llama_cfg,
             .token_embd = token_embd,
             .output_norm = output_norm,
             .output_w = output_w,
             .layers = layers,
         };
+        if (build_options.weight_fusion) {
+            try fuseLayerWeights(&model, allocator, llama_cfg);
+        }
+        return model;
     }
 };
+
+/// Pre-concatenate per-layer Q/K/V and gate/up rows into single contiguous
+/// tensors so the GPU fused-matmul path reads activations once. Only fuses
+/// when the source projections share `quant` and have matching column counts
+/// (head_dim). Skips MLX-Q4 which keeps scales/biases in side buffers — the
+/// fusion plan covers GGUF-quant tensors only.
+fn fuseLayerWeights(model: *Model, allocator: Allocator, c: LlamaConfig) ModelError!void {
+    for (model.layers) |*lw| {
+        if (try fuseRowConcat(allocator, &.{ lw.attn_q, lw.attn_k, lw.attn_v }, c.dim)) |fused_bytes| {
+            try model.owned_buffers.append(allocator, fused_bytes);
+            lw.attn_qkv_fused = .{
+                .bytes = fused_bytes,
+                .quant = lw.attn_q.quant,
+                .ggml_type = lw.attn_q.ggml_type,
+            };
+        }
+        if (try fuseRowConcat(allocator, &.{ lw.ffn_gate, lw.ffn_up }, c.dim)) |fused_bytes| {
+            try model.owned_buffers.append(allocator, fused_bytes);
+            lw.ffn_gate_up_fused = .{
+                .bytes = fused_bytes,
+                .quant = lw.ffn_gate.quant,
+                .ggml_type = lw.ffn_gate.ggml_type,
+            };
+        }
+    }
+}
+
+/// Concatenate the row bytes of `tensors` into a fresh allocation. All
+/// tensors must share `quant` and have rows that span exactly `cols` columns
+/// (i.e. each tensor's bytes.len is divisible by rowBytesForQuant(cols, q)).
+/// Returns `null` if the tensors are heterogeneous or the quant is not
+/// supported by the row-concat layout (mlx_q4 has side buffers).
+fn fuseRowConcat(allocator: Allocator, tensors: []const TypedTensor, cols: usize) ModelError!?[]u8 {
+    if (tensors.len == 0) return null;
+    const q = tensors[0].quant;
+    if (q == .mlx_q4) return null;
+    for (tensors[1..]) |t| {
+        if (t.quant != q) return null;
+    }
+    const row_bytes = rowBytesForQuant(q, cols) orelse return null;
+    var total: usize = 0;
+    for (tensors) |t| {
+        if (row_bytes == 0 or t.bytes.len % row_bytes != 0) return null;
+        total += t.bytes.len;
+    }
+    const out = try allocator.alloc(u8, total);
+    var off: usize = 0;
+    for (tensors) |t| {
+        @memcpy(out[off..][0..t.bytes.len], t.bytes);
+        off += t.bytes.len;
+    }
+    return out;
+}
+
+fn rowBytesForQuant(q: kernels.QuantType, cols: usize) ?usize {
+    return switch (q) {
+        .f32 => cols * 4,
+        .f16, .bf16 => cols * 2,
+        .q8_0 => if (cols % simd.q8_0_block_elems == 0) (cols / simd.q8_0_block_elems) * simd.q8_0_block_bytes else null,
+        .q4_k => if (cols % simd.q4_k_block_elems == 0) (cols / simd.q4_k_block_elems) * simd.q4_k_block_bytes else null,
+        .q5_k => if (cols % simd.q5_k_block_elems == 0) (cols / simd.q5_k_block_elems) * simd.q5_k_block_bytes else null,
+        .q6_k => if (cols % simd.q6_k_block_elems == 0) (cols / simd.q6_k_block_elems) * simd.q6_k_block_bytes else null,
+        .ternary158 => if (cols % simd.tq2_0_block_elems == 0) (cols / simd.tq2_0_block_elems) * simd.tq2_0_block_bytes else null,
+        .mlx_q4 => null,
+    };
+}
 
 fn quantOfHfDtype(d: safetensors.Dtype) ConfigError!kernels.QuantType {
     return switch (d) {
@@ -368,4 +456,65 @@ pub fn quantOf(t: parser.GgmlType) ConfigError!@import("../kernels/comptime_gen.
         .tq2_0, .tq1_0 => .ternary158,
         else => error.UnsupportedWeightType,
     };
+}
+
+// -- tests ----------------------------------------------------------------
+
+test "fuseRowConcat: q8_0 three-tensor concat preserves bytes in order" {
+    const gpa = std.testing.allocator;
+    const cols: usize = 32; // one Q8_0 block per row
+    const row_bytes: usize = simd.q8_0_block_bytes;
+
+    var a_bytes: [row_bytes * 4]u8 = undefined;
+    @memset(&a_bytes, 0xA1);
+    var b_bytes: [row_bytes * 2]u8 = undefined;
+    @memset(&b_bytes, 0xB2);
+    var c_bytes: [row_bytes * 1]u8 = undefined;
+    @memset(&c_bytes, 0xC3);
+
+    const tensors = [_]TypedTensor{
+        .{ .bytes = &a_bytes, .quant = .q8_0 },
+        .{ .bytes = &b_bytes, .quant = .q8_0 },
+        .{ .bytes = &c_bytes, .quant = .q8_0 },
+    };
+
+    const fused = (try fuseRowConcat(gpa, &tensors, cols)).?;
+    defer gpa.free(fused);
+
+    try std.testing.expectEqual(a_bytes.len + b_bytes.len + c_bytes.len, fused.len);
+    try std.testing.expectEqualSlices(u8, &a_bytes, fused[0..a_bytes.len]);
+    try std.testing.expectEqualSlices(u8, &b_bytes, fused[a_bytes.len..][0..b_bytes.len]);
+    try std.testing.expectEqualSlices(u8, &c_bytes, fused[a_bytes.len + b_bytes.len ..][0..c_bytes.len]);
+}
+
+test "fuseRowConcat: heterogeneous quants return null" {
+    const gpa = std.testing.allocator;
+    var a: [simd.q8_0_block_bytes]u8 = undefined;
+    var b: [4]u8 = undefined;
+    const tensors = [_]TypedTensor{
+        .{ .bytes = &a, .quant = .q8_0 },
+        .{ .bytes = &b, .quant = .f32 },
+    };
+    try std.testing.expect((try fuseRowConcat(gpa, &tensors, 32)) == null);
+}
+
+test "fuseRowConcat: mlx_q4 returns null (side buffers not row-concatable)" {
+    const gpa = std.testing.allocator;
+    var a: [4]u8 = undefined;
+    var b: [4]u8 = undefined;
+    const tensors = [_]TypedTensor{
+        .{ .bytes = &a, .quant = .mlx_q4 },
+        .{ .bytes = &b, .quant = .mlx_q4 },
+    };
+    try std.testing.expect((try fuseRowConcat(gpa, &tensors, 32)) == null);
+}
+
+test "rowBytesForQuant: matches forward.zig::rowBytes for known quants" {
+    try std.testing.expectEqual(@as(?usize, 32 * 4), rowBytesForQuant(.f32, 32));
+    try std.testing.expectEqual(@as(?usize, 32 * 2), rowBytesForQuant(.f16, 32));
+    try std.testing.expectEqual(@as(?usize, simd.q8_0_block_bytes), rowBytesForQuant(.q8_0, simd.q8_0_block_elems));
+    try std.testing.expectEqual(@as(?usize, simd.q4_k_block_bytes), rowBytesForQuant(.q4_k, simd.q4_k_block_elems));
+    try std.testing.expectEqual(@as(?usize, null), rowBytesForQuant(.mlx_q4, 32));
+    // Non-aligned cols → null (would otherwise produce a fractional block).
+    try std.testing.expectEqual(@as(?usize, null), rowBytesForQuant(.q8_0, 33));
 }
