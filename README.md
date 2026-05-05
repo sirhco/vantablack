@@ -41,7 +41,7 @@ tax, no framework tax. Just weights and math.
 | MLX 2 / 3 / 4 / 5 / 6 / 8-bit dispatch                  | shipped — 4-bit verified on real model; others covered by unit tests |
 | Multi-shard safetensors directory loading               | shipped (covered by `core/hf_loader.zig` test) |
 | MLX 4-bit MSL kernel                                    | compiled + cached; runtime dispatch from forward.zig pending |
-| Tiktoken-style tokenizer (Llama-3+, GPT-2)              | not yet              |
+| Tiktoken-style tokenizer (GPT-2 + cl100k-style)         | shipped — byte→Unicode alphabet, GPT-2 pre-tokenizer split, byte-level encode/decode; `Tokenizer.initFromHfJson` auto-detects `ByteLevel` in `tokenizer.json::pre_tokenizer` and switches flavor. Llama-3 contraction-aware split deferred until reference fixtures available |
 | Vulkan / cross-vendor GPU                               | not yet              |
 | Prompt prefill batching                                 | not yet              |
 
