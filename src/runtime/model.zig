@@ -29,7 +29,16 @@ pub const ModelError = error{
     UnexpectedTensorShape,
 } || ConfigError || mapper_mod.TensorSliceError || Allocator.Error;
 
+/// Forward-pass family. Drives sliding-window attention masking, FFN
+/// activation choice, and (for Gemma) tied input/output embeddings.
+pub const Architecture = enum { llama, mistral, gemma, phi };
+
+/// FFN activation. Llama / Mistral / Phi use SwiGLU (silu(gate) * up);
+/// Gemma uses gelu(gate) * up with the tanh-approximate GELU.
+pub const HiddenActivation = enum { silu, gelu_approx };
+
 pub const LlamaConfig = struct {
+    architecture: Architecture = .llama,
     dim: usize,
     n_layers: usize,
     n_heads: usize,
@@ -47,26 +56,51 @@ pub const LlamaConfig = struct {
     /// matching rotation at runtime.
     rope_half: bool = false,
 
+    /// Sliding-window attention size (Mistral). `maxInt(usize)` disables
+    /// windowing; otherwise token at position `t` only attends to positions
+    /// in `[t - sliding_window + 1, t]`.
+    sliding_window: usize = std.math.maxInt(usize),
+    /// FFN activation. SwiGLU for Llama / Mistral / Phi, gelu_approx for Gemma.
+    hidden_activation: HiddenActivation = .silu,
+    /// True when the LM-head matrix aliases the input embedding table
+    /// (Gemma-2B). When the model has no separate `output.weight` tensor,
+    /// `output_w` falls back to `token_embd` regardless — this flag lets
+    /// downstream code know that's intentional rather than a missing-tensor
+    /// fallback.
+    tied_embeddings: bool = false,
+
     pub fn fromCatalog(catalog: parser.Catalog) ConfigError!LlamaConfig {
         const arch_v = findValue(catalog, "general.architecture") orelse return error.MissingMetadata;
-        const arch = switch (arch_v) {
+        const arch_s = switch (arch_v) {
             .string => |s| s,
             else => return error.MissingMetadata,
         };
-        if (!std.mem.eql(u8, arch, "llama")) return error.UnsupportedArchitecture;
+        const arch: Architecture = blk: {
+            if (std.mem.eql(u8, arch_s, "llama")) break :blk .llama;
+            if (std.mem.eql(u8, arch_s, "mistral")) break :blk .mistral;
+            if (std.mem.eql(u8, arch_s, "gemma")) break :blk .gemma;
+            if (std.mem.eql(u8, arch_s, "phi") or std.mem.eql(u8, arch_s, "phi2") or std.mem.eql(u8, arch_s, "phi3")) break :blk .phi;
+            return error.UnsupportedArchitecture;
+        };
+        const prefix = switch (arch) {
+            .llama => "llama",
+            .mistral => "mistral",
+            .gemma => "gemma",
+            .phi => "phi",
+        };
 
-        const dim = try metaUsize(catalog, "llama.embedding_length");
-        const n_layers = try metaUsize(catalog, "llama.block_count");
-        const n_heads = try metaUsize(catalog, "llama.attention.head_count");
-        const ffn_dim = try metaUsize(catalog, "llama.feed_forward_length");
-        const max_seq = try metaUsize(catalog, "llama.context_length");
-        const n_kv_heads = metaUsize(catalog, "llama.attention.head_count_kv") catch n_heads;
-        const rope_base = metaF32(catalog, "llama.rope.freq_base") catch 10000.0;
-        const rms_eps = metaF32(catalog, "llama.attention.layer_norm_rms_epsilon") catch 1e-5;
+        var key_buf: [64]u8 = undefined;
+        const dim = try metaUsizePrefixed(catalog, &key_buf, prefix, ".embedding_length");
+        const n_layers = try metaUsizePrefixed(catalog, &key_buf, prefix, ".block_count");
+        const n_heads = try metaUsizePrefixed(catalog, &key_buf, prefix, ".attention.head_count");
+        const ffn_dim = try metaUsizePrefixed(catalog, &key_buf, prefix, ".feed_forward_length");
+        const max_seq = try metaUsizePrefixed(catalog, &key_buf, prefix, ".context_length");
+        const n_kv_heads = metaUsizePrefixed(catalog, &key_buf, prefix, ".attention.head_count_kv") catch n_heads;
+        const rope_base = metaF32Prefixed(catalog, &key_buf, prefix, ".rope.freq_base") catch 10000.0;
+        const rms_eps = metaF32Prefixed(catalog, &key_buf, prefix, ".attention.layer_norm_rms_epsilon") catch 1e-5;
 
-        // Vocab size: prefer llama.vocab_size; fall back to tokenizer array len.
         const vocab_size = blk: {
-            if (metaUsize(catalog, "llama.vocab_size")) |v| break :blk v else |_| {}
+            if (metaUsizePrefixed(catalog, &key_buf, prefix, ".vocab_size")) |v| break :blk v else |_| {}
             if (findValue(catalog, "tokenizer.ggml.tokens")) |v| switch (v) {
                 .array => |arr| break :blk @as(usize, @intCast(arr.count)),
                 else => {},
@@ -77,7 +111,21 @@ pub const LlamaConfig = struct {
         if (n_heads == 0) return error.MissingMetadata;
         const head_dim = dim / n_heads;
 
+        const sliding_window: usize = switch (arch) {
+            .mistral => metaUsizePrefixed(catalog, &key_buf, prefix, ".attention.sliding_window") catch 4096,
+            else => std.math.maxInt(usize),
+        };
+        const hidden_activation: HiddenActivation = switch (arch) {
+            .gemma => .gelu_approx,
+            else => .silu,
+        };
+        // Gemma checkpoints commonly tie embeddings; trust the tensor layout
+        // (forward path falls back to token_embd when `output.weight` is
+        // absent regardless), but record the architectural intent.
+        const tied_embeddings = arch == .gemma;
+
         return .{
+            .architecture = arch,
             .dim = dim,
             .n_layers = n_layers,
             .n_heads = n_heads,
@@ -88,6 +136,9 @@ pub const LlamaConfig = struct {
             .max_seq = max_seq,
             .rope_base = rope_base,
             .rms_eps = rms_eps,
+            .sliding_window = sliding_window,
+            .hidden_activation = hidden_activation,
+            .tied_embeddings = tied_embeddings,
         };
     }
 };
@@ -144,6 +195,11 @@ pub const Model = struct {
 
     pub fn init(allocator: Allocator, m: *const ModelMapper) ModelError!Model {
         const config = try LlamaConfig.fromCatalog(m.catalog);
+        // Phi uses a parallel-block forward (attn + ffn share input,
+        // outputs sum into the residual). The current sequential layer
+        // step would silently produce wrong logits — refuse load until the
+        // parallel path lands.
+        if (config.architecture == .phi) return error.UnsupportedArchitecture;
 
         const layers = try allocator.alloc(LayerWeights, config.n_layers);
         errdefer allocator.free(layers);
@@ -418,6 +474,16 @@ fn findValue(catalog: parser.Catalog, key: []const u8) ?parser.MetaValue {
         if (std.mem.eql(u8, kv.key, key)) return kv.value;
     }
     return null;
+}
+
+fn metaUsizePrefixed(catalog: parser.Catalog, buf: []u8, prefix: []const u8, suffix: []const u8) ConfigError!usize {
+    const key = std.fmt.bufPrint(buf, "{s}{s}", .{ prefix, suffix }) catch return error.MissingMetadata;
+    return metaUsize(catalog, key);
+}
+
+fn metaF32Prefixed(catalog: parser.Catalog, buf: []u8, prefix: []const u8, suffix: []const u8) ConfigError!f32 {
+    const key = std.fmt.bufPrint(buf, "{s}{s}", .{ prefix, suffix }) catch return error.MissingMetadata;
+    return metaF32(catalog, key);
 }
 
 fn metaUsize(catalog: parser.Catalog, key: []const u8) ConfigError!usize {

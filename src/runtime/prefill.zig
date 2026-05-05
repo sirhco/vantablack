@@ -212,13 +212,16 @@ fn prefillLayer(
         try forward.rmsNormTyped(xb_b, layer.ffn_norm, c.rms_eps);
     }
 
-    // Batched gate / up matmul, per-batch SwiGLU, batched ffn_down.
+    // Batched gate / up matmul, per-batch activation, batched ffn_down.
     try matmulBatched(pool, s.gate, layer.ffn_gate, s.xb, c.ffn_dim, c.dim, B);
     try matmulBatched(pool, s.up, layer.ffn_up, s.xb, c.ffn_dim, c.dim, B);
     for (0..B) |b| {
         const gate_b = s.gate[b * c.ffn_dim ..][0..c.ffn_dim];
         const up_b = s.up[b * c.ffn_dim ..][0..c.ffn_dim];
-        math.swiglu(gate_b, up_b);
+        switch (c.hidden_activation) {
+            .silu => math.swiglu(gate_b, up_b),
+            .gelu_approx => math.gegluApprox(gate_b, up_b),
+        }
     }
     try matmulBatched(pool, s.ffn_out, layer.ffn_down, s.gate, c.dim, c.ffn_dim, B);
     for (0..B) |b| {
@@ -240,10 +243,19 @@ fn attentionCausal(
 ) void {
     const head_dim_f: f32 = @floatFromInt(c.head_dim);
     const inv_sqrt_hd: f32 = 1.0 / @sqrt(head_dim_f);
-    const seq_len = cache.pos + b + 1;
+    const cur_pos = cache.pos + b;
+    const seq_len = cur_pos + 1;
     const kv_row = c.n_kv_heads * c.head_dim;
     const k_buf = cache.keysFor(l, seq_len);
     const v_buf = cache.valuesFor(l, seq_len);
+
+    // Sliding-window: same logic as forward.cpuAttention. Mistral uses
+    // sliding_window = 4096; non-windowed arches set maxInt(usize).
+    const window_start: usize = if (c.sliding_window == std.math.maxInt(usize) or cur_pos < c.sliding_window)
+        0
+    else
+        cur_pos - c.sliding_window + 1;
+    const attended_len = seq_len - window_start;
 
     const q_b = s.q[b * (c.n_heads * c.head_dim) ..][0 .. c.n_heads * c.head_dim];
     const out_b = s.attn_out[b * c.dim ..][0..c.dim];
@@ -253,20 +265,22 @@ fn attentionCausal(
     for (0..c.n_heads) |h| {
         const kv_h = (h * c.n_kv_heads) / c.n_heads;
         const q_h = q_b[h * c.head_dim ..][0..c.head_dim];
-        const scores = scores_b[h * c.max_seq ..][0..seq_len];
+        const scores = scores_b[h * c.max_seq ..][0..attended_len];
 
-        for (0..seq_len) |t| {
+        for (0..attended_len) |i| {
+            const t = window_start + i;
             const k_th = k_buf[t * kv_row + kv_h * c.head_dim ..][0..c.head_dim];
             var dot: f32 = 0;
             for (q_h, k_th) |qv, kv| dot += qv * kv;
-            scores[t] = dot * inv_sqrt_hd;
+            scores[i] = dot * inv_sqrt_hd;
         }
         math.softmax(scores);
 
         const out_h = out_b[h * c.head_dim ..][0..c.head_dim];
-        for (0..seq_len) |t| {
+        for (0..attended_len) |i| {
+            const t = window_start + i;
             const v_th = v_buf[t * kv_row + kv_h * c.head_dim ..][0..c.head_dim];
-            const w = scores[t];
+            const w = scores[i];
             for (out_h, v_th) |*o, vv| o.* += w * vv;
         }
     }

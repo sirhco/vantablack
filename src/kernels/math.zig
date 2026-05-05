@@ -109,6 +109,20 @@ pub fn swiglu(gate: []f32, up: []const f32) void {
     }
 }
 
+/// GeGLU (Gemma-style): out[i] = gelu_approx(gate[i]) * up[i].
+/// `gelu_approx(z) = 0.5 * z * (1 + tanh(sqrt(2/pi) * (z + 0.044715 * z^3)))`
+/// — the tanh-approximate GELU used by GPT-2 / BERT / Gemma.
+pub fn gegluApprox(gate: []f32, up: []const f32) void {
+    std.debug.assert(gate.len == up.len);
+    const sqrt_2_over_pi: f32 = 0.7978845608028654;
+    for (gate, up) |*g, u| {
+        const z = g.*;
+        const inner = sqrt_2_over_pi * (z + 0.044715 * z * z * z);
+        const gelu = 0.5 * z * (1.0 + std.math.tanh(inner));
+        g.* = gelu * u;
+    }
+}
+
 /// Add `b` into `a` element-wise (a += b).
 pub fn addInto(a: []f32, b: []const f32) void {
     std.debug.assert(a.len == b.len);
@@ -162,6 +176,17 @@ test "softmax sums to 1" {
     var sum: f32 = 0;
     for (x) |v| sum += v;
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum, 1e-5);
+}
+
+test "gegluApprox: matches HF/GPT-2 tanh-approx reference at known points" {
+    // Reference values from a high-precision evaluation of
+    // gelu_approx(z) = 0.5*z*(1 + tanh(sqrt(2/pi)*(z + 0.044715*z^3))) * up.
+    var gate = [_]f32{ -2.0, -0.5, 0.0, 0.5, 1.0, 2.0 };
+    const up = [_]f32{ 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 };
+    gegluApprox(&gate, &up);
+    // Independent reference: import math; math.tanh; ...
+    const expected = [_]f32{ -0.045402, -0.154286, 0.0, 0.345714, 0.841192, 1.954598 };
+    for (gate, expected) |g, e| try std.testing.expectApproxEqAbs(e, g, 1e-4);
 }
 
 test "swiglu against scalar reference" {

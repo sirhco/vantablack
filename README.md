@@ -24,7 +24,7 @@ tax, no framework tax. Just weights and math.
 | Capability                                              | State                |
 |---------------------------------------------------------|----------------------|
 | GGUF v2/v3 parsing (zero-copy mmap)                     | shipped              |
-| Llama-architecture forward pass                         | shipped              |
+| Llama / Mistral / Gemma architectures                   | shipped (CPU). Llama: full GPU forward path. Mistral: sliding-window attention (`mistral.attention.sliding_window` GGUF key, default 4096). Gemma: `gelu_approx` (tanh-approx GELU) FFN. Phi (parallel-block forward): refused at load until segment-API redesign lands |
 | KV cache (fixed-size, layer-major)                      | shipped              |
 | Persistent thread pool (N-1 workers)                    | shipped              |
 | SentencePiece BPE encode + decode                       | shipped              |
