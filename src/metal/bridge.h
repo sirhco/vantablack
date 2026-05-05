@@ -54,6 +54,21 @@ int vtb_metal_matmul_q8_0(
     size_t m,
     size_t k);
 
+// Q4_K / Q5_K / Q6_K matmul. Same signature as Q8_0; block layouts match
+// `src/kernels/simd.zig::dequantBlockQ{4,5,6}_K`. Synchronous one-shot.
+int vtb_metal_matmul_q4_k(
+    VtbMetalCtx *ctx, VtbMetalBuf *out_buf,
+    VtbMetalBuf *w_buf, size_t w_offset,
+    VtbMetalBuf *acts_buf, size_t m, size_t k);
+int vtb_metal_matmul_q5_k(
+    VtbMetalCtx *ctx, VtbMetalBuf *out_buf,
+    VtbMetalBuf *w_buf, size_t w_offset,
+    VtbMetalBuf *acts_buf, size_t m, size_t k);
+int vtb_metal_matmul_q6_k(
+    VtbMetalCtx *ctx, VtbMetalBuf *out_buf,
+    VtbMetalBuf *w_buf, size_t w_offset,
+    VtbMetalBuf *acts_buf, size_t m, size_t k);
+
 // ----- Batched / fused dispatch -------------------------------------------
 //
 // `vtb_metal_segment_*` lets the caller chain multiple operations into one
@@ -83,6 +98,19 @@ void vtb_metal_segment_matmul_q8_0(
     VtbMetalBuf *acts_buf,
     size_t m,
     size_t k);
+
+void vtb_metal_segment_matmul_q4_k(
+    VtbMetalSeg *seg, VtbMetalBuf *out_buf,
+    VtbMetalBuf *w_buf, size_t w_offset,
+    VtbMetalBuf *acts_buf, size_t m, size_t k);
+void vtb_metal_segment_matmul_q5_k(
+    VtbMetalSeg *seg, VtbMetalBuf *out_buf,
+    VtbMetalBuf *w_buf, size_t w_offset,
+    VtbMetalBuf *acts_buf, size_t m, size_t k);
+void vtb_metal_segment_matmul_q6_k(
+    VtbMetalSeg *seg, VtbMetalBuf *out_buf,
+    VtbMetalBuf *w_buf, size_t w_offset,
+    VtbMetalBuf *acts_buf, size_t m, size_t k);
 
 void vtb_metal_segment_rmsnorm(
     VtbMetalSeg *seg,

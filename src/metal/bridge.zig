@@ -28,6 +28,12 @@ const c_api = if (metal_enabled) struct {
         m: usize,
         k: usize,
     ) c_int;
+    extern "c" fn vtb_metal_matmul_q4_k(ctx: *Ctx, out_buf: *Buf, w_buf: *Buf, w_offset: usize, acts_buf: *Buf, m: usize, k: usize) c_int;
+    extern "c" fn vtb_metal_matmul_q5_k(ctx: *Ctx, out_buf: *Buf, w_buf: *Buf, w_offset: usize, acts_buf: *Buf, m: usize, k: usize) c_int;
+    extern "c" fn vtb_metal_matmul_q6_k(ctx: *Ctx, out_buf: *Buf, w_buf: *Buf, w_offset: usize, acts_buf: *Buf, m: usize, k: usize) c_int;
+    extern "c" fn vtb_metal_segment_matmul_q4_k(seg: *Seg, out_buf: *Buf, w_buf: *Buf, w_offset: usize, acts_buf: *Buf, m: usize, k: usize) void;
+    extern "c" fn vtb_metal_segment_matmul_q5_k(seg: *Seg, out_buf: *Buf, w_buf: *Buf, w_offset: usize, acts_buf: *Buf, m: usize, k: usize) void;
+    extern "c" fn vtb_metal_segment_matmul_q6_k(seg: *Seg, out_buf: *Buf, w_buf: *Buf, w_offset: usize, acts_buf: *Buf, m: usize, k: usize) void;
     extern "c" fn vtb_metal_segment_begin(ctx: *Ctx) ?*Seg;
     extern "c" fn vtb_metal_segment_commit(seg: *Seg) c_int;
     extern "c" fn vtb_metal_wait_idle(ctx: *Ctx) void;
@@ -55,6 +61,18 @@ const c_api = if (metal_enabled) struct {
     fn vtb_metal_matmul_q8_0(_: *Ctx, _: *Buf, _: *Buf, _: usize, _: *Buf, _: usize, _: usize) c_int {
         return 1;
     }
+    fn vtb_metal_matmul_q4_k(_: *Ctx, _: *Buf, _: *Buf, _: usize, _: *Buf, _: usize, _: usize) c_int {
+        return 1;
+    }
+    fn vtb_metal_matmul_q5_k(_: *Ctx, _: *Buf, _: *Buf, _: usize, _: *Buf, _: usize, _: usize) c_int {
+        return 1;
+    }
+    fn vtb_metal_matmul_q6_k(_: *Ctx, _: *Buf, _: *Buf, _: usize, _: *Buf, _: usize, _: usize) c_int {
+        return 1;
+    }
+    fn vtb_metal_segment_matmul_q4_k(_: *Seg, _: *Buf, _: *Buf, _: usize, _: *Buf, _: usize, _: usize) void {}
+    fn vtb_metal_segment_matmul_q5_k(_: *Seg, _: *Buf, _: *Buf, _: usize, _: *Buf, _: usize, _: usize) void {}
+    fn vtb_metal_segment_matmul_q6_k(_: *Seg, _: *Buf, _: *Buf, _: usize, _: *Buf, _: usize, _: usize) void {}
     fn vtb_metal_segment_begin(_: *Ctx) ?*Seg {
         return null;
     }
@@ -79,6 +97,12 @@ const vtb_metal_alloc = c_api.vtb_metal_alloc;
 const vtb_metal_wrap = c_api.vtb_metal_wrap;
 const vtb_metal_release = c_api.vtb_metal_release;
 const vtb_metal_matmul_q8_0 = c_api.vtb_metal_matmul_q8_0;
+const vtb_metal_matmul_q4_k = c_api.vtb_metal_matmul_q4_k;
+const vtb_metal_matmul_q5_k = c_api.vtb_metal_matmul_q5_k;
+const vtb_metal_matmul_q6_k = c_api.vtb_metal_matmul_q6_k;
+const vtb_metal_segment_matmul_q4_k = c_api.vtb_metal_segment_matmul_q4_k;
+const vtb_metal_segment_matmul_q5_k = c_api.vtb_metal_segment_matmul_q5_k;
+const vtb_metal_segment_matmul_q6_k = c_api.vtb_metal_segment_matmul_q6_k;
 const vtb_metal_segment_begin = c_api.vtb_metal_segment_begin;
 const vtb_metal_segment_commit = c_api.vtb_metal_segment_commit;
 const vtb_metal_wait_idle = c_api.vtb_metal_wait_idle;
@@ -140,6 +164,19 @@ pub const Device = struct {
         if (rc != 0) return error.MetalDispatchFailed;
     }
 
+    pub fn matmulQ4_K(self: Device, out_buf: *Buf, w_buf: *Buf, w_offset: usize, acts_buf: *Buf, m: usize, k: usize) DispatchError!void {
+        const rc = vtb_metal_matmul_q4_k(self.handle, out_buf, w_buf, w_offset, acts_buf, m, k);
+        if (rc != 0) return error.MetalDispatchFailed;
+    }
+    pub fn matmulQ5_K(self: Device, out_buf: *Buf, w_buf: *Buf, w_offset: usize, acts_buf: *Buf, m: usize, k: usize) DispatchError!void {
+        const rc = vtb_metal_matmul_q5_k(self.handle, out_buf, w_buf, w_offset, acts_buf, m, k);
+        if (rc != 0) return error.MetalDispatchFailed;
+    }
+    pub fn matmulQ6_K(self: Device, out_buf: *Buf, w_buf: *Buf, w_offset: usize, acts_buf: *Buf, m: usize, k: usize) DispatchError!void {
+        const rc = vtb_metal_matmul_q6_k(self.handle, out_buf, w_buf, w_offset, acts_buf, m, k);
+        if (rc != 0) return error.MetalDispatchFailed;
+    }
+
     pub fn segmentBegin(self: Device) DispatchError!Segment {
         const seg = vtb_metal_segment_begin(self.handle) orelse return error.MetalDispatchFailed;
         return .{ .handle = seg };
@@ -163,6 +200,15 @@ pub const Segment = struct {
 
     pub fn matmulQ8_0(self: Segment, out_buf: *Buf, w_buf: *Buf, w_offset: usize, acts_buf: *Buf, m: usize, k: usize) void {
         vtb_metal_segment_matmul_q8_0(self.handle, out_buf, w_buf, w_offset, acts_buf, m, k);
+    }
+    pub fn matmulQ4_K(self: Segment, out_buf: *Buf, w_buf: *Buf, w_offset: usize, acts_buf: *Buf, m: usize, k: usize) void {
+        vtb_metal_segment_matmul_q4_k(self.handle, out_buf, w_buf, w_offset, acts_buf, m, k);
+    }
+    pub fn matmulQ5_K(self: Segment, out_buf: *Buf, w_buf: *Buf, w_offset: usize, acts_buf: *Buf, m: usize, k: usize) void {
+        vtb_metal_segment_matmul_q5_k(self.handle, out_buf, w_buf, w_offset, acts_buf, m, k);
+    }
+    pub fn matmulQ6_K(self: Segment, out_buf: *Buf, w_buf: *Buf, w_offset: usize, acts_buf: *Buf, m: usize, k: usize) void {
+        vtb_metal_segment_matmul_q6_k(self.handle, out_buf, w_buf, w_offset, acts_buf, m, k);
     }
     pub fn rmsnorm(self: Segment, out_buf: *Buf, in_buf: *Buf, weight_buf: *Buf, weight_offset: usize, n: usize, eps: f32) void {
         vtb_metal_segment_rmsnorm(self.handle, out_buf, in_buf, weight_buf, weight_offset, n, eps);
@@ -189,3 +235,129 @@ pub const Segment = struct {
         vtb_metal_segment_attn_weighted_sum(self.handle, out_buf, scores_buf, v_cache_buf, v_offset, n_heads, n_kv_heads, head_dim, seq_len);
     }
 };
+
+// -- tests ----------------------------------------------------------------
+
+const KQuantKind = enum { q4_k, q5_k, q6_k };
+
+fn writeF16(dst: *[2]u8, value: f32) void {
+    const h: f16 = @floatCast(value);
+    const bits: u16 = @bitCast(h);
+    std.mem.writeInt(u16, dst, bits, .little);
+}
+
+/// Replace the random super-scale / super-min f16 bytes in each block with
+/// values guaranteed to be finite + small. Without this, ~1 in 30 random
+/// u16s decodes as f16 +Inf / NaN and propagates through the matmul,
+/// drowning real algorithmic bugs in NaN comparisons.
+fn fixupKQuantScales(kind: KQuantKind, w_bytes: []u8, block_bytes: usize, rnd: anytype) void {
+    var off: usize = 0;
+    while (off < w_bytes.len) : (off += block_bytes) {
+        const block = w_bytes[off..][0..block_bytes];
+        switch (kind) {
+            .q4_k, .q5_k => {
+                writeF16(block[0..2], 0.001 + rnd.float(f32) * 0.05);   // d
+                writeF16(block[2..4], rnd.float(f32) * 0.05);            // dmin
+            },
+            .q6_k => {
+                writeF16(block[208..210], 0.001 + rnd.float(f32) * 0.05); // d
+            },
+        }
+    }
+}
+
+/// CPU-vs-GPU parity check shared across the K-quant kernels. `cpu_matmul`
+/// is the simd reference, `gpu_dispatch` runs the MSL kernel via the
+/// segment API. Random byte fixture exercises every sub-block boundary;
+/// f16 super-scales are post-processed into a finite, small range so the
+/// arithmetic stays well-behaved.
+fn kQuantParityCheck(
+    seed: u64,
+    kind: KQuantKind,
+    block_bytes: usize,
+    block_elems: usize,
+    cpu_matmul: *const fn ([]f32, []const u8, []const f32, usize, usize) void,
+    gpu_dispatch: *const fn (Segment, *Buf, *Buf, usize, *Buf, usize, usize) void,
+) !void {
+    if (!metal_enabled) return error.SkipZigTest;
+    var dev = try Device.init();
+    defer dev.deinit();
+
+    const m: usize = 4;
+    const k: usize = block_elems * 2; // 2 super-blocks per row to cover boundaries
+    const blocks_per_row = k / block_elems;
+    const row_bytes = blocks_per_row * block_bytes;
+    const w_len = m * row_bytes;
+
+    var prng = std.Random.DefaultPrng.init(seed);
+    var rnd = prng.random();
+
+    const w_bytes = try std.testing.allocator.alloc(u8, w_len);
+    defer std.testing.allocator.free(w_bytes);
+    for (w_bytes) |*b| b.* = rnd.int(u8);
+    fixupKQuantScales(kind, w_bytes, block_bytes, &rnd);
+
+    const acts = try std.testing.allocator.alloc(f32, k);
+    defer std.testing.allocator.free(acts);
+    for (acts) |*a| a.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    var w_ptr: ?*anyopaque = null;
+    const w_buf = try dev.alloc(w_len, &w_ptr);
+    defer dev.release(w_buf);
+    @memcpy(@as([*]u8, @ptrCast(@alignCast(w_ptr.?)))[0..w_len], w_bytes);
+
+    var a_ptr: ?*anyopaque = null;
+    const a_buf = try dev.alloc(k * @sizeOf(f32), &a_ptr);
+    defer dev.release(a_buf);
+    @memcpy(@as([*]f32, @ptrCast(@alignCast(a_ptr.?)))[0..k], acts);
+
+    var o_ptr: ?*anyopaque = null;
+    const o_buf = try dev.alloc(m * @sizeOf(f32), &o_ptr);
+    defer dev.release(o_buf);
+
+    const cpu_out = try std.testing.allocator.alloc(f32, m);
+    defer std.testing.allocator.free(cpu_out);
+    cpu_matmul(cpu_out, w_bytes, acts, m, k);
+
+    const seg = try dev.segmentBegin();
+    gpu_dispatch(seg, o_buf, w_buf, 0, a_buf, m, k);
+    try seg.commit();
+    dev.waitIdle();
+
+    const gpu_out: [*]const f32 = @ptrCast(@alignCast(o_ptr.?));
+    // Relative tolerance — random byte fixtures produce sums in the millions
+    // and absolute error scales with summation reordering between CPU SIMD
+    // and GPU FMA chains. 1e-4 catches every algorithmic bug observed during
+    // bring-up while admitting native float drift.
+    for (0..m) |i| try std.testing.expectApproxEqRel(cpu_out[i], gpu_out[i], 1e-4);
+}
+
+test "Q4_K MSL kernel matches CPU reference (random fixture)" {
+    const simd = @import("../kernels/simd.zig");
+    const Wrap = struct {
+        fn gpu(seg: Segment, out: *Buf, w: *Buf, off: usize, a: *Buf, m: usize, k: usize) void {
+            seg.matmulQ4_K(out, w, off, a, m, k);
+        }
+    };
+    try kQuantParityCheck(0xDEADBEEF, .q4_k, simd.q4_k_block_bytes, simd.q4_k_block_elems, simd.matmul_q4_k, Wrap.gpu);
+}
+
+test "Q5_K MSL kernel matches CPU reference (random fixture)" {
+    const simd = @import("../kernels/simd.zig");
+    const Wrap = struct {
+        fn gpu(seg: Segment, out: *Buf, w: *Buf, off: usize, a: *Buf, m: usize, k: usize) void {
+            seg.matmulQ5_K(out, w, off, a, m, k);
+        }
+    };
+    try kQuantParityCheck(0xCAFEBABE, .q5_k, simd.q5_k_block_bytes, simd.q5_k_block_elems, simd.matmul_q5_k, Wrap.gpu);
+}
+
+test "Q6_K MSL kernel matches CPU reference (random fixture)" {
+    const simd = @import("../kernels/simd.zig");
+    const Wrap = struct {
+        fn gpu(seg: Segment, out: *Buf, w: *Buf, off: usize, a: *Buf, m: usize, k: usize) void {
+            seg.matmulQ6_K(out, w, off, a, m, k);
+        }
+    };
+    try kQuantParityCheck(0xFEEDFACE, .q6_k, simd.q6_k_block_bytes, simd.q6_k_block_elems, simd.matmul_q6_k, Wrap.gpu);
+}

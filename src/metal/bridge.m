@@ -259,6 +259,190 @@ kernel void matmul_mlx_q4(
     out[gid] = total;
 }
 
+// ----- K-quant matmul kernels -------------------------------------------
+//
+// One thread per output row, mirroring matmul_q8_0. Block layouts match
+// `src/kernels/simd.zig::dequantBlockQ{4,5,6}_K` exactly — the kernels read
+// the same byte stream the CPU dequant reads.
+//
+// Reuses MMParams { m, k, w_offset_bytes } from matmul_q8_0.
+
+constant uint Q4K_BLOCK_BYTES = 144;
+constant uint Q4K_BLOCK_ELEMS = 256;
+constant uint Q5K_BLOCK_BYTES = 176;
+constant uint Q5K_BLOCK_ELEMS = 256;
+constant uint Q6K_BLOCK_BYTES = 210;
+constant uint Q6K_BLOCK_ELEMS = 256;
+
+inline ushort kq_load_u16(device const uchar *p) {
+    return (ushort)p[0] | ((ushort)p[1] << 8);
+}
+
+inline float kq_f16_to_f32(ushort bits) {
+    return (float)as_type<half>(bits);
+}
+
+// Q4_K / Q5_K share a 12-byte 8-pair (sub_scale, sub_min) packing.
+inline uchar2 q4k_scale_min(uint s, device const uchar *scales) {
+    uchar sc, mn;
+    if (s < 4) {
+        sc = scales[s] & 0x3F;
+        mn = scales[s + 4] & 0x3F;
+    } else {
+        sc = (scales[s + 4] & 0x0F) | ((scales[s - 4] >> 6) << 4);
+        mn = (scales[s + 4] >> 4)   | ((scales[s] >> 6) << 4);
+    }
+    return uchar2(sc, mn);
+}
+
+kernel void matmul_q4_k(
+    device float       *out      [[buffer(0)]],
+    device const uchar *weights  [[buffer(1)]],
+    device const float *acts     [[buffer(2)]],
+    constant MMParams  &p        [[buffer(3)]],
+    uint                gid      [[thread_position_in_grid]])
+{
+    if (gid >= p.m) return;
+    uint blocks_per_row = p.k / Q4K_BLOCK_ELEMS;
+    uint row_bytes = blocks_per_row * Q4K_BLOCK_BYTES;
+    device const uchar *row = weights + p.w_offset_bytes + gid * row_bytes;
+
+    float total = 0.0;
+    for (uint b = 0; b < blocks_per_row; ++b) {
+        device const uchar *blk = row + b * Q4K_BLOCK_BYTES;
+        float d = kq_f16_to_f32(kq_load_u16(blk));
+        float dmin = kq_f16_to_f32(kq_load_u16(blk + 2));
+        device const uchar *scales = blk + 4;
+        device const uchar *qs = blk + 16;
+        device const float *x = acts + b * Q4K_BLOCK_ELEMS;
+
+        // 4 pairs of sub-blocks: (0,1) (2,3) (4,5) (6,7). Pair `sp` shares
+        // 32 qs bytes (lo nibble = sub-block sp*2, hi = sub-block sp*2+1).
+        for (uint sp = 0; sp < 4; ++sp) {
+            uchar2 sm0 = q4k_scale_min(sp * 2,     scales);
+            uchar2 sm1 = q4k_scale_min(sp * 2 + 1, scales);
+            float d1 = d    * (float)sm0.x;
+            float m1 = dmin * (float)sm0.y;
+            float d2 = d    * (float)sm1.x;
+            float m2 = dmin * (float)sm1.y;
+            uint y_idx = sp * 64;
+            device const uchar *q = qs + sp * 32;
+            for (uint l = 0; l < 32; ++l) {
+                uchar packed = q[l];
+                float deq_lo = d1 * (float)(packed & 0x0F) - m1;
+                float deq_hi = d2 * (float)(packed >> 4)   - m2;
+                total = fma(deq_lo, x[y_idx + l],      total);
+                total = fma(deq_hi, x[y_idx + 32 + l], total);
+            }
+        }
+    }
+    out[gid] = total;
+}
+
+kernel void matmul_q5_k(
+    device float       *out      [[buffer(0)]],
+    device const uchar *weights  [[buffer(1)]],
+    device const float *acts     [[buffer(2)]],
+    constant MMParams  &p        [[buffer(3)]],
+    uint                gid      [[thread_position_in_grid]])
+{
+    if (gid >= p.m) return;
+    uint blocks_per_row = p.k / Q5K_BLOCK_ELEMS;
+    uint row_bytes = blocks_per_row * Q5K_BLOCK_BYTES;
+    device const uchar *row = weights + p.w_offset_bytes + gid * row_bytes;
+
+    float total = 0.0;
+    for (uint b = 0; b < blocks_per_row; ++b) {
+        device const uchar *blk = row + b * Q5K_BLOCK_BYTES;
+        float d = kq_f16_to_f32(kq_load_u16(blk));
+        float dmin = kq_f16_to_f32(kq_load_u16(blk + 2));
+        device const uchar *scales = blk + 4;
+        device const uchar *qh = blk + 16;       // 32 high-bit bytes
+        device const uchar *qs = blk + 48;       // 128 low-nibble bytes
+        device const float *x = acts + b * Q5K_BLOCK_ELEMS;
+
+        for (uint sp = 0; sp < 4; ++sp) {
+            uint s0 = sp * 2;
+            uint s1 = sp * 2 + 1;
+            uchar2 sm0 = q4k_scale_min(s0, scales);
+            uchar2 sm1 = q4k_scale_min(s1, scales);
+            float d1 = d    * (float)sm0.x;
+            float m1 = dmin * (float)sm0.y;
+            float d2 = d    * (float)sm1.x;
+            float m2 = dmin * (float)sm1.y;
+            uchar mask_lo = (uchar)(1u << s0);
+            uchar mask_hi = (uchar)(1u << s1);
+            uint y_idx = sp * 64;
+            device const uchar *q = qs + sp * 32;
+            for (uint l = 0; l < 32; ++l) {
+                uchar h = qh[l];
+                uint w_lo = (uint)(q[l] & 0x0F) + (((h & mask_lo) != 0) ? 16u : 0u);
+                uint w_hi = (uint)(q[l] >> 4)   + (((h & mask_hi) != 0) ? 16u : 0u);
+                float deq_lo = d1 * (float)w_lo - m1;
+                float deq_hi = d2 * (float)w_hi - m2;
+                total = fma(deq_lo, x[y_idx + l],      total);
+                total = fma(deq_hi, x[y_idx + 32 + l], total);
+            }
+        }
+    }
+    out[gid] = total;
+}
+
+kernel void matmul_q6_k(
+    device float       *out      [[buffer(0)]],
+    device const uchar *weights  [[buffer(1)]],
+    device const float *acts     [[buffer(2)]],
+    constant MMParams  &p        [[buffer(3)]],
+    uint                gid      [[thread_position_in_grid]])
+{
+    if (gid >= p.m) return;
+    uint blocks_per_row = p.k / Q6K_BLOCK_ELEMS;
+    uint row_bytes = blocks_per_row * Q6K_BLOCK_BYTES;
+    device const uchar *row = weights + p.w_offset_bytes + gid * row_bytes;
+
+    float total = 0.0;
+    for (uint b = 0; b < blocks_per_row; ++b) {
+        device const uchar *blk = row + b * Q6K_BLOCK_BYTES;
+        device const uchar *ql_all = blk;
+        device const uchar *qh_all = blk + 128;
+        device const char  *sc_all = (device const char *)(blk + 192);
+        float d = kq_f16_to_f32(kq_load_u16(blk + 208));
+        device const float *x = acts + b * Q6K_BLOCK_ELEMS;
+
+        // Two halves of 128 weights each. Each l in [0,32) reconstructs four
+        // weights at positions l, l+32, l+64, l+96 within the half.
+        uint y_off = 0;
+        uint ql_off = 0;
+        uint qh_off = 0;
+        uint sc_off = 0;
+        for (uint hh = 0; hh < 2; ++hh) {
+            for (uint l = 0; l < 32; ++l) {
+                uint is = l / 16;
+                uint ql_l   = ql_all[ql_off + l];
+                uint ql_l32 = ql_all[ql_off + l + 32];
+                uint qh_l   = qh_all[qh_off + l];
+                int q1 = (int)((ql_l   & 0x0F) | (((qh_l >> 0) & 0x3) << 4)) - 32;
+                int q2 = (int)((ql_l32 & 0x0F) | (((qh_l >> 2) & 0x3) << 4)) - 32;
+                int q3 = (int)((ql_l   >> 4)   | (((qh_l >> 4) & 0x3) << 4)) - 32;
+                int q4 = (int)((ql_l32 >> 4)   | (((qh_l >> 6) & 0x3) << 4)) - 32;
+                float s0 = (float)sc_all[sc_off + is + 0];
+                float s2 = (float)sc_all[sc_off + is + 2];
+                float s4 = (float)sc_all[sc_off + is + 4];
+                float s6 = (float)sc_all[sc_off + is + 6];
+                total = fma(d * s0 * (float)q1, x[y_off + l + 0],  total);
+                total = fma(d * s2 * (float)q2, x[y_off + l + 32], total);
+                total = fma(d * s4 * (float)q3, x[y_off + l + 64], total);
+                total = fma(d * s6 * (float)q4, x[y_off + l + 96], total);
+            }
+            y_off  += 128;
+            ql_off += 64;
+            qh_off += 32;
+            sc_off += 8;
+        }
+    }
+    out[gid] = total;
+}
+
 // Plain f32 copy. Caller binds dst+offset and src+offset; kernel just writes
 // p.n contiguous floats from src to dst. Used to splice the just-computed
 // k_cur / v_cur into the right slot in the persistent KV cache.
@@ -395,6 +579,9 @@ struct VtbMetalCtx {
     id<MTLCommandQueue> queue;
     id<MTLLibrary> library;
     id<MTLComputePipelineState> pso_q8_0;
+    id<MTLComputePipelineState> pso_q4_k;
+    id<MTLComputePipelineState> pso_q5_k;
+    id<MTLComputePipelineState> pso_q6_k;
     id<MTLComputePipelineState> pso_rmsnorm;
     id<MTLComputePipelineState> pso_rope;
     id<MTLComputePipelineState> pso_swiglu;
@@ -441,9 +628,10 @@ VtbMetalCtx *vtb_metal_init(void) {
             @"swiglu", @"residual_add", @"copy_f32",
             @"attn_scores", @"softmax_rows", @"attn_weighted_sum",
             @"matmul_mlx_q4",
+            @"matmul_q4_k", @"matmul_q5_k", @"matmul_q6_k",
         };
         const int n_psos = sizeof(names) / sizeof(names[0]);
-        id<MTLComputePipelineState> psos[10] = {nil};
+        id<MTLComputePipelineState> psos[13] = {nil};
         for (int i = 0; i < n_psos; i++) {
             id<MTLFunction> fn = [library newFunctionWithName:names[i]];
             if (!fn) {
@@ -472,6 +660,9 @@ VtbMetalCtx *vtb_metal_init(void) {
         ctx->pso_softmax = psos[7];
         ctx->pso_attn_weighted = psos[8];
         ctx->pso_mlx_q4 = psos[9];
+        ctx->pso_q4_k = psos[10];
+        ctx->pso_q5_k = psos[11];
+        ctx->pso_q6_k = psos[12];
         return ctx;
     }
 }
@@ -491,6 +682,9 @@ void vtb_metal_destroy(VtbMetalCtx *ctx) {
     ctx->pso_softmax = nil;
     ctx->pso_attn_weighted = nil;
     ctx->pso_mlx_q4 = nil;
+    ctx->pso_q4_k = nil;
+    ctx->pso_q5_k = nil;
+    ctx->pso_q6_k = nil;
     free(ctx);
 }
 
@@ -573,6 +767,100 @@ int vtb_metal_matmul_q8_0(
         }
         return 0;
     }
+}
+
+// ----------------- K-quant matmul dispatch -----------------------------------
+//
+// Q4_K / Q5_K / Q6_K kernels share the MMParams { m, k, w_offset_bytes }
+// binding shape with Q8_0, so the dispatch pattern is identical — only the
+// pipeline state differs. Each public entry point selects the PSO from the
+// shared `kq_dispatch_*` helpers below.
+
+static int kq_dispatch_oneshot(
+    VtbMetalCtx *ctx,
+    id<MTLComputePipelineState> pso,
+    VtbMetalBuf *out_buf,
+    VtbMetalBuf *w_buf,
+    size_t w_offset,
+    VtbMetalBuf *acts_buf,
+    size_t m,
+    size_t k,
+    const char *label)
+{
+    if (!ctx || !out_buf || !w_buf || !acts_buf) return 1;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:out_buf->buffer offset:0 atIndex:0];
+        [enc setBuffer:w_buf->buffer offset:0 atIndex:1];
+        [enc setBuffer:acts_buf->buffer offset:0 atIndex:2];
+
+        struct MMParams { uint32_t m; uint32_t k; uint32_t w_offset_bytes; } params;
+        params.m = (uint32_t)m;
+        params.k = (uint32_t)k;
+        params.w_offset_bytes = (uint32_t)w_offset;
+        [enc setBytes:&params length:sizeof(params) atIndex:3];
+
+        NSUInteger tg = 64;
+        if (tg > pso.maxTotalThreadsPerThreadgroup)
+            tg = pso.maxTotalThreadsPerThreadgroup;
+        [enc dispatchThreads:MTLSizeMake(m, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        if (cmd.status == MTLCommandBufferStatusError) {
+            NSLog(@"%s: cmd failed: %@", label, cmd.error);
+            return 2;
+        }
+        return 0;
+    }
+}
+
+static void kq_dispatch_segment(
+    VtbMetalSeg *seg,
+    id<MTLComputePipelineState> pso,
+    VtbMetalBuf *out_buf,
+    VtbMetalBuf *w_buf,
+    size_t w_offset,
+    VtbMetalBuf *acts_buf,
+    size_t m,
+    size_t k)
+{
+    if (!seg) return;
+    [seg->enc setComputePipelineState:pso];
+    [seg->enc setBuffer:out_buf->buffer offset:0 atIndex:0];
+    [seg->enc setBuffer:w_buf->buffer offset:0 atIndex:1];
+    [seg->enc setBuffer:acts_buf->buffer offset:0 atIndex:2];
+    struct MMParams { uint32_t m; uint32_t k; uint32_t w_offset_bytes; } params;
+    params.m = (uint32_t)m;
+    params.k = (uint32_t)k;
+    params.w_offset_bytes = (uint32_t)w_offset;
+    [seg->enc setBytes:&params length:sizeof(params) atIndex:3];
+    NSUInteger tg = 64;
+    if (tg > pso.maxTotalThreadsPerThreadgroup) tg = pso.maxTotalThreadsPerThreadgroup;
+    [seg->enc dispatchThreads:MTLSizeMake(m, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+}
+
+int vtb_metal_matmul_q4_k(VtbMetalCtx *ctx, VtbMetalBuf *out, VtbMetalBuf *w, size_t off, VtbMetalBuf *acts, size_t m, size_t k) {
+    return kq_dispatch_oneshot(ctx, ctx ? ctx->pso_q4_k : nil, out, w, off, acts, m, k, "vtb_metal_matmul_q4_k");
+}
+int vtb_metal_matmul_q5_k(VtbMetalCtx *ctx, VtbMetalBuf *out, VtbMetalBuf *w, size_t off, VtbMetalBuf *acts, size_t m, size_t k) {
+    return kq_dispatch_oneshot(ctx, ctx ? ctx->pso_q5_k : nil, out, w, off, acts, m, k, "vtb_metal_matmul_q5_k");
+}
+int vtb_metal_matmul_q6_k(VtbMetalCtx *ctx, VtbMetalBuf *out, VtbMetalBuf *w, size_t off, VtbMetalBuf *acts, size_t m, size_t k) {
+    return kq_dispatch_oneshot(ctx, ctx ? ctx->pso_q6_k : nil, out, w, off, acts, m, k, "vtb_metal_matmul_q6_k");
+}
+void vtb_metal_segment_matmul_q4_k(VtbMetalSeg *seg, VtbMetalBuf *out, VtbMetalBuf *w, size_t off, VtbMetalBuf *acts, size_t m, size_t k) {
+    kq_dispatch_segment(seg, seg ? seg->ctx->pso_q4_k : nil, out, w, off, acts, m, k);
+}
+void vtb_metal_segment_matmul_q5_k(VtbMetalSeg *seg, VtbMetalBuf *out, VtbMetalBuf *w, size_t off, VtbMetalBuf *acts, size_t m, size_t k) {
+    kq_dispatch_segment(seg, seg ? seg->ctx->pso_q5_k : nil, out, w, off, acts, m, k);
+}
+void vtb_metal_segment_matmul_q6_k(VtbMetalSeg *seg, VtbMetalBuf *out, VtbMetalBuf *w, size_t off, VtbMetalBuf *acts, size_t m, size_t k) {
+    kq_dispatch_segment(seg, seg ? seg->ctx->pso_q6_k : nil, out, w, off, acts, m, k);
 }
 
 // ----------------- Segment (batched) dispatch --------------------------------
