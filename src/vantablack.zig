@@ -12,6 +12,7 @@ pub const mlx = @import("kernels/mlx.zig");
 pub const kv_cache = @import("runtime/kv_cache.zig");
 pub const model = @import("runtime/model.zig");
 pub const forward = @import("runtime/forward.zig");
+pub const prefill = @import("runtime/prefill.zig");
 pub const tokenizer = @import("runtime/tokenizer.zig");
 pub const byte_level_bpe = @import("runtime/byte_level_bpe.zig");
 pub const unicode_table = @import("runtime/unicode_table.zig");

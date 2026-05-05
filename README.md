@@ -43,7 +43,7 @@ tax, no framework tax. Just weights and math.
 | MLX 4-bit MSL kernel                                    | compiled + cached; runtime dispatch from forward.zig pending |
 | Tiktoken-style tokenizer (GPT-2 + cl100k-style)         | shipped — byte→Unicode alphabet, GPT-2 pre-tokenizer split, byte-level encode/decode; `Tokenizer.initFromHfJson` auto-detects `ByteLevel` in `tokenizer.json::pre_tokenizer` and switches flavor. Llama-3 contraction-aware split deferred until reference fixtures available |
 | Vulkan / cross-vendor GPU                               | not yet              |
-| Prompt prefill batching                                 | not yet              |
+| Prompt prefill batching                                 | shipped (CPU) — `runtime/prefill.zig` runs the prompt as one B-wide pass: each weight row is dequantized once and dot-multiplied against B activation rows via `simd.dot_f32`. ~2.3× faster than per-token CPU forward on an 87-token TinyLlama prompt. Metal builds keep the per-token GPU loop pending a batched MSL kernel |
 
 The Metal backend covers the full per-layer forward pass when every
 projection is Q8_0, Q4_K, Q5_K, or Q6_K and every norm is f32 (the common

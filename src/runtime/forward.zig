@@ -461,7 +461,7 @@ fn matmulRuntime(
     pool.dispatch(matmulWorker, &ctx);
 }
 
-fn rowBytes(q: kernels.QuantType, k: usize) usize {
+pub fn rowBytes(q: kernels.QuantType, k: usize) usize {
     return switch (q) {
         .f32 => k * 4,
         .f16 => k * 2,
@@ -477,7 +477,7 @@ fn rowBytes(q: kernels.QuantType, k: usize) usize {
 
 /// RMSNorm where the weight tensor is stored in some ggml type. Most llamas
 /// keep norms in f32 but Q8_0 / f16 are also legal.
-fn rmsNormTyped(x: []f32, w: TypedTensor, eps: f32) StepError!void {
+pub fn rmsNormTyped(x: []f32, w: TypedTensor, eps: f32) StepError!void {
     var stack_buf: [8192]f32 = undefined;
     const dim = x.len;
     if (dim > stack_buf.len) return error.UnsupportedWeightType;
@@ -486,7 +486,7 @@ fn rmsNormTyped(x: []f32, w: TypedTensor, eps: f32) StepError!void {
     math.rmsNorm(x, w_f32, eps);
 }
 
-fn dequantToF32(out: []f32, w: TypedTensor, n: usize) StepError!void {
+pub fn dequantToF32(out: []f32, w: TypedTensor, n: usize) StepError!void {
     const q = w.quant;
     switch (q) {
         .f32 => {
@@ -570,7 +570,7 @@ fn dequantToF32(out: []f32, w: TypedTensor, n: usize) StepError!void {
     }
 }
 
-fn gatherEmbedding(out: []f32, table: TypedTensor, id: u32, dim: usize) StepError!void {
+pub fn gatherEmbedding(out: []f32, table: TypedTensor, id: u32, dim: usize) StepError!void {
     const q = table.quant;
     const id_us: usize = @intCast(id);
     switch (q) {

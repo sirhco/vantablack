@@ -240,11 +240,20 @@ fn generate(
     defer pool.deinit(gpa);
 
     if (prompt_ids.len == 0) return;
-    for (prompt_ids) |id| {
-        try vantablack.forward.step(&model, &state, &cache, pool, metal_ptr, id);
-        try tok.decodeTo(out, id);
-    }
+    // Echo the prompt while it's being processed.
+    for (prompt_ids) |id| try tok.decodeTo(out, id);
     try out.flush();
+    // Prefill on CPU when there's no Metal backend — single B-wide pass
+    // amortizes weight bandwidth across the whole prompt. With Metal, the
+    // per-token GPU path is faster than a CPU prefill for typical prompt
+    // sizes; revisit once a GPU batched matmul ships.
+    if (metal_ptr == null) {
+        try vantablack.prefill.prefillCpu(gpa, pool, &model, &state, &cache, prompt_ids);
+    } else {
+        for (prompt_ids) |id| {
+            try vantablack.forward.step(&model, &state, &cache, pool, metal_ptr, id);
+        }
+    }
 
     var produced: u32 = 0;
     var next: u32 = sampler.sample(state.logits);
@@ -453,11 +462,10 @@ fn runHfCli(
     try out.flush();
 
     if (prompt_ids.len == 0) return;
-    for (prompt_ids) |id| {
-        try vantablack.forward.step(&model, &state, &cache, pool, null, id);
-        try tok.decodeTo(out, id);
-    }
+    for (prompt_ids) |id| try tok.decodeTo(out, id);
     try out.flush();
+    // HF path is CPU-only — always prefill.
+    try vantablack.prefill.prefillCpu(gpa, pool, &model, &state, &cache, prompt_ids);
 
     var produced: u32 = 0;
     var next: u32 = sampler.sample(state.logits);

@@ -26,6 +26,7 @@ const hf_loader_mod = @import("../core/hf_loader.zig");
 const hf_config_mod = @import("../core/hf_config.zig");
 const model_mod = @import("model.zig");
 const forward_mod = @import("forward.zig");
+const prefill_mod = @import("prefill.zig");
 const kv_cache_mod = @import("kv_cache.zig");
 const sampler_mod = @import("sampler.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -464,9 +465,15 @@ pub const Server = struct {
 
         const prompt_ids = try self.tok.encode(a, prompt_text, true);
 
-        // Feed prompt (no streaming back per Ollama convention).
-        for (prompt_ids) |id| {
-            try forward_mod.step(&self.model, &self.state, &self.cache, self.pool, self.metal_ptr(), id);
+        // Feed prompt (no streaming back per Ollama convention). Prefill on
+        // CPU when no Metal backend; otherwise per-token GPU which is faster
+        // for the prompt sizes seen in practice.
+        if (self.metal_ptr() == null) {
+            try prefill_mod.prefillCpu(self.gpa, self.pool, &self.model, &self.state, &self.cache, prompt_ids);
+        } else {
+            for (prompt_ids) |id| {
+                try forward_mod.step(&self.model, &self.state, &self.cache, self.pool, self.metal_ptr(), id);
+            }
         }
 
         if (stream_mode) {
