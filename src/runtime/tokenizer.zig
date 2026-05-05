@@ -11,6 +11,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const parser = @import("../core/parser.zig");
+const byte_level_bpe = @import("byte_level_bpe.zig");
 
 pub const TokenizerError = error{
     MissingVocab,
@@ -23,6 +24,18 @@ pub const PieceMap = std.StringHashMapUnmanaged(IdScore);
 
 pub const IdScore = struct { id: u32, score: f32 };
 
+/// Selects how `Tokenizer.encode` prepares text before greedy BPE merge.
+pub const Flavor = enum {
+    /// Llama 1/2-style: replace ' ' with U+2581 (▁), prepend leading ▁,
+    /// fall back to <0xHH> byte tokens for unknown spans.
+    sentencepiece,
+    /// GPT-2 / Llama-3-style: pre-tokenizer split on Unicode classes,
+    /// each byte mapped through the GPT-2 byte→Unicode alphabet, BPE
+    /// merge runs per pre-token. No byte fallback (every mapped byte is
+    /// guaranteed to be in vocab).
+    byte_level,
+};
+
 pub const Tokenizer = struct {
     /// Slice of pieces, one per token id. Each piece is a slice into the mmap
     /// region (zero-copy).
@@ -33,6 +46,7 @@ pub const Tokenizer = struct {
     by_piece: PieceMap,
     bos: u32,
     eos: u32,
+    flavor: Flavor = .sentencepiece,
 
     pub fn init(allocator: Allocator, catalog: parser.Catalog) TokenizerError!Tokenizer {
         const tokens_v = findValue(catalog, "tokenizer.ggml.tokens") orelse
@@ -105,12 +119,26 @@ pub const Tokenizer = struct {
         self.* = undefined;
     }
 
+    /// Encode `text` to token IDs. Dispatches to the SentencePiece or
+    /// byte-level pipeline based on `self.flavor`.
+    pub fn encode(
+        self: *const Tokenizer,
+        allocator: Allocator,
+        text: []const u8,
+        prepend_bos: bool,
+    ) TokenizerError![]u32 {
+        return switch (self.flavor) {
+            .sentencepiece => self.encodeSentencePiece(allocator, text, prepend_bos),
+            .byte_level => self.encodeByteLevel(allocator, text, prepend_bos),
+        };
+    }
+
     /// SentencePiece BPE encoding (matches llama.cpp `llm_tokenizer_spm`).
     /// Spaces are replaced by U+2581 (▁), and a leading ▁ is prepended.
     /// Multi-byte UTF-8 stays intact as initial pieces.
     /// Unknown bytes after merging fall back to `<0xHH>` byte tokens.
     /// Caller owns the returned slice.
-    pub fn encode(
+    pub fn encodeSentencePiece(
         self: *const Tokenizer,
         allocator: Allocator,
         text: []const u8,
@@ -200,6 +228,107 @@ pub const Tokenizer = struct {
             cur = sym.next;
         }
         return try out.toOwnedSlice(allocator);
+    }
+
+    /// Byte-level (tiktoken-style) encoder for GPT-2 / Llama-3 / cl100k
+    /// vocabularies. Pre-tokenizes via `byte_level_bpe.splitGpt2`, maps
+    /// every byte through the GPT-2 byte→Unicode alphabet, runs greedy
+    /// BPE per pre-token. No byte fallback — byte-level vocabs include
+    /// every mapped byte by construction.
+    pub fn encodeByteLevel(
+        self: *const Tokenizer,
+        allocator: Allocator,
+        text: []const u8,
+        prepend_bos: bool,
+    ) TokenizerError![]u32 {
+        var out: std.ArrayList(u32) = .empty;
+        errdefer out.deinit(allocator);
+        if (prepend_bos) try out.append(allocator, self.bos);
+
+        var splits: std.ArrayList(byte_level_bpe.Span) = .empty;
+        defer splits.deinit(allocator);
+        byte_level_bpe.splitGpt2(text, &splits, allocator) catch return error.InvalidUtf8;
+
+        var mapped: std.ArrayList(u8) = .empty;
+        defer mapped.deinit(allocator);
+
+        for (splits.items) |sp| {
+            mapped.clearRetainingCapacity();
+            for (text[sp.start..sp.end]) |b| {
+                byte_level_bpe.utf8Append(byte_level_bpe.byte_to_unicode[b], &mapped, allocator) catch return error.InvalidUtf8;
+            }
+            try self.bpeMergeMapped(allocator, mapped.items, &out);
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// Run greedy BPE on a mapped UTF-8 string and append token IDs to `out`.
+    /// Helper for `encodeByteLevel`. No byte fallback (byte-level vocab is
+    /// total over the 256-cp alphabet).
+    fn bpeMergeMapped(
+        self: *const Tokenizer,
+        allocator: Allocator,
+        mapped: []const u8,
+        out: *std.ArrayList(u32),
+    ) TokenizerError!void {
+        if (mapped.len == 0) return;
+
+        var symbols: std.ArrayList(Symbol) = .empty;
+        defer symbols.deinit(allocator);
+        var i: usize = 0;
+        while (i < mapped.len) {
+            const len = utf8Len(mapped[i]);
+            const take = @min(len, mapped.len - i);
+            try symbols.append(allocator, .{
+                .text = mapped[i .. i + take],
+                .prev = @intCast(@as(isize, @intCast(symbols.items.len)) - 1),
+                .next = -1,
+                .alive = true,
+            });
+            i += take;
+        }
+        for (symbols.items, 0..) |*sym, idx| {
+            sym.next = if (idx + 1 < symbols.items.len) @intCast(idx + 1) else -1;
+        }
+
+        var queue: BigramQueue = .empty;
+        defer queue.deinit(allocator);
+        for (1..symbols.items.len) |idx| {
+            try self.tryAddBigram(allocator, &queue, symbols.items, @intCast(idx - 1), @intCast(idx));
+        }
+        while (queue.pop()) |bg| {
+            const left_idx: usize = @intCast(bg.left);
+            const right_idx: usize = @intCast(bg.right);
+            const left = &symbols.items[left_idx];
+            const right = &symbols.items[right_idx];
+            if (!left.alive or !right.alive) continue;
+            if (left.text.len + right.text.len != bg.merged_len) continue;
+            const start_off = @intFromPtr(left.text.ptr) - @intFromPtr(mapped.ptr);
+            const end_off = @intFromPtr(right.text.ptr) - @intFromPtr(mapped.ptr) + right.text.len;
+            left.text = mapped[start_off..end_off];
+            right.alive = false;
+            left.next = right.next;
+            if (right.next >= 0) {
+                symbols.items[@intCast(right.next)].prev = bg.left;
+            }
+            try self.tryAddBigram(allocator, &queue, symbols.items, left.prev, bg.left);
+            try self.tryAddBigram(allocator, &queue, symbols.items, bg.left, left.next);
+        }
+
+        var cur: i32 = if (symbols.items.len == 0) -1 else 0;
+        while (cur >= 0) {
+            const sym = symbols.items[@intCast(cur)];
+            if (sym.alive) {
+                if (self.by_piece.get(sym.text)) |hit| {
+                    try out.append(allocator, hit.id);
+                }
+                // No byte fallback. A miss here means the vocab does not
+                // contain a single mapped byte the alphabet produced, which
+                // would indicate a malformed byte-level tokenizer. Drop
+                // silently rather than emit garbage.
+            }
+            cur = sym.next;
+        }
     }
 
     fn tryAddBigram(
@@ -295,6 +424,14 @@ pub const Tokenizer = struct {
             pieces[id_us] = try allocator.dupe(u8, kv.key_ptr.*);
         }
 
+        // Detect tokenizer flavor from pre_tokenizer.type. ByteLevel (raw
+        // or nested in a Sequence) → byte-level pipeline; everything else
+        // (default, Metaspace, etc.) keeps the SentencePiece path.
+        var flavor: Flavor = .sentencepiece;
+        if (root.object.get("pre_tokenizer")) |pt_v| {
+            flavor = detectFlavor(pt_v);
+        }
+
         // added_tokens override (e.g., `<unk>`, `<s>`, `</s>`).
         var bos: u32 = 1;
         var eos: u32 = 2;
@@ -364,6 +501,7 @@ pub const Tokenizer = struct {
             .by_piece = by_piece,
             .bos = bos,
             .eos = eos,
+            .flavor = flavor,
         };
     }
 
@@ -381,31 +519,55 @@ pub const Tokenizer = struct {
         self.* = undefined;
     }
 
-    /// Write the decoded bytes for `token_id` into `writer`. Handles:
-    ///  * SentencePiece `▁` (U+2581 = bytes E2 96 81) → space
-    ///  * Byte-fallback pieces of the form `<0xHH>` → raw byte 0xHH
+    /// Write the decoded bytes for `token_id` into `writer`. Dispatches on
+    /// `self.flavor`:
+    ///  * SentencePiece: ▁ → space, <0xHH> → raw byte.
+    ///  * Byte-level: walk the piece's codepoints, reverse the GPT-2
+    ///    byte→Unicode alphabet to recover the original bytes.
     pub fn decodeTo(self: *const Tokenizer, writer: *std.Io.Writer, token_id: u32) !void {
         if (token_id >= self.pieces.len) return;
         const piece = self.pieces[token_id];
-        if (piece.len == 6 and piece[0] == '<' and piece[1] == '0' and piece[2] == 'x' and piece[5] == '>') {
-            const hi = hexNibble(piece[3]) orelse return writer.writeAll(piece);
-            const lo = hexNibble(piece[4]) orelse return writer.writeAll(piece);
-            try writer.writeByte(@intCast((hi << 4) | lo));
-            return;
-        }
-        // Replace SentencePiece word-start marker with a real space.
-        var i: usize = 0;
-        while (i < piece.len) {
-            if (i + 3 <= piece.len and piece[i] == 0xE2 and piece[i + 1] == 0x96 and piece[i + 2] == 0x81) {
-                try writer.writeByte(' ');
-                i += 3;
-            } else {
-                try writer.writeByte(piece[i]);
-                i += 1;
-            }
+        switch (self.flavor) {
+            .sentencepiece => try decodeSentencePiece(writer, piece),
+            .byte_level => try decodeByteLevel(writer, piece),
         }
     }
 };
+
+fn decodeSentencePiece(writer: *std.Io.Writer, piece: []const u8) !void {
+    if (piece.len == 6 and piece[0] == '<' and piece[1] == '0' and piece[2] == 'x' and piece[5] == '>') {
+        const hi = hexNibble(piece[3]) orelse return writer.writeAll(piece);
+        const lo = hexNibble(piece[4]) orelse return writer.writeAll(piece);
+        try writer.writeByte(@intCast((hi << 4) | lo));
+        return;
+    }
+    var i: usize = 0;
+    while (i < piece.len) {
+        if (i + 3 <= piece.len and piece[i] == 0xE2 and piece[i + 1] == 0x96 and piece[i + 2] == 0x81) {
+            try writer.writeByte(' ');
+            i += 3;
+        } else {
+            try writer.writeByte(piece[i]);
+            i += 1;
+        }
+    }
+}
+
+fn decodeByteLevel(writer: *std.Io.Writer, piece: []const u8) !void {
+    var i: usize = 0;
+    while (i < piece.len) {
+        const d = byte_level_bpe.utf8Decode(piece[i..]);
+        if (byte_level_bpe.inverse.get(d.cp)) |b| {
+            try writer.writeByte(b);
+        } else {
+            // Codepoint outside the alphabet; emit raw UTF-8 bytes
+            // verbatim. Should not happen for a well-formed byte-level
+            // tokenizer, but degrades gracefully if a piece slips through.
+            try writer.writeAll(piece[i .. i + d.len]);
+        }
+        i += d.len;
+    }
+}
 
 const Symbol = struct {
     text: []const u8,
@@ -460,6 +622,31 @@ fn findValue(catalog: parser.Catalog, key: []const u8) ?parser.MetaValue {
     return null;
 }
 
+/// Walk a `pre_tokenizer` JSON node looking for a `ByteLevel` type marker
+/// — either as a leaf or nested in a Sequence/list. Returns `.byte_level`
+/// when found, `.sentencepiece` otherwise.
+fn detectFlavor(node: std.json.Value) Flavor {
+    switch (node) {
+        .object => |obj| {
+            if (obj.get("type")) |t_v| {
+                if (t_v == .string and std.mem.eql(u8, t_v.string, "ByteLevel")) {
+                    return .byte_level;
+                }
+            }
+            // Sequence with nested pretokenizers: scan the inner array.
+            if (obj.get("pretokenizers")) |inner| {
+                if (inner == .array) {
+                    for (inner.array.items) |child| {
+                        if (detectFlavor(child) == .byte_level) return .byte_level;
+                    }
+                }
+            }
+        },
+        else => {},
+    }
+    return .sentencepiece;
+}
+
 fn readU32(catalog: parser.Catalog, key: []const u8) ?u32 {
     const v = findValue(catalog, key) orelse return null;
     return switch (v) {
@@ -484,6 +671,78 @@ test "decode byte-fallback piece" {
     };
     try t.decodeTo(&fbw, 0);
     try std.testing.expectEqualSlices(u8, &.{0xAB}, fbw.buffered());
+}
+
+test "byte-level: encode + decode round-trips ASCII text on synthetic vocab" {
+    const allocator = std.testing.allocator;
+    // Build a minimal byte-level vocab covering every byte 0..255 as a
+    // single-codepoint piece. No merges: every output token is one byte.
+    const piece_count: usize = 256;
+    const pieces = try allocator.alloc([]const u8, piece_count);
+    defer {
+        for (pieces) |p| allocator.free(p);
+        allocator.free(pieces);
+    }
+    for (pieces, 0..) |*p, b| {
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(byte_level_bpe.byte_to_unicode[b], &buf) catch unreachable;
+        p.* = try allocator.dupe(u8, buf[0..n]);
+    }
+    const scores = try allocator.alloc(f32, piece_count);
+    defer allocator.free(scores);
+    @memset(scores, 0);
+
+    var by_piece: PieceMap = .empty;
+    defer by_piece.deinit(allocator);
+    try by_piece.ensureTotalCapacity(allocator, @intCast(piece_count));
+    for (pieces, 0..) |p, i| {
+        try by_piece.put(allocator, p, .{ .id = @intCast(i), .score = 0 });
+    }
+
+    const tok: Tokenizer = .{
+        .pieces = pieces,
+        .scores = scores,
+        .by_piece = by_piece,
+        .bos = 0,
+        .eos = 0,
+        .flavor = .byte_level,
+    };
+
+    const original = "Hello, world! 123\n\tend.";
+    const ids = try tok.encode(allocator, original, false);
+    defer allocator.free(ids);
+    // No merges → one token per byte.
+    try std.testing.expectEqual(original.len, ids.len);
+
+    var buf: [128]u8 = undefined;
+    var fbw: std.Io.Writer = .fixed(&buf);
+    for (ids) |id| try tok.decodeTo(&fbw, id);
+    try std.testing.expectEqualSlices(u8, original, fbw.buffered());
+}
+
+test "detectFlavor: ByteLevel pre_tokenizer → byte_level" {
+    const json_byte = "{\"type\":\"ByteLevel\",\"add_prefix_space\":false}";
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json_byte, .{});
+    try std.testing.expectEqual(Flavor.byte_level, detectFlavor(v));
+}
+
+test "detectFlavor: Sequence with ByteLevel inner → byte_level" {
+    const json_byte =
+        "{\"type\":\"Sequence\",\"pretokenizers\":[{\"type\":\"Split\"},{\"type\":\"ByteLevel\"}]}";
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json_byte, .{});
+    try std.testing.expectEqual(Flavor.byte_level, detectFlavor(v));
+}
+
+test "detectFlavor: Metaspace → sentencepiece" {
+    const json_byte = "{\"type\":\"Metaspace\",\"replacement\":\"_\"}";
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json_byte, .{});
+    try std.testing.expectEqual(Flavor.sentencepiece, detectFlavor(v));
 }
 
 test "decode SentencePiece space marker" {
