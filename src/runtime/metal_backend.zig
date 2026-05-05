@@ -297,6 +297,22 @@ pub const MetalBackend = struct {
         try self.dev.matmulQ8_0(out_buf.buf, self.weights_buf, off, in_buf.buf, m, k);
     }
 
+    pub fn matmulQ4_K(self: *MetalBackend, out_buf: *ScratchBuf, weight_bytes: []const u8, in_buf: *const ScratchBuf, m: usize, k: usize) !void {
+        std.debug.assert(m <= out_buf.cap);
+        std.debug.assert(k <= in_buf.cap);
+        try self.dev.matmulQ4_K(out_buf.buf, self.weights_buf, self.weightOffset(weight_bytes), in_buf.buf, m, k);
+    }
+    pub fn matmulQ5_K(self: *MetalBackend, out_buf: *ScratchBuf, weight_bytes: []const u8, in_buf: *const ScratchBuf, m: usize, k: usize) !void {
+        std.debug.assert(m <= out_buf.cap);
+        std.debug.assert(k <= in_buf.cap);
+        try self.dev.matmulQ5_K(out_buf.buf, self.weights_buf, self.weightOffset(weight_bytes), in_buf.buf, m, k);
+    }
+    pub fn matmulQ6_K(self: *MetalBackend, out_buf: *ScratchBuf, weight_bytes: []const u8, in_buf: *const ScratchBuf, m: usize, k: usize) !void {
+        std.debug.assert(m <= out_buf.cap);
+        std.debug.assert(k <= in_buf.cap);
+        try self.dev.matmulQ6_K(out_buf.buf, self.weights_buf, self.weightOffset(weight_bytes), in_buf.buf, m, k);
+    }
+
     /// Returns the ScratchBuf whose shared-storage pointer matches `p`, or
     /// null if `p` was allocated outside the backend (e.g. in CPU-only mode).
     /// Lets `forward.zig` map a plain `[]f32` view back to its GPU buffer

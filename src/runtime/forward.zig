@@ -15,6 +15,7 @@ const model_mod = @import("model.zig");
 const kv_cache_mod = @import("kv_cache.zig");
 const pool_mod = @import("pool.zig");
 const metal_backend_mod = @import("metal_backend.zig");
+const metal_bridge = @import("../metal/bridge.zig");
 
 const Model = model_mod.Model;
 const TypedTensor = model_mod.TypedTensor;
@@ -243,9 +244,16 @@ fn cpuLayerStep(
     math.addInto(state.x, state.ffn_out);
 }
 
+fn isGpuEligibleProj(q: kernels.QuantType) bool {
+    return switch (q) {
+        .q8_0, .q4_k, .q5_k, .q6_k => true,
+        else => false,
+    };
+}
+
 fn modelGpuEligible(m: *const Model) bool {
     if (m.output_norm.quant != .f32) return false;
-    if (m.output_w.quant != .q8_0) return false;
+    if (!isGpuEligibleProj(m.output_w.quant)) return false;
     for (m.layers) |lw| {
         if (lw.attn_norm.quant != .f32) return false;
         if (lw.ffn_norm.quant != .f32) return false;
@@ -255,9 +263,30 @@ fn modelGpuEligible(m: *const Model) bool {
             lw.ffn_gate.quant,  lw.ffn_up.quant,
             lw.ffn_down.quant,
         };
-        for (projs) |p| if (p != .q8_0) return false;
+        for (projs) |p| if (!isGpuEligibleProj(p)) return false;
     }
     return true;
+}
+
+/// Dispatch a quantized matmul on the segment, selecting the kernel by
+/// `quant`. Caller has already verified eligibility via modelGpuEligible.
+fn segMatmulQuant(
+    seg: metal_bridge.Segment,
+    out_buf: *metal_bridge.Buf,
+    w_buf: *metal_bridge.Buf,
+    w_offset: usize,
+    in_buf: *metal_bridge.Buf,
+    m: usize,
+    k: usize,
+    quant: kernels.QuantType,
+) void {
+    switch (quant) {
+        .q8_0 => seg.matmulQ8_0(out_buf, w_buf, w_offset, in_buf, m, k),
+        .q4_k => seg.matmulQ4_K(out_buf, w_buf, w_offset, in_buf, m, k),
+        .q5_k => seg.matmulQ5_K(out_buf, w_buf, w_offset, in_buf, m, k),
+        .q6_k => seg.matmulQ6_K(out_buf, w_buf, w_offset, in_buf, m, k),
+        else => unreachable, // gated by modelGpuEligible / isGpuEligibleProj
+    }
 }
 
 fn gpuLayerStep(
@@ -283,14 +312,16 @@ fn gpuLayerStep(
 
     // Pre-attn: rmsnorm(xb ← x), QKV projection, RoPE on Q/K.
     seg.rmsnorm(mb.xb.buf, mb.x.buf, mb.weights_buf, mb.weightOffset(layer.attn_norm.bytes), c.dim, c.rms_eps);
-    if (layer.attn_qkv_fused != null and mb.fused_qkv != null and mb.qkv_scratch != null) {
+    const qkv_fused_ready = layer.attn_qkv_fused != null and mb.fused_qkv != null and mb.qkv_scratch != null;
+    if (qkv_fused_ready) {
         // One matmul produces the concatenated [Q | K | V] vector; copies
         // split it back into the per-projection scratch buffers so the
         // existing RoPE / KV-cache / attention path stays unchanged.
+        const fused_t = layer.attn_qkv_fused.?;
         const fused = mb.fused_qkv.?;
-        const qkv_dim = c.n_heads * c.head_dim + 2 * c.n_kv_heads * c.head_dim;
         const scratch = mb.qkv_scratch.?;
-        seg.matmulQ8_0(scratch.buf, fused.buf, fused.byte_offsets[l], mb.xb.buf, qkv_dim, c.dim);
+        const qkv_dim = c.n_heads * c.head_dim + 2 * c.n_kv_heads * c.head_dim;
+        segMatmulQuant(seg, scratch.buf, fused.buf, fused.byte_offsets[l], mb.xb.buf, qkv_dim, c.dim, fused_t.quant);
         const q_floats = c.n_heads * c.head_dim;
         const k_off_bytes = q_floats * @sizeOf(f32);
         const v_off_bytes = (q_floats + kv_dim) * @sizeOf(f32);
@@ -298,9 +329,9 @@ fn gpuLayerStep(
         seg.copy(mb.k_cur.buf, 0, scratch.buf, k_off_bytes, kv_dim);
         seg.copy(mb.v_cur.buf, 0, scratch.buf, v_off_bytes, kv_dim);
     } else {
-        seg.matmulQ8_0(mb.q.buf, mb.weights_buf, mb.weightOffset(layer.attn_q.bytes), mb.xb.buf, c.dim, c.dim);
-        seg.matmulQ8_0(mb.k_cur.buf, mb.weights_buf, mb.weightOffset(layer.attn_k.bytes), mb.xb.buf, kv_dim, c.dim);
-        seg.matmulQ8_0(mb.v_cur.buf, mb.weights_buf, mb.weightOffset(layer.attn_v.bytes), mb.xb.buf, kv_dim, c.dim);
+        segMatmulQuant(seg, mb.q.buf,     mb.weights_buf, mb.weightOffset(layer.attn_q.bytes), mb.xb.buf, c.dim,  c.dim, layer.attn_q.quant);
+        segMatmulQuant(seg, mb.k_cur.buf, mb.weights_buf, mb.weightOffset(layer.attn_k.bytes), mb.xb.buf, kv_dim, c.dim, layer.attn_k.quant);
+        segMatmulQuant(seg, mb.v_cur.buf, mb.weights_buf, mb.weightOffset(layer.attn_v.bytes), mb.xb.buf, kv_dim, c.dim, layer.attn_v.quant);
     }
     seg.rope(mb.q.buf, c.n_heads, c.head_dim, cache.pos, c.rope_base);
     seg.rope(mb.k_cur.buf, c.n_kv_heads, c.head_dim, cache.pos, c.rope_base);
@@ -317,25 +348,27 @@ fn gpuLayerStep(
     seg.attnWeightedSum(mb.attn_out.buf, mb.attn_scores.buf, mb.kv_v.buf, layer_kv_off_bytes, c.n_heads, c.n_kv_heads, c.head_dim, seq_len);
 
     // Post-attn: O proj + residual into x.
-    seg.matmulQ8_0(mb.xb2.buf, mb.weights_buf, mb.weightOffset(layer.attn_o.bytes), mb.attn_out.buf, c.dim, c.dim);
+    segMatmulQuant(seg, mb.xb2.buf, mb.weights_buf, mb.weightOffset(layer.attn_o.bytes), mb.attn_out.buf, c.dim, c.dim, layer.attn_o.quant);
     seg.residualAdd(mb.x.buf, mb.xb2.buf, c.dim);
 
     // FFN: rmsnorm(xb ← x), gate/up matmul, SwiGLU, ffn_down, residual.
     seg.rmsnorm(mb.xb.buf, mb.x.buf, mb.weights_buf, mb.weightOffset(layer.ffn_norm.bytes), c.dim, c.rms_eps);
-    if (layer.ffn_gate_up_fused != null and mb.fused_gate_up != null and mb.gate_up_scratch != null) {
+    const gu_fused_ready = layer.ffn_gate_up_fused != null and mb.fused_gate_up != null and mb.gate_up_scratch != null;
+    if (gu_fused_ready) {
+        const fused_t = layer.ffn_gate_up_fused.?;
         const fused = mb.fused_gate_up.?;
         const scratch = mb.gate_up_scratch.?;
         const gu_dim = 2 * c.ffn_dim;
-        seg.matmulQ8_0(scratch.buf, fused.buf, fused.byte_offsets[l], mb.xb.buf, gu_dim, c.dim);
+        segMatmulQuant(seg, scratch.buf, fused.buf, fused.byte_offsets[l], mb.xb.buf, gu_dim, c.dim, fused_t.quant);
         const up_off_bytes = c.ffn_dim * @sizeOf(f32);
         seg.copy(mb.gate.buf, 0, scratch.buf, 0, c.ffn_dim);
         seg.copy(mb.up.buf, 0, scratch.buf, up_off_bytes, c.ffn_dim);
     } else {
-        seg.matmulQ8_0(mb.gate.buf, mb.weights_buf, mb.weightOffset(layer.ffn_gate.bytes), mb.xb.buf, c.ffn_dim, c.dim);
-        seg.matmulQ8_0(mb.up.buf, mb.weights_buf, mb.weightOffset(layer.ffn_up.bytes), mb.xb.buf, c.ffn_dim, c.dim);
+        segMatmulQuant(seg, mb.gate.buf, mb.weights_buf, mb.weightOffset(layer.ffn_gate.bytes), mb.xb.buf, c.ffn_dim, c.dim, layer.ffn_gate.quant);
+        segMatmulQuant(seg, mb.up.buf,   mb.weights_buf, mb.weightOffset(layer.ffn_up.bytes),   mb.xb.buf, c.ffn_dim, c.dim, layer.ffn_up.quant);
     }
     seg.swiglu(mb.gate.buf, mb.up.buf, c.ffn_dim);
-    seg.matmulQ8_0(mb.ffn_out.buf, mb.weights_buf, mb.weightOffset(layer.ffn_down.bytes), mb.gate.buf, c.dim, c.ffn_dim);
+    segMatmulQuant(seg, mb.ffn_out.buf, mb.weights_buf, mb.weightOffset(layer.ffn_down.bytes), mb.gate.buf, c.dim, c.ffn_dim, layer.ffn_down.quant);
     seg.residualAdd(mb.x.buf, mb.ffn_out.buf, c.dim);
 
     seg.commit() catch return error.UnsupportedWeightType;
@@ -344,7 +377,7 @@ fn gpuLayerStep(
 fn gpuFinalStep(mb: *MetalBackend, m: *const Model, c: model_mod.LlamaConfig) StepError!void {
     const seg = mb.dev.segmentBegin() catch return error.UnsupportedWeightType;
     seg.rmsnorm(mb.x.buf, mb.x.buf, mb.weights_buf, mb.weightOffset(m.output_norm.bytes), c.dim, c.rms_eps);
-    seg.matmulQ8_0(mb.logits.buf, mb.weights_buf, mb.weightOffset(m.output_w.bytes), mb.x.buf, c.vocab_size, c.dim);
+    segMatmulQuant(seg, mb.logits.buf, mb.weights_buf, mb.weightOffset(m.output_w.bytes), mb.x.buf, c.vocab_size, c.dim, m.output_w.quant);
     seg.commit() catch return error.UnsupportedWeightType;
 }
 
@@ -399,13 +432,20 @@ fn matmulRuntime(
         return;
     }
 
-    // GPU fast path: Q8_0 only for now. Other quants stay on CPU.
+    // GPU fast path: Q8_0 + K-quant projections. Other quants stay on CPU.
     // Both `out` and `acts` must alias persistent ScratchBufs so the
     // dispatch can be zero-copy. State.init wires this up when metal is on.
-    if (metal) |mb| if (q == .q8_0) {
+    if (metal) |mb| if (isGpuEligibleProj(q)) {
         const out_buf = mb.scratchForPtr(out.ptr) orelse return error.UnsupportedWeightType;
         const in_buf = mb.scratchForPtr(acts.ptr) orelse return error.UnsupportedWeightType;
-        mb.matmulQ8_0(out_buf, w.bytes, in_buf, m, k) catch return error.UnsupportedWeightType;
+        const rc = switch (q) {
+            .q8_0 => mb.matmulQ8_0(out_buf, w.bytes, in_buf, m, k),
+            .q4_k => mb.matmulQ4_K(out_buf, w.bytes, in_buf, m, k),
+            .q5_k => mb.matmulQ5_K(out_buf, w.bytes, in_buf, m, k),
+            .q6_k => mb.matmulQ6_K(out_buf, w.bytes, in_buf, m, k),
+            else => unreachable,
+        };
+        rc catch return error.UnsupportedWeightType;
         return;
     };
 
