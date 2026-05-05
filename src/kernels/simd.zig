@@ -28,6 +28,39 @@ pub fn dot_f32(a: []const f32, b: []const f32) f32 {
     return sum;
 }
 
+/// Signed-int8 dot product. Multiplies element-wise as i32 and reduces.
+/// On aarch64 with FEAT_DotProd (Apple M1 onward, ARMv8.4-A and later),
+/// the Zig codegen lowers @reduce(.Add) over an `i8 * i8 -> i32` chain
+/// into the `sdot` instruction (one `int32x4_t += int8x16_t · int8x16_t`
+/// in 1 cycle). For `a.len = 32` this is the inner-loop primitive a
+/// future Q8_0 × Q8_0 matmul (activations dynamically quantized to Q8_0)
+/// would build on top of. Today only the kernel-level test + bench
+/// harness exercise it; the runtime matmul pipeline still uses the
+/// f32-act path to avoid the per-call activation-quant cost.
+pub fn dot_i8(a: []const i8, b: []const i8) i32 {
+    std.debug.assert(a.len == b.len);
+    const I8x16 = @Vector(16, i8);
+    const I32x16 = @Vector(16, i32);
+
+    var acc: I32x16 = @splat(0);
+    var i: usize = 0;
+    while (i + 16 <= a.len) : (i += 16) {
+        const va: I8x16 = a[i..][0..16].*;
+        const vb: I8x16 = b[i..][0..16].*;
+        // Widen to i32 before multiply so the codegen sees a chain it can
+        // fold into sdot (otherwise it would generate i8*i8 -> i16 -> i32
+        // sequences and miss the fused instruction).
+        const va_w: I32x16 = @intCast(va);
+        const vb_w: I32x16 = @intCast(vb);
+        acc += va_w * vb_w;
+    }
+    var sum: i32 = @reduce(.Add, acc);
+    while (i < a.len) : (i += 1) {
+        sum += @as(i32, a[i]) * @as(i32, b[i]);
+    }
+    return sum;
+}
+
 fn f16BitsToF32(bits: u16) f32 {
     const h: f16 = @bitCast(bits);
     return @floatCast(h);
@@ -465,6 +498,37 @@ pub fn matmul_ternary158(out: []f32, weights: []const u8, acts: []const f32, m: 
 }
 
 // -- tests ----------------------------------------------------------------
+
+test "dot_i8 matches scalar reference (length divisible by 16)" {
+    var a: [32]i8 = undefined;
+    var b: [32]i8 = undefined;
+    var expected: i32 = 0;
+    for (&a, &b, 0..) |*ai, *bi, idx| {
+        ai.* = @intCast(@as(i32, @intCast(idx)) - 16); // -16..15
+        bi.* = @intCast((@as(i32, @intCast(idx)) * 3) - 47); // mixed signs
+        expected += @as(i32, ai.*) * @as(i32, bi.*);
+    }
+    try std.testing.expectEqual(expected, dot_i8(&a, &b));
+}
+
+test "dot_i8 handles non-multiple-of-16 length via scalar tail" {
+    var a: [19]i8 = undefined;
+    var b: [19]i8 = undefined;
+    var expected: i32 = 0;
+    for (&a, &b, 0..) |*ai, *bi, idx| {
+        ai.* = @intCast(@as(i32, @intCast(idx)) - 9);
+        bi.* = @intCast(@as(i32, @intCast(idx)) + 1);
+        expected += @as(i32, ai.*) * @as(i32, bi.*);
+    }
+    try std.testing.expectEqual(expected, dot_i8(&a, &b));
+}
+
+test "dot_i8 saturation safety: max-magnitude i8 inputs do not overflow i32" {
+    // 32 lanes of (-128 * -128) = 32 * 16384 = 524288 — well below i32 max.
+    var a: [32]i8 = @splat(-128);
+    var b: [32]i8 = @splat(-128);
+    try std.testing.expectEqual(@as(i32, 524288), dot_i8(&a, &b));
+}
 
 test "dot_f32 vector path matches scalar reference" {
     var a: [19]f32 = undefined;
