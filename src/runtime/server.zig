@@ -110,6 +110,7 @@ pub const Server = struct {
         // not change (they live in MTLBuffer storage, not in Server memory),
         // so the aliases held by State remain valid.
         const metal_ptr_init: ?*MetalBackend = if (maybe_metal != null) &maybe_metal.? else null;
+        if (metal_ptr_init) |mb| mb.attachFusedWeights(gpa, &model) catch {};
 
         var state = try forward_mod.State.init(gpa, &model, metal_ptr_init);
         errdefer state.deinit(gpa);

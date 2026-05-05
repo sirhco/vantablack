@@ -283,9 +283,25 @@ fn gpuLayerStep(
 
     // Pre-attn: rmsnorm(xb ← x), QKV projection, RoPE on Q/K.
     seg.rmsnorm(mb.xb.buf, mb.x.buf, mb.weights_buf, mb.weightOffset(layer.attn_norm.bytes), c.dim, c.rms_eps);
-    seg.matmulQ8_0(mb.q.buf, mb.weights_buf, mb.weightOffset(layer.attn_q.bytes), mb.xb.buf, c.dim, c.dim);
-    seg.matmulQ8_0(mb.k_cur.buf, mb.weights_buf, mb.weightOffset(layer.attn_k.bytes), mb.xb.buf, kv_dim, c.dim);
-    seg.matmulQ8_0(mb.v_cur.buf, mb.weights_buf, mb.weightOffset(layer.attn_v.bytes), mb.xb.buf, kv_dim, c.dim);
+    if (layer.attn_qkv_fused != null and mb.fused_qkv != null and mb.qkv_scratch != null) {
+        // One matmul produces the concatenated [Q | K | V] vector; copies
+        // split it back into the per-projection scratch buffers so the
+        // existing RoPE / KV-cache / attention path stays unchanged.
+        const fused = mb.fused_qkv.?;
+        const qkv_dim = c.n_heads * c.head_dim + 2 * c.n_kv_heads * c.head_dim;
+        const scratch = mb.qkv_scratch.?;
+        seg.matmulQ8_0(scratch.buf, fused.buf, fused.byte_offsets[l], mb.xb.buf, qkv_dim, c.dim);
+        const q_floats = c.n_heads * c.head_dim;
+        const k_off_bytes = q_floats * @sizeOf(f32);
+        const v_off_bytes = (q_floats + kv_dim) * @sizeOf(f32);
+        seg.copy(mb.q.buf, 0, scratch.buf, 0, q_floats);
+        seg.copy(mb.k_cur.buf, 0, scratch.buf, k_off_bytes, kv_dim);
+        seg.copy(mb.v_cur.buf, 0, scratch.buf, v_off_bytes, kv_dim);
+    } else {
+        seg.matmulQ8_0(mb.q.buf, mb.weights_buf, mb.weightOffset(layer.attn_q.bytes), mb.xb.buf, c.dim, c.dim);
+        seg.matmulQ8_0(mb.k_cur.buf, mb.weights_buf, mb.weightOffset(layer.attn_k.bytes), mb.xb.buf, kv_dim, c.dim);
+        seg.matmulQ8_0(mb.v_cur.buf, mb.weights_buf, mb.weightOffset(layer.attn_v.bytes), mb.xb.buf, kv_dim, c.dim);
+    }
     seg.rope(mb.q.buf, c.n_heads, c.head_dim, cache.pos, c.rope_base);
     seg.rope(mb.k_cur.buf, c.n_kv_heads, c.head_dim, cache.pos, c.rope_base);
 
@@ -306,8 +322,18 @@ fn gpuLayerStep(
 
     // FFN: rmsnorm(xb ← x), gate/up matmul, SwiGLU, ffn_down, residual.
     seg.rmsnorm(mb.xb.buf, mb.x.buf, mb.weights_buf, mb.weightOffset(layer.ffn_norm.bytes), c.dim, c.rms_eps);
-    seg.matmulQ8_0(mb.gate.buf, mb.weights_buf, mb.weightOffset(layer.ffn_gate.bytes), mb.xb.buf, c.ffn_dim, c.dim);
-    seg.matmulQ8_0(mb.up.buf, mb.weights_buf, mb.weightOffset(layer.ffn_up.bytes), mb.xb.buf, c.ffn_dim, c.dim);
+    if (layer.ffn_gate_up_fused != null and mb.fused_gate_up != null and mb.gate_up_scratch != null) {
+        const fused = mb.fused_gate_up.?;
+        const scratch = mb.gate_up_scratch.?;
+        const gu_dim = 2 * c.ffn_dim;
+        seg.matmulQ8_0(scratch.buf, fused.buf, fused.byte_offsets[l], mb.xb.buf, gu_dim, c.dim);
+        const up_off_bytes = c.ffn_dim * @sizeOf(f32);
+        seg.copy(mb.gate.buf, 0, scratch.buf, 0, c.ffn_dim);
+        seg.copy(mb.up.buf, 0, scratch.buf, up_off_bytes, c.ffn_dim);
+    } else {
+        seg.matmulQ8_0(mb.gate.buf, mb.weights_buf, mb.weightOffset(layer.ffn_gate.bytes), mb.xb.buf, c.ffn_dim, c.dim);
+        seg.matmulQ8_0(mb.up.buf, mb.weights_buf, mb.weightOffset(layer.ffn_up.bytes), mb.xb.buf, c.ffn_dim, c.dim);
+    }
     seg.swiglu(mb.gate.buf, mb.up.buf, c.ffn_dim);
     seg.matmulQ8_0(mb.ffn_out.buf, mb.weights_buf, mb.weightOffset(layer.ffn_down.bytes), mb.gate.buf, c.dim, c.ffn_dim);
     seg.residualAdd(mb.x.buf, mb.ffn_out.buf, c.dim);

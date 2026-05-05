@@ -212,6 +212,7 @@ fn generate(
     };
     defer if (maybe_metal) |*mb| mb.deinit();
     const metal_ptr: ?*vantablack.MetalBackend = if (maybe_metal != null) &maybe_metal.? else null;
+    if (metal_ptr) |mb| mb.attachFusedWeights(gpa, &model) catch {};
 
     var state = try vantablack.forward.State.init(gpa, &model, metal_ptr);
     defer state.deinit(gpa);

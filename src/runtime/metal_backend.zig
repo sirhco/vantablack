@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const build_options = @import("build_options");
 
 const metal = @import("../metal/bridge.zig");
 const model_mod = @import("model.zig");
@@ -25,6 +26,14 @@ pub const ScratchBuf = struct {
     buf: *metal.Buf,
     ptr: [*]f32,
     cap: usize,
+};
+
+/// Per-layer fused-weight pack. `buf` is one shared-storage MTLBuffer
+/// containing every layer's fused tensor concatenated; `byte_offsets[l]` is
+/// where layer `l`'s tensor starts inside that buffer.
+pub const FusedPack = struct {
+    buf: *metal.Buf,
+    byte_offsets: []usize, // len == n_layers
 };
 
 pub const MetalBackend = struct {
@@ -56,6 +65,14 @@ pub const MetalBackend = struct {
     kv_k: ScratchBuf,         // n_layers * max_seq * n_kv_heads * head_dim
     kv_v: ScratchBuf,         // n_layers * max_seq * n_kv_heads * head_dim
     attn_scores: ScratchBuf,  // n_heads * max_seq
+
+    // Optional fused-weight packs + matmul output scratch. Populated by
+    // `attachFusedWeights` when `-Dweight_fusion=true`; null otherwise.
+    fused_qkv: ?FusedPack = null,
+    fused_gate_up: ?FusedPack = null,
+    qkv_scratch: ?ScratchBuf = null,        // (n_heads + 2*n_kv_heads) * head_dim
+    gate_up_scratch: ?ScratchBuf = null,    // 2 * ffn_dim
+    fused_alloc: ?Allocator = null,         // remembers which allocator owns offset arrays
 
     pub fn init(
         allocator: Allocator,
@@ -129,6 +146,16 @@ pub const MetalBackend = struct {
     }
 
     pub fn deinit(self: *MetalBackend) void {
+        if (self.fused_qkv) |p| {
+            self.dev.release(p.buf);
+            if (self.fused_alloc) |a| a.free(p.byte_offsets);
+        }
+        if (self.fused_gate_up) |p| {
+            self.dev.release(p.buf);
+            if (self.fused_alloc) |a| a.free(p.byte_offsets);
+        }
+        if (self.qkv_scratch) |s| self.dev.release(s.buf);
+        if (self.gate_up_scratch) |s| self.dev.release(s.buf);
         self.dev.release(self.attn_scores.buf);
         self.dev.release(self.kv_v.buf);
         self.dev.release(self.kv_k.buf);
@@ -146,6 +173,100 @@ pub const MetalBackend = struct {
         self.dev.release(self.weights_buf);
         self.dev.deinit();
         self.* = undefined;
+    }
+
+    /// Move heap-allocated fused weight bytes from `model` into shared-storage
+    /// MTLBuffers and free the heap copies. After this call,
+    /// `model.layers[l].attn_qkv_fused.?.bytes` aliases GPU memory directly,
+    /// and `model.owned_buffers` is empty.
+    pub fn attachFusedWeights(
+        self: *MetalBackend,
+        allocator: Allocator,
+        model: *model_mod.Model,
+    ) !void {
+        if (!build_options.weight_fusion) return;
+        const cfg = model.config;
+
+        // Pack a single MTLBuffer containing every layer's fused tensor
+        // concatenated. Returns null if no layer has the fused field
+        // populated.
+        const PackKind = enum { qkv, gate_up };
+        const Helpers = struct {
+            fn fusedTensor(lw: *const model_mod.LayerWeights, kind: PackKind) ?model_mod.TypedTensor {
+                return switch (kind) {
+                    .qkv => lw.attn_qkv_fused,
+                    .gate_up => lw.ffn_gate_up_fused,
+                };
+            }
+            fn setFusedTensor(lw: *model_mod.LayerWeights, kind: PackKind, t: model_mod.TypedTensor) void {
+                switch (kind) {
+                    .qkv => lw.attn_qkv_fused = t,
+                    .gate_up => lw.ffn_gate_up_fused = t,
+                }
+            }
+            fn buildPack(
+                dev: metal.Device,
+                alloc: Allocator,
+                layers: []model_mod.LayerWeights,
+                kind: PackKind,
+            ) !?FusedPack {
+                var total: usize = 0;
+                for (layers) |lw| {
+                    if (fusedTensor(&lw, kind)) |t| total += t.bytes.len;
+                }
+                if (total == 0) return null;
+
+                var raw: ?*anyopaque = null;
+                const buf = dev.alloc(total, &raw) catch return error.MetalAllocFailed;
+                errdefer dev.release(buf);
+                const dst: [*]u8 = @ptrCast(@alignCast(raw.?));
+
+                const offsets = try alloc.alloc(usize, layers.len);
+                errdefer alloc.free(offsets);
+
+                var off: usize = 0;
+                for (layers, 0..) |*lw, l| {
+                    if (fusedTensor(lw, kind)) |t| {
+                        offsets[l] = off;
+                        @memcpy(dst[off..][0..t.bytes.len], t.bytes);
+                        // Re-point the model's view at GPU shared memory and
+                        // drop the heap copy below.
+                        var new_t = t;
+                        new_t.bytes = dst[off..][0..t.bytes.len];
+                        setFusedTensor(lw, kind, new_t);
+                        off += t.bytes.len;
+                    } else {
+                        offsets[l] = 0;
+                    }
+                }
+                return .{ .buf = buf, .byte_offsets = offsets };
+            }
+        };
+
+        self.fused_qkv = try Helpers.buildPack(self.dev, allocator, model.layers, .qkv);
+        errdefer if (self.fused_qkv) |p| {
+            self.dev.release(p.buf);
+            allocator.free(p.byte_offsets);
+        };
+        self.fused_gate_up = try Helpers.buildPack(self.dev, allocator, model.layers, .gate_up);
+        errdefer if (self.fused_gate_up) |p| {
+            self.dev.release(p.buf);
+            allocator.free(p.byte_offsets);
+        };
+        self.fused_alloc = allocator;
+
+        if (self.fused_qkv != null) {
+            const qkv_dim = cfg.n_heads * cfg.head_dim + 2 * cfg.n_kv_heads * cfg.head_dim;
+            self.qkv_scratch = try allocScratch(self.dev, qkv_dim);
+        }
+        if (self.fused_gate_up != null) {
+            self.gate_up_scratch = try allocScratch(self.dev, 2 * cfg.ffn_dim);
+        }
+
+        // The MTLBuffer copies are the only copies we need now — drop the
+        // heap originals so we don't keep paying their memory cost.
+        for (model.owned_buffers.items) |b| allocator.free(b);
+        model.owned_buffers.clearRetainingCapacity();
     }
 
     /// Byte offset of `weight_bytes.ptr` inside the wrapped weight buffer.
