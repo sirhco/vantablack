@@ -343,11 +343,15 @@ test "math.gegluApprox: per-element correctness already covered in math.zig" {
 }
 
 fn modelGpuEligible(m: *const Model) bool {
-    // GPU full-forward currently assumes Llama-arch shape: full causal
-    // attention (no sliding window kernel yet), SwiGLU activation, separate
-    // attn / ffn residual blocks. Mistral / Gemma / Phi take the CPU path
-    // until per-arch GPU kernels land.
-    if (m.config.architecture != .llama) return false;
+    // GPU full-forward shape:
+    //   - Llama: full causal attention + SwiGLU
+    //   - Mistral: sliding-window via K/V offset shift, SwiGLU
+    //   - Gemma: full causal attention + GeGLU (gelu_approx kernel)
+    //   - Phi: parallel-block — refused at Model.init, never seen here
+    switch (m.config.architecture) {
+        .llama, .mistral, .gemma => {},
+        .phi => return false,
+    }
     if (m.output_norm.quant != .f32) return false;
     if (!isGpuEligibleProj(m.output_w.quant)) return false;
     for (m.layers) |lw| {
@@ -437,11 +441,19 @@ fn gpuLayerStep(
     seg.copy(mb.kv_v.buf, slot_off_bytes, mb.v_cur.buf, 0, kv_dim);
 
     // GQA self-attention on GPU: scores = Q · Kᵀ * inv_sqrt_hd, softmax,
-    // weighted V sum. No causal mask needed — decode reads exactly the
-    // populated prefix [0, seq_len) out of the cache.
-    seg.attnScores(mb.attn_scores.buf, mb.q.buf, mb.kv_k.buf, layer_kv_off_bytes, c.n_heads, c.n_kv_heads, c.head_dim, seq_len, inv_sqrt_hd);
-    seg.softmaxRows(mb.attn_scores.buf, c.n_heads, c.n_kv_heads, c.head_dim, seq_len);
-    seg.attnWeightedSum(mb.attn_out.buf, mb.attn_scores.buf, mb.kv_v.buf, layer_kv_off_bytes, c.n_heads, c.n_kv_heads, c.head_dim, seq_len);
+    // weighted V sum. Sliding-window attention (Mistral) is implemented by
+    // shifting the K/V cache base offset forward by `window_start` rows and
+    // shortening `seq_len` to `attended_len` — the existing kernels only see
+    // the windowed prefix and have no idea windowing is in play.
+    const window_start: usize = if (c.sliding_window == std.math.maxInt(usize) or cache.pos < c.sliding_window)
+        0
+    else
+        cache.pos - c.sliding_window + 1;
+    const attended_len = seq_len - window_start;
+    const window_off_bytes = layer_kv_off_bytes + window_start * kv_dim * @sizeOf(f32);
+    seg.attnScores(mb.attn_scores.buf, mb.q.buf, mb.kv_k.buf, window_off_bytes, c.n_heads, c.n_kv_heads, c.head_dim, attended_len, inv_sqrt_hd);
+    seg.softmaxRows(mb.attn_scores.buf, c.n_heads, c.n_kv_heads, c.head_dim, attended_len);
+    seg.attnWeightedSum(mb.attn_out.buf, mb.attn_scores.buf, mb.kv_v.buf, window_off_bytes, c.n_heads, c.n_kv_heads, c.head_dim, attended_len);
 
     // Post-attn: O proj + residual into x.
     segMatmulQuant(seg, mb.xb2.buf, mb.weights_buf, mb.weightOffset(layer.attn_o.bytes), mb.attn_out.buf, c.dim, c.dim, layer.attn_o.quant);
@@ -463,7 +475,10 @@ fn gpuLayerStep(
         segMatmulQuant(seg, mb.gate.buf, mb.weights_buf, mb.weightOffset(layer.ffn_gate.bytes), mb.xb.buf, c.ffn_dim, c.dim, layer.ffn_gate.quant);
         segMatmulQuant(seg, mb.up.buf,   mb.weights_buf, mb.weightOffset(layer.ffn_up.bytes),   mb.xb.buf, c.ffn_dim, c.dim, layer.ffn_up.quant);
     }
-    seg.swiglu(mb.gate.buf, mb.up.buf, c.ffn_dim);
+    switch (c.hidden_activation) {
+        .silu => seg.swiglu(mb.gate.buf, mb.up.buf, c.ffn_dim),
+        .gelu_approx => seg.gegluApprox(mb.gate.buf, mb.up.buf, c.ffn_dim),
+    }
     segMatmulQuant(seg, mb.ffn_out.buf, mb.weights_buf, mb.weightOffset(layer.ffn_down.bytes), mb.gate.buf, c.dim, c.ffn_dim, layer.ffn_down.quant);
     seg.residualAdd(mb.x.buf, mb.ffn_out.buf, c.dim);
 

@@ -165,6 +165,22 @@ kernel void swiglu(
     gate[gid] = silu * up[gid];
 }
 
+// GeGLU with tanh-approximate GELU (Gemma): gate[i] = gelu_approx(gate[i]) * up[i].
+// gelu_approx(z) = 0.5 * z * (1 + tanh(sqrt(2/pi) * (z + 0.044715 * z^3)))
+// — matches the math.zig::gegluApprox CPU reference.
+kernel void gelu_approx(
+    device float        *gate    [[buffer(0)]],
+    device const float  *up      [[buffer(1)]],
+    constant LenParams  &p       [[buffer(2)]],
+    uint                 gid     [[thread_position_in_grid]])
+{
+    if (gid >= p.n) return;
+    float z = gate[gid];
+    float inner = 0.7978845608028654f * (z + 0.044715f * z * z * z);
+    float gelu = 0.5f * z * (1.0f + tanh(inner));
+    gate[gid] = gelu * up[gid];
+}
+
 // In-place residual: a[i] += b[i].
 
 kernel void residual_add(
@@ -585,6 +601,7 @@ struct VtbMetalCtx {
     id<MTLComputePipelineState> pso_rmsnorm;
     id<MTLComputePipelineState> pso_rope;
     id<MTLComputePipelineState> pso_swiglu;
+    id<MTLComputePipelineState> pso_gelu_approx;
     id<MTLComputePipelineState> pso_residual;
     id<MTLComputePipelineState> pso_copy;
     id<MTLComputePipelineState> pso_attn_scores;
@@ -629,9 +646,10 @@ VtbMetalCtx *vtb_metal_init(void) {
             @"attn_scores", @"softmax_rows", @"attn_weighted_sum",
             @"matmul_mlx_q4",
             @"matmul_q4_k", @"matmul_q5_k", @"matmul_q6_k",
+            @"gelu_approx",
         };
         const int n_psos = sizeof(names) / sizeof(names[0]);
-        id<MTLComputePipelineState> psos[13] = {nil};
+        id<MTLComputePipelineState> psos[14] = {nil};
         for (int i = 0; i < n_psos; i++) {
             id<MTLFunction> fn = [library newFunctionWithName:names[i]];
             if (!fn) {
@@ -663,6 +681,7 @@ VtbMetalCtx *vtb_metal_init(void) {
         ctx->pso_q4_k = psos[10];
         ctx->pso_q5_k = psos[11];
         ctx->pso_q6_k = psos[12];
+        ctx->pso_gelu_approx = psos[13];
         return ctx;
     }
 }
@@ -685,6 +704,7 @@ void vtb_metal_destroy(VtbMetalCtx *ctx) {
     ctx->pso_q4_k = nil;
     ctx->pso_q5_k = nil;
     ctx->pso_q6_k = nil;
+    ctx->pso_gelu_approx = nil;
     free(ctx);
 }
 
@@ -986,6 +1006,24 @@ void vtb_metal_segment_swiglu(
     NSUInteger tg = 64;
     if (tg > seg->ctx->pso_swiglu.maxTotalThreadsPerThreadgroup)
         tg = seg->ctx->pso_swiglu.maxTotalThreadsPerThreadgroup;
+    [seg->enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+}
+
+void vtb_metal_segment_gelu_approx(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *gate_buf,
+    VtbMetalBuf *up_buf,
+    size_t n)
+{
+    if (!seg) return;
+    [seg->enc setComputePipelineState:seg->ctx->pso_gelu_approx];
+    [seg->enc setBuffer:gate_buf->buffer offset:0 atIndex:0];
+    [seg->enc setBuffer:up_buf->buffer offset:0 atIndex:1];
+    struct LenParams { uint32_t n; } p = { (uint32_t)n };
+    [seg->enc setBytes:&p length:sizeof(p) atIndex:2];
+    NSUInteger tg = 64;
+    if (tg > seg->ctx->pso_gelu_approx.maxTotalThreadsPerThreadgroup)
+        tg = seg->ctx->pso_gelu_approx.maxTotalThreadsPerThreadgroup;
     [seg->enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
 }
 

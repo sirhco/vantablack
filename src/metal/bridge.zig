@@ -41,6 +41,7 @@ const c_api = if (metal_enabled) struct {
     extern "c" fn vtb_metal_segment_rmsnorm(seg: *Seg, out_buf: *Buf, in_buf: *Buf, weight_buf: *Buf, weight_offset: usize, n: usize, eps: f32) void;
     extern "c" fn vtb_metal_segment_rope(seg: *Seg, x_buf: *Buf, n_heads: usize, head_dim: usize, pos: usize, base: f32) void;
     extern "c" fn vtb_metal_segment_swiglu(seg: *Seg, gate_buf: *Buf, up_buf: *Buf, n: usize) void;
+    extern "c" fn vtb_metal_segment_gelu_approx(seg: *Seg, gate_buf: *Buf, up_buf: *Buf, n: usize) void;
     extern "c" fn vtb_metal_segment_residual_add(seg: *Seg, a_buf: *Buf, b_buf: *Buf, n: usize) void;
     extern "c" fn vtb_metal_segment_copy(seg: *Seg, dst_buf: *Buf, dst_offset_bytes: usize, src_buf: *Buf, src_offset_bytes: usize, n_floats: usize) void;
     extern "c" fn vtb_metal_segment_attn_scores(seg: *Seg, scores_buf: *Buf, q_buf: *Buf, k_cache_buf: *Buf, k_offset: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, seq_len: usize, inv_sqrt_hd: f32) void;
@@ -84,6 +85,7 @@ const c_api = if (metal_enabled) struct {
     fn vtb_metal_segment_rmsnorm(_: *Seg, _: *Buf, _: *Buf, _: *Buf, _: usize, _: usize, _: f32) void {}
     fn vtb_metal_segment_rope(_: *Seg, _: *Buf, _: usize, _: usize, _: usize, _: f32) void {}
     fn vtb_metal_segment_swiglu(_: *Seg, _: *Buf, _: *Buf, _: usize) void {}
+    fn vtb_metal_segment_gelu_approx(_: *Seg, _: *Buf, _: *Buf, _: usize) void {}
     fn vtb_metal_segment_residual_add(_: *Seg, _: *Buf, _: *Buf, _: usize) void {}
     fn vtb_metal_segment_copy(_: *Seg, _: *Buf, _: usize, _: *Buf, _: usize, _: usize) void {}
     fn vtb_metal_segment_attn_scores(_: *Seg, _: *Buf, _: *Buf, _: *Buf, _: usize, _: usize, _: usize, _: usize, _: usize, _: f32) void {}
@@ -110,6 +112,7 @@ const vtb_metal_segment_matmul_q8_0 = c_api.vtb_metal_segment_matmul_q8_0;
 const vtb_metal_segment_rmsnorm = c_api.vtb_metal_segment_rmsnorm;
 const vtb_metal_segment_rope = c_api.vtb_metal_segment_rope;
 const vtb_metal_segment_swiglu = c_api.vtb_metal_segment_swiglu;
+const vtb_metal_segment_gelu_approx = c_api.vtb_metal_segment_gelu_approx;
 const vtb_metal_segment_residual_add = c_api.vtb_metal_segment_residual_add;
 const vtb_metal_segment_copy = c_api.vtb_metal_segment_copy;
 const vtb_metal_segment_attn_scores = c_api.vtb_metal_segment_attn_scores;
@@ -218,6 +221,9 @@ pub const Segment = struct {
     }
     pub fn swiglu(self: Segment, gate_buf: *Buf, up_buf: *Buf, n: usize) void {
         vtb_metal_segment_swiglu(self.handle, gate_buf, up_buf, n);
+    }
+    pub fn gegluApprox(self: Segment, gate_buf: *Buf, up_buf: *Buf, n: usize) void {
+        vtb_metal_segment_gelu_approx(self.handle, gate_buf, up_buf, n);
     }
     pub fn residualAdd(self: Segment, a_buf: *Buf, b_buf: *Buf, n: usize) void {
         vtb_metal_segment_residual_add(self.handle, a_buf, b_buf, n);

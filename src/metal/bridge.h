@@ -135,6 +135,13 @@ void vtb_metal_segment_swiglu(
     VtbMetalBuf *up_buf,
     size_t n);
 
+// Gemma activation: gate[i] = gelu_approx(gate[i]) * up[i] in place.
+void vtb_metal_segment_gelu_approx(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *gate_buf,
+    VtbMetalBuf *up_buf,
+    size_t n);
+
 void vtb_metal_segment_residual_add(
     VtbMetalSeg *seg,
     VtbMetalBuf *a_buf,
