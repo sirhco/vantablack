@@ -45,20 +45,21 @@ tax, no framework tax. Just weights and math.
 | Vulkan / cross-vendor GPU                               | not yet              |
 | Prompt prefill batching                                 | not yet              |
 
-The Metal backend covers the full per-layer forward pass when the model is
-all Q8_0 projections + f32 norms (the common TinyLlama / Llama Q8_0 layout).
-On GPU: rmsnorm, QKV matmul, RoPE, KV cache write, GQA attention (scores +
-softmax + weighted V), O matmul, residual, FFN rmsnorm, gate/up matmul,
-SwiGLU, ffn_down, residual, final rmsnorm, LM head matmul. One
-`MTLCommandBuffer` per layer; the CPU only does the embedding gather and the
-sampler. State buffers and the KV cache live in shared-storage `MTLBuffer`s
-that the CPU and GPU read in place — Apple Silicon unified memory means same
-physical pages, no DMA, no copy. Models that don't match the eligibility
-criteria fall back to the per-op path (CPU + GPU Q8_0 matmul only).
+The Metal backend covers the full per-layer forward pass when every
+projection is Q8_0, Q4_K, Q5_K, or Q6_K and every norm is f32 (the common
+TinyLlama / Llama GGUF layout). On GPU: rmsnorm, QKV matmul, RoPE, KV cache
+write, GQA attention (scores + softmax + weighted V), O matmul, residual,
+FFN rmsnorm, gate/up matmul, SwiGLU, ffn_down, residual, final rmsnorm, LM
+head matmul. One `MTLCommandBuffer` per layer, committed asynchronously;
+the CPU only does the embedding gather and the sampler. State buffers and
+the KV cache live in shared-storage `MTLBuffer`s that the CPU and GPU read
+in place — Apple Silicon unified memory means same physical pages, no DMA,
+no copy. Models that don't match the eligibility criteria fall back to the
+per-op path (CPU + GPU per-quant matmul).
 
-**Verified end-to-end** on TinyLlama-1.1B-Chat-v1.0 GGUF Q8_0, Q4_K_M, Q4_K_S
-(ReleaseFast, macOS arm64). Coherent text generation, canonical SentencePiece
-tokenization, EOS-correct chat-template completions.
+**Verified end-to-end** on TinyLlama-1.1B-Chat-v1.0 GGUF Q8_0, Q4_K_M,
+Q4_K_S, Q5_K_S, Q6_K (ReleaseFast, macOS arm64). GPU output bit-equal to
+CPU-only build across all five quants on a 64-token greedy decode.
 
 ### MLX-format models — end-to-end
 
@@ -138,31 +139,41 @@ Caveats / not-yet:
 
 ## Performance
 
-TinyLlama-1.1B-Chat-v1.0 Q8_0 on macOS arm64 (M-series), ReleaseFast,
+TinyLlama-1.1B-Chat-v1.0 on macOS arm64 (M-series), ReleaseFast,
 128-token decode, warm caches:
 
-| Build                  | tok/s | Wall (128 tok) | Notes                                          |
-|------------------------|-------|----------------|------------------------------------------------|
-| CPU `--threads 16`     | 45    | 2.85s          | All cores pinned; max CPU throughput           |
-| CPU default (~8)       | 28    | 4.57s          | Half cores; default                            |
-| **Metal full forward** | **~65** | **1.96s**    | **All layer ops on GPU; one cmd buffer/layer** |
+| Build                                  | Quant   | tok/s | Wall (128 tok) | Notes                                                    |
+|----------------------------------------|---------|-------|----------------|----------------------------------------------------------|
+| CPU `--threads 16`                     | Q8_0    | 45    | 2.85s          | All cores pinned; max CPU throughput                     |
+| CPU default (~8)                       | Q8_0    | 28    | 4.57s          | Half cores; default                                      |
+| Metal full forward (pre-async)         | Q8_0    | ~65   | 1.96s          | One cmd buffer / layer, per-layer waitUntilCompleted     |
+| **Metal async + fusion**               | Q8_0    | **93** | **1.38s**      | **Async segment commit + `-Dweight_fusion=true`**        |
+| Metal full forward                     | Q4_K_M  | 102   | 1.25s          | K-quant kernels online                                    |
+| Metal full forward                     | Q4_K_S  | 108   | 1.18s          | Smallest K-quant variant                                  |
+| Metal full forward                     | Q5_K_S  | 94    | 1.36s          |                                                           |
+| Metal full forward                     | Q6_K    | 79    | 1.62s          | Heaviest unpack of the K-quant family                    |
 
-**The headline win:** `-Dmetal=true` runs the inference on the GPU while
-the CPU thread pool sits at 1 worker. Fan stays off, foreground work stays
-responsive, throughput **~45% above** the all-cores-pinned CPU build.
+**The headline wins:**
+1. `-Dmetal=true` runs the inference on the GPU while the CPU thread pool
+   sits at 1 worker. Fan stays off, foreground work stays responsive.
+2. Phase 1 of the GPU push (async segment commit + Q/K/V and gate/up
+   weight fusion under `-Dweight_fusion=true`) lifts Q8_0 throughput
+   from ~65 to ~93 tok/s — a **1.43× speedup** with byte-equal output.
+3. Phase 2 lit up Q4_K / Q5_K / Q6_K kernels on the GPU full-forward path.
+   Q4_K_M decodes ~12% faster than Q8_0 thanks to halved weight
+   bandwidth; Q4_K_S even more so.
 
 With Metal enabled the default is `--threads 1` because additional CPU
 workers just spin on GPU sync; the only per-token CPU work is the embedding
 gather and the sampler.
 
-vantablack now lands inside llama.cpp's typical Q8_0 range (~50-100 tok/s
-on the same hardware). The matmul kernel is at the hardware's effective
+vantablack now lands at the upper end of llama.cpp's typical Q8_0 / Q4_K_M
+range on the same hardware. The matmul kernel is at the hardware's effective
 limit for GEMV at this model scale (three kernel-rewrite experiments —
 threadgroup-shared activation tiling, multi-row-per-thread, simdgroup-per-
 row with `simd_sum` — all matched the simple per-thread per-row kernel
-within noise). Further gains beyond ~65 tok/s require async pipelining
-across layers, weight fusion (QKV / gate-up), or token batching for
-prefill — see roadmap.
+within noise). Further gains beyond this require token batching for prefill
+or sub-32-elem block layouts — see roadmap.
 
 ---
 
