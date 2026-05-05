@@ -36,6 +36,12 @@ pub const Flavor = enum {
     byte_level,
 };
 
+/// Pre-tokenizer regex flavor for the byte-level path. GPT-2 splits text
+/// purely by Unicode category. Llama-3 / cl100k_base adds case-insensitive
+/// contractions, leading-non-LN binding before letters, 1-3 digit chunking,
+/// and the `\s+(?!\S)` whitespace peel.
+pub const ByteSplit = enum { gpt2, llama3 };
+
 pub const Tokenizer = struct {
     /// Slice of pieces, one per token id. Each piece is a slice into the mmap
     /// region (zero-copy).
@@ -47,6 +53,7 @@ pub const Tokenizer = struct {
     bos: u32,
     eos: u32,
     flavor: Flavor = .sentencepiece,
+    byte_split: ByteSplit = .gpt2,
 
     pub fn init(allocator: Allocator, catalog: parser.Catalog) TokenizerError!Tokenizer {
         const tokens_v = findValue(catalog, "tokenizer.ggml.tokens") orelse
@@ -247,7 +254,10 @@ pub const Tokenizer = struct {
 
         var splits: std.ArrayList(byte_level_bpe.Span) = .empty;
         defer splits.deinit(allocator);
-        byte_level_bpe.splitGpt2(text, &splits, allocator) catch return error.InvalidUtf8;
+        switch (self.byte_split) {
+            .gpt2 => byte_level_bpe.splitGpt2(text, &splits, allocator) catch return error.InvalidUtf8,
+            .llama3 => byte_level_bpe.splitLlama3(text, &splits, allocator) catch return error.InvalidUtf8,
+        }
 
         var mapped: std.ArrayList(u8) = .empty;
         defer mapped.deinit(allocator);
@@ -427,9 +437,13 @@ pub const Tokenizer = struct {
         // Detect tokenizer flavor from pre_tokenizer.type. ByteLevel (raw
         // or nested in a Sequence) → byte-level pipeline; everything else
         // (default, Metaspace, etc.) keeps the SentencePiece path.
+        // Also sniff for the cl100k_base contraction signature in any
+        // nested Split's regex pattern → use splitLlama3.
         var flavor: Flavor = .sentencepiece;
+        var byte_split: ByteSplit = .gpt2;
         if (root.object.get("pre_tokenizer")) |pt_v| {
             flavor = detectFlavor(pt_v);
+            byte_split = detectByteSplit(pt_v);
         }
 
         // added_tokens override (e.g., `<unk>`, `<s>`, `</s>`).
@@ -502,6 +516,7 @@ pub const Tokenizer = struct {
             .bos = bos,
             .eos = eos,
             .flavor = flavor,
+            .byte_split = byte_split,
         };
     }
 
@@ -622,6 +637,39 @@ fn findValue(catalog: parser.Catalog, key: []const u8) ?parser.MetaValue {
     return null;
 }
 
+/// Walk a `pre_tokenizer` JSON node looking for a Split with the cl100k
+/// contraction signature (`'s|'t|'re`). Returns `.llama3` when found, else
+/// `.gpt2`. Reliable across the cl100k variants shipped by Qwen2 / Llama-3
+/// / Mistral-NeMo since they all carry the same regex byte-for-byte.
+fn detectByteSplit(node: std.json.Value) ByteSplit {
+    switch (node) {
+        .object => |obj| {
+            if (obj.get("type")) |t_v| {
+                if (t_v == .string and std.mem.eql(u8, t_v.string, "Split")) {
+                    if (obj.get("pattern")) |pat_v| {
+                        if (pat_v == .object) {
+                            if (pat_v.object.get("Regex")) |r_v| {
+                                if (r_v == .string and std.mem.indexOf(u8, r_v.string, "'s|'t|'re") != null) {
+                                    return .llama3;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (obj.get("pretokenizers")) |inner| {
+                if (inner == .array) {
+                    for (inner.array.items) |child| {
+                        if (detectByteSplit(child) == .llama3) return .llama3;
+                    }
+                }
+            }
+        },
+        else => {},
+    }
+    return .gpt2;
+}
+
 /// Walk a `pre_tokenizer` JSON node looking for a `ByteLevel` type marker
 /// — either as a leaf or nested in a Sequence/list. Returns `.byte_level`
 /// when found, `.sentencepiece` otherwise.
@@ -735,6 +783,25 @@ test "detectFlavor: Sequence with ByteLevel inner → byte_level" {
     defer arena.deinit();
     const v = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json_byte, .{});
     try std.testing.expectEqual(Flavor.byte_level, detectFlavor(v));
+}
+
+test "detectByteSplit: cl100k regex in nested Split → llama3" {
+    const json_byte =
+        "{\"type\":\"Sequence\",\"pretokenizers\":[" ++
+        "{\"type\":\"Split\",\"pattern\":{\"Regex\":\"(?i:'s|'t|'re)|...\"}}," ++
+        "{\"type\":\"ByteLevel\"}]}";
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json_byte, .{});
+    try std.testing.expectEqual(ByteSplit.llama3, detectByteSplit(v));
+}
+
+test "detectByteSplit: GPT-2 ByteLevel without cl100k regex → gpt2" {
+    const json_byte = "{\"type\":\"ByteLevel\",\"add_prefix_space\":false}";
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json_byte, .{});
+    try std.testing.expectEqual(ByteSplit.gpt2, detectByteSplit(v));
 }
 
 test "detectFlavor: Metaspace → sentencepiece" {
