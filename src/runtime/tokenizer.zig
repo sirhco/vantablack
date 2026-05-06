@@ -457,6 +457,12 @@ pub const Tokenizer = struct {
                     const content_v = entry.object.get("content") orelse continue;
                     if (id_v != .integer or content_v != .string) continue;
                     const id_us: usize = @intCast(id_v.integer);
+                    // Free any vocab-derived dupe at this id before overwriting:
+                    // added_tokens like `<s>` / `</s>` / `<unk>` shadow the
+                    // earlier vocab entry, and skipping the free leaks N
+                    // tokens worth of memory per call (caught by DebugAllocator
+                    // in the integration test).
+                    if (pieces[id_us].len > 0) allocator.free(pieces[id_us]);
                     pieces[id_us] = try allocator.dupe(u8, content_v.string);
                     if (std.mem.eql(u8, content_v.string, "<s>")) bos = @intCast(id_us);
                     if (std.mem.eql(u8, content_v.string, "</s>")) eos = @intCast(id_us);
@@ -525,6 +531,9 @@ pub const Tokenizer = struct {
     /// would leak). Use this when the Tokenizer was built with
     /// `initFromHfJson`.
     pub fn deinitOwnedPieces(self: *Tokenizer, allocator: Allocator) void {
+        // Pieces with len == 0 are the static "" literal placed at vocab
+        // gaps in `initFromHfJson`; freeing them would be UB. Only free the
+        // non-empty entries that actually came from `allocator.dupe`.
         for (self.pieces) |p| {
             if (p.len > 0) allocator.free(p);
         }

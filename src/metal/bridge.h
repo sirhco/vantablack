@@ -182,6 +182,51 @@ void vtb_metal_segment_attn_weighted_sum(
     VtbMetalBuf *v_cache_buf, size_t v_cache_offset_bytes,
     size_t n_heads, size_t n_kv_heads, size_t head_dim, size_t seq_len);
 
+// MLX-format 4-bit affine block-quant matmul. Weight, scales, and biases
+// may live in different MTLBuffers (different safetensors shards), so the
+// dispatch takes one buffer + byte offset per tensor.
+//
+//   out_buf:           shared-storage scratch, m floats
+//   weight_buf,off:    packed U32 nibbles, m * (k/8) u32s (m * k/2 bytes)
+//   scales_buf,off:    F16 or BF16 scales, m * (k/group_size) entries
+//   biases_buf,off:    same layout as scales, F16 or BF16
+//   acts_buf,off:      k floats
+//   m, k:              dims
+//   group_size:        quant group (typically 64)
+//   scale_dtype_is_bf16: 0 = f16, 1 = bf16
+//
+// Metal compute encoders require setBuffer:offset: to be 4-byte aligned, but
+// safetensors data sections begin at `8 + json_header_len` and the JSON
+// header length is rarely a multiple of 4 — so absolute tensor offsets are
+// commonly 1 or 3 mod 4. The wrapper snaps each offset down to the nearest
+// 4-byte boundary (`& ~3`) for the bind, then passes the 0..3-byte residual
+// through MlxQ4Params.{w,scales,biases}_offset_bytes; the kernel adds the
+// residual back in via byte-wise pointer arithmetic. The acts buffer is f32
+// scratch and is always 4-byte aligned, so it's bound at its raw offset.
+void vtb_metal_segment_matmul_mlx_q4(
+    VtbMetalSeg *seg,
+    VtbMetalBuf *out_buf,
+    VtbMetalBuf *weight_buf, size_t weight_offset,
+    VtbMetalBuf *scales_buf, size_t scales_offset,
+    VtbMetalBuf *biases_buf, size_t biases_offset,
+    VtbMetalBuf *acts_buf,   size_t acts_offset,
+    size_t m, size_t k,
+    uint32_t group_size,
+    uint32_t scale_dtype_is_bf16);
+
+// One-shot variant of vtb_metal_segment_matmul_mlx_q4: builds, commits, and
+// waits on its own command buffer. Returns 0 on success, nonzero on failure.
+int vtb_metal_matmul_mlx_q4(
+    VtbMetalCtx *ctx,
+    VtbMetalBuf *out_buf,
+    VtbMetalBuf *weight_buf, size_t weight_offset,
+    VtbMetalBuf *scales_buf, size_t scales_offset,
+    VtbMetalBuf *biases_buf, size_t biases_offset,
+    VtbMetalBuf *acts_buf,   size_t acts_offset,
+    size_t m, size_t k,
+    uint32_t group_size,
+    uint32_t scale_dtype_is_bf16);
+
 #ifdef __cplusplus
 }
 #endif

@@ -117,12 +117,13 @@ What ships:
   ```
 
 Caveats / not-yet:
-- **MLX 4-bit on GPU**: the MSL kernel `matmul_mlx_q4` is compiled into
-  the runtime when `-Dmetal=true` is set, but `forward.zig` still routes
-  MLX-Q4 layers to the CPU implementation. Reaching the GPU path requires
-  threading `HfBundle` shards through `MetalBackend` so each shard's mmap
-  is wrapped as its own `MTLBuffer` (currently only the GGUF mmap is
-  wrapped). Q8_0-GGUF models keep getting full GPU acceleration unchanged.
+- **MLX 4-bit on GPU**: matmul ops dispatch to the GPU when `-Dmetal=true`
+  is set. Per-shard `MTLBuffer` wrapping handles multi-file safetensors
+  bundles. Verified bit-equal to the CPU baseline on TinyLlama-1.1B-MLX-4bit.
+  **Not yet on GPU for MLX models**: rmsnorm, RoPE, attention, residual,
+  SwiGLU — those still run on the CPU per matmul, so the GPU win is
+  matmul-only. Full-forward GPU (one MTLCommandBuffer per layer) for MLX
+  models needs MLX-aware versions of the segment-API kernels — separate plan.
 - **MLX bit widths**: 2/3/4/5/6/8 are all dispatched correctly on CPU
   (`kernels/mlx.zig::matmul`). End-to-end verification on a real model is
   done for 4-bit only; the other widths are covered by unit tests.
@@ -175,6 +176,23 @@ threadgroup-shared activation tiling, multi-row-per-thread, simdgroup-per-
 row with `simd_sum` — all matched the simple per-thread per-row kernel
 within noise). Further gains beyond this require token batching for prefill
 or sub-32-elem block layouts — see roadmap.
+
+### MLX 4-bit (matmul-only GPU)
+
+TinyLlama-1.1B-Chat-v1.0 MLX-4bit on the same hardware, 128-token decode,
+greedy, warm caches:
+
+| Build              | tok/s | Wall (128 tok) | Notes                                                  |
+|--------------------|-------|----------------|--------------------------------------------------------|
+| CPU (autodetect)   | ~3.8  | 33.7s          | All MLX-Q4 matmuls on CPU; ~half-cores worker pool     |
+| **Metal GPU**      | **~22.9** | **5.6s**   | **MLX-Q4 matmul on GPU; everything else on CPU**       |
+
+Output is bit-equal between the two builds. The GPU win here is
+matmul-only — rmsnorm, RoPE, attention, residual, and SwiGLU still run on
+the CPU per matmul, so each layer pays a host↔device sync per matmul.
+Full-forward GPU (one `MTLCommandBuffer` per layer, the GGUF Q8_0 path) is
+not yet wired for MLX models; doing it requires MLX-aware versions of the
+segment-API kernels.
 
 ---
 
@@ -588,17 +606,15 @@ root cause: pure CPU matmul saturates every core. The fixes:
     decode rate).
 12. **MLX model loader (full integration)** — *shipped*. End-to-end
     inference on `mlx-community/*` Llama-1/2-family 4-bit models, verified
-    bit-perfect against `mlx_lm`. 2/3/5/6/8-bit MLX kernels also shipped
-    (CPU). Multi-shard safetensors directory loading shipped + tested.
-    The MLX-Q4 MSL kernel (`matmul_mlx_q4`) is compiled at startup when
-    `-Dmetal=true`; runtime dispatch from `forward.zig` to the GPU is the
-    last bit needed to put MLX models on Metal. Tiktoken-style tokenizer
-    for Llama 3+ / GPT-2-family is the only remaining piece for broader
-    MLX-community coverage.
-12. **Apple AMX matrix coprocessor** — *planned*. M1/M2/M3 ship a hidden
+    bit-perfect against `mlx_lm` (CPU) and bit-equal CPU vs GPU on
+    TinyLlama-1.1B-MLX-4bit. 2/3/5/6/8-bit MLX kernels shipped on CPU;
+    4-bit also shipped on Metal GPU. Multi-shard safetensors directory
+    loading shipped + tested. Tiktoken-style tokenizer for Llama 3+ /
+    GPT-2-family remains the next piece for broader MLX-community coverage.
+13. **Apple AMX matrix coprocessor** — *planned*. M1/M2/M3 ship a hidden
     matrix unit accessible via inline assembly. Pure-Zig + lower power
     than even GPU for some shapes. Useful as a CPU-only fallback path.
-13. **NEON `sdot` int8 dot** — *planned*. ARMv8.2-A dedicated dot-product
+14. **NEON `sdot` int8 dot** — *planned*. ARMv8.2-A dedicated dot-product
     instruction. Modest CPU-path speedup, no FFI needed.
 
 Items 8 + 9 + 10 are the next perf pushes. Item 7's negative result

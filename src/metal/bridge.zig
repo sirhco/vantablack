@@ -47,6 +47,38 @@ const c_api = if (metal_enabled) struct {
     extern "c" fn vtb_metal_segment_attn_scores(seg: *Seg, scores_buf: *Buf, q_buf: *Buf, k_cache_buf: *Buf, k_offset: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, seq_len: usize, inv_sqrt_hd: f32) void;
     extern "c" fn vtb_metal_segment_softmax_rows(seg: *Seg, scores_buf: *Buf, n_heads: usize, n_kv_heads: usize, head_dim: usize, seq_len: usize) void;
     extern "c" fn vtb_metal_segment_attn_weighted_sum(seg: *Seg, out_buf: *Buf, scores_buf: *Buf, v_cache_buf: *Buf, v_offset: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, seq_len: usize) void;
+    extern "c" fn vtb_metal_matmul_mlx_q4(
+        ctx: *Ctx,
+        out_buf: *Buf,
+        w_buf: *Buf,
+        w_offset: usize,
+        s_buf: *Buf,
+        s_offset: usize,
+        b_buf: *Buf,
+        b_offset: usize,
+        a_buf: *Buf,
+        a_offset: usize,
+        m: usize,
+        k: usize,
+        group_size: u32,
+        scale_dtype_is_bf16: u32,
+    ) c_int;
+    extern "c" fn vtb_metal_segment_matmul_mlx_q4(
+        seg: *Seg,
+        out_buf: *Buf,
+        w_buf: *Buf,
+        w_offset: usize,
+        s_buf: *Buf,
+        s_offset: usize,
+        b_buf: *Buf,
+        b_offset: usize,
+        a_buf: *Buf,
+        a_offset: usize,
+        m: usize,
+        k: usize,
+        group_size: u32,
+        scale_dtype_is_bf16: u32,
+    ) void;
 } else struct {
     fn vtb_metal_init() ?*Ctx {
         return null;
@@ -91,6 +123,40 @@ const c_api = if (metal_enabled) struct {
     fn vtb_metal_segment_attn_scores(_: *Seg, _: *Buf, _: *Buf, _: *Buf, _: usize, _: usize, _: usize, _: usize, _: usize, _: f32) void {}
     fn vtb_metal_segment_softmax_rows(_: *Seg, _: *Buf, _: usize, _: usize, _: usize, _: usize) void {}
     fn vtb_metal_segment_attn_weighted_sum(_: *Seg, _: *Buf, _: *Buf, _: *Buf, _: usize, _: usize, _: usize, _: usize, _: usize) void {}
+    fn vtb_metal_matmul_mlx_q4(
+        _: *Ctx,
+        _: *Buf,
+        _: *Buf,
+        _: usize,
+        _: *Buf,
+        _: usize,
+        _: *Buf,
+        _: usize,
+        _: *Buf,
+        _: usize,
+        _: usize,
+        _: usize,
+        _: u32,
+        _: u32,
+    ) c_int {
+        return 1;
+    }
+    fn vtb_metal_segment_matmul_mlx_q4(
+        _: *Seg,
+        _: *Buf,
+        _: *Buf,
+        _: usize,
+        _: *Buf,
+        _: usize,
+        _: *Buf,
+        _: usize,
+        _: *Buf,
+        _: usize,
+        _: usize,
+        _: usize,
+        _: u32,
+        _: u32,
+    ) void {}
 };
 
 const vtb_metal_init = c_api.vtb_metal_init;
@@ -118,6 +184,8 @@ const vtb_metal_segment_copy = c_api.vtb_metal_segment_copy;
 const vtb_metal_segment_attn_scores = c_api.vtb_metal_segment_attn_scores;
 const vtb_metal_segment_softmax_rows = c_api.vtb_metal_segment_softmax_rows;
 const vtb_metal_segment_attn_weighted_sum = c_api.vtb_metal_segment_attn_weighted_sum;
+const vtb_metal_matmul_mlx_q4 = c_api.vtb_metal_matmul_mlx_q4;
+const vtb_metal_segment_matmul_mlx_q4 = c_api.vtb_metal_segment_matmul_mlx_q4;
 
 pub const InitError = error{MetalUnavailable};
 pub const AllocError = error{MetalAllocFailed};
