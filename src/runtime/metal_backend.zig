@@ -45,6 +45,26 @@ pub const FusedPack = struct {
     byte_offsets: []usize, // len == n_layers
 };
 
+/// One page-aligned mmap region to register with the GPU as a no-copy
+/// MTLBuffer. Multi-shard HF/MLX bundles supply one of these per shard.
+pub const ShardInput = struct {
+    bytes: []const u8,
+};
+
+/// One wrapped MTLBuffer plus the host-pointer extents that resolve to it.
+pub const WeightShard = struct {
+    buf: *metal.Buf,
+    base: [*]const u8,
+    len: usize,
+};
+
+/// Result of `resolveWeight`: which shard a host pointer belongs to and the
+/// byte offset within that shard's wrapped buffer.
+pub const WeightLoc = struct {
+    buf: *metal.Buf,
+    offset: usize,
+};
+
 pub const MetalBackend = struct {
     dev: metal.Device,
 
@@ -205,7 +225,7 @@ pub const MetalBackend = struct {
         };
     }
 
-    pub fn deinit(self: *MetalBackend) void {
+    pub fn deinit(self: *MetalBackend, allocator: Allocator) void {
         if (self.fused_qkv) |p| {
             self.dev.release(p.buf);
             if (self.fused_alloc) |a| a.free(p.byte_offsets);
@@ -234,6 +254,26 @@ pub const MetalBackend = struct {
         allocator.free(self.weight_shards);
         self.dev.deinit();
         self.* = undefined;
+    }
+
+    /// Linear-scan the registered shards and return the one containing
+    /// `host_ptr`, or null if it lies outside every shard.
+    pub fn resolveWeight(self: *const MetalBackend, host_ptr: [*]const u8) ?WeightLoc {
+        const p = @intFromPtr(host_ptr);
+        for (self.weight_shards) |sh| {
+            const base = @intFromPtr(sh.base);
+            if (p >= base and p < base + sh.len) {
+                return .{ .buf = sh.buf, .offset = p - base };
+            }
+        }
+        return null;
+    }
+
+    /// Legacy single-shard accessor for the GGUF forward path. Asserts there
+    /// is at least one shard registered.
+    pub fn weightsBuf(self: *const MetalBackend) *metal.Buf {
+        std.debug.assert(self.weight_shards.len >= 1);
+        return self.weight_shards[0].buf;
     }
 
     /// Move heap-allocated fused weight bytes from `model` into shared-storage
@@ -400,17 +440,17 @@ pub const MetalBackend = struct {
     pub fn matmulQ4_K(self: *MetalBackend, out_buf: *ScratchBuf, weight_bytes: []const u8, in_buf: *const ScratchBuf, m: usize, k: usize) !void {
         std.debug.assert(m <= out_buf.cap);
         std.debug.assert(k <= in_buf.cap);
-        try self.dev.matmulQ4_K(out_buf.buf, self.weights_buf, self.weightOffset(weight_bytes), in_buf.buf, m, k);
+        try self.dev.matmulQ4_K(out_buf.buf, self.weightsBuf(), self.weightOffset(weight_bytes), in_buf.buf, m, k);
     }
     pub fn matmulQ5_K(self: *MetalBackend, out_buf: *ScratchBuf, weight_bytes: []const u8, in_buf: *const ScratchBuf, m: usize, k: usize) !void {
         std.debug.assert(m <= out_buf.cap);
         std.debug.assert(k <= in_buf.cap);
-        try self.dev.matmulQ5_K(out_buf.buf, self.weights_buf, self.weightOffset(weight_bytes), in_buf.buf, m, k);
+        try self.dev.matmulQ5_K(out_buf.buf, self.weightsBuf(), self.weightOffset(weight_bytes), in_buf.buf, m, k);
     }
     pub fn matmulQ6_K(self: *MetalBackend, out_buf: *ScratchBuf, weight_bytes: []const u8, in_buf: *const ScratchBuf, m: usize, k: usize) !void {
         std.debug.assert(m <= out_buf.cap);
         std.debug.assert(k <= in_buf.cap);
-        try self.dev.matmulQ6_K(out_buf.buf, self.weights_buf, self.weightOffset(weight_bytes), in_buf.buf, m, k);
+        try self.dev.matmulQ6_K(out_buf.buf, self.weightsBuf(), self.weightOffset(weight_bytes), in_buf.buf, m, k);
     }
 
     /// Returns the ScratchBuf whose shared-storage pointer matches `p`, or

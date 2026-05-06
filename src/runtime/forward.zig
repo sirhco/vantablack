@@ -411,7 +411,7 @@ fn gpuLayerStep(
     const seg = mb.dev.segmentBegin() catch return error.UnsupportedWeightType;
 
     // Pre-attn: rmsnorm(xb ← x), QKV projection, RoPE on Q/K.
-    seg.rmsnorm(mb.xb.buf, mb.x.buf, mb.weights_buf, mb.weightOffset(layer.attn_norm.bytes), c.dim, c.rms_eps);
+    seg.rmsnorm(mb.xb.buf, mb.x.buf, mb.weightsBuf(), mb.weightOffset(layer.attn_norm.bytes), c.dim, c.rms_eps);
     const qkv_fused_ready = layer.attn_qkv_fused != null and mb.fused_qkv != null and mb.qkv_scratch != null;
     if (qkv_fused_ready) {
         // One matmul produces the concatenated [Q | K | V] vector; copies
@@ -429,9 +429,9 @@ fn gpuLayerStep(
         seg.copy(mb.k_cur.buf, 0, scratch.buf, k_off_bytes, kv_dim);
         seg.copy(mb.v_cur.buf, 0, scratch.buf, v_off_bytes, kv_dim);
     } else {
-        segMatmulQuant(seg, mb.q.buf,     mb.weights_buf, mb.weightOffset(layer.attn_q.bytes), mb.xb.buf, c.dim,  c.dim, layer.attn_q.quant);
-        segMatmulQuant(seg, mb.k_cur.buf, mb.weights_buf, mb.weightOffset(layer.attn_k.bytes), mb.xb.buf, kv_dim, c.dim, layer.attn_k.quant);
-        segMatmulQuant(seg, mb.v_cur.buf, mb.weights_buf, mb.weightOffset(layer.attn_v.bytes), mb.xb.buf, kv_dim, c.dim, layer.attn_v.quant);
+        segMatmulQuant(seg, mb.q.buf,     mb.weightsBuf(), mb.weightOffset(layer.attn_q.bytes), mb.xb.buf, c.dim,  c.dim, layer.attn_q.quant);
+        segMatmulQuant(seg, mb.k_cur.buf, mb.weightsBuf(), mb.weightOffset(layer.attn_k.bytes), mb.xb.buf, kv_dim, c.dim, layer.attn_k.quant);
+        segMatmulQuant(seg, mb.v_cur.buf, mb.weightsBuf(), mb.weightOffset(layer.attn_v.bytes), mb.xb.buf, kv_dim, c.dim, layer.attn_v.quant);
     }
     seg.rope(mb.q.buf, c.n_heads, c.head_dim, cache.pos, c.rope_base);
     seg.rope(mb.k_cur.buf, c.n_kv_heads, c.head_dim, cache.pos, c.rope_base);
@@ -456,11 +456,11 @@ fn gpuLayerStep(
     seg.attnWeightedSum(mb.attn_out.buf, mb.attn_scores.buf, mb.kv_v.buf, window_off_bytes, c.n_heads, c.n_kv_heads, c.head_dim, attended_len);
 
     // Post-attn: O proj + residual into x.
-    segMatmulQuant(seg, mb.xb2.buf, mb.weights_buf, mb.weightOffset(layer.attn_o.bytes), mb.attn_out.buf, c.dim, c.dim, layer.attn_o.quant);
+    segMatmulQuant(seg, mb.xb2.buf, mb.weightsBuf(), mb.weightOffset(layer.attn_o.bytes), mb.attn_out.buf, c.dim, c.dim, layer.attn_o.quant);
     seg.residualAdd(mb.x.buf, mb.xb2.buf, c.dim);
 
     // FFN: rmsnorm(xb ← x), gate/up matmul, SwiGLU, ffn_down, residual.
-    seg.rmsnorm(mb.xb.buf, mb.x.buf, mb.weights_buf, mb.weightOffset(layer.ffn_norm.bytes), c.dim, c.rms_eps);
+    seg.rmsnorm(mb.xb.buf, mb.x.buf, mb.weightsBuf(), mb.weightOffset(layer.ffn_norm.bytes), c.dim, c.rms_eps);
     const gu_fused_ready = layer.ffn_gate_up_fused != null and mb.fused_gate_up != null and mb.gate_up_scratch != null;
     if (gu_fused_ready) {
         const fused_t = layer.ffn_gate_up_fused.?;
@@ -472,14 +472,14 @@ fn gpuLayerStep(
         seg.copy(mb.gate.buf, 0, scratch.buf, 0, c.ffn_dim);
         seg.copy(mb.up.buf, 0, scratch.buf, up_off_bytes, c.ffn_dim);
     } else {
-        segMatmulQuant(seg, mb.gate.buf, mb.weights_buf, mb.weightOffset(layer.ffn_gate.bytes), mb.xb.buf, c.ffn_dim, c.dim, layer.ffn_gate.quant);
-        segMatmulQuant(seg, mb.up.buf,   mb.weights_buf, mb.weightOffset(layer.ffn_up.bytes),   mb.xb.buf, c.ffn_dim, c.dim, layer.ffn_up.quant);
+        segMatmulQuant(seg, mb.gate.buf, mb.weightsBuf(), mb.weightOffset(layer.ffn_gate.bytes), mb.xb.buf, c.ffn_dim, c.dim, layer.ffn_gate.quant);
+        segMatmulQuant(seg, mb.up.buf,   mb.weightsBuf(), mb.weightOffset(layer.ffn_up.bytes),   mb.xb.buf, c.ffn_dim, c.dim, layer.ffn_up.quant);
     }
     switch (c.hidden_activation) {
         .silu => seg.swiglu(mb.gate.buf, mb.up.buf, c.ffn_dim),
         .gelu_approx => seg.gegluApprox(mb.gate.buf, mb.up.buf, c.ffn_dim),
     }
-    segMatmulQuant(seg, mb.ffn_out.buf, mb.weights_buf, mb.weightOffset(layer.ffn_down.bytes), mb.gate.buf, c.dim, c.ffn_dim, layer.ffn_down.quant);
+    segMatmulQuant(seg, mb.ffn_out.buf, mb.weightsBuf(), mb.weightOffset(layer.ffn_down.bytes), mb.gate.buf, c.dim, c.ffn_dim, layer.ffn_down.quant);
     seg.residualAdd(mb.x.buf, mb.ffn_out.buf, c.dim);
 
     seg.commit() catch return error.UnsupportedWeightType;
@@ -487,8 +487,8 @@ fn gpuLayerStep(
 
 fn gpuFinalStep(mb: *MetalBackend, m: *const Model, c: model_mod.LlamaConfig) StepError!void {
     const seg = mb.dev.segmentBegin() catch return error.UnsupportedWeightType;
-    seg.rmsnorm(mb.x.buf, mb.x.buf, mb.weights_buf, mb.weightOffset(m.output_norm.bytes), c.dim, c.rms_eps);
-    segMatmulQuant(seg, mb.logits.buf, mb.weights_buf, mb.weightOffset(m.output_w.bytes), mb.x.buf, c.vocab_size, c.dim, m.output_w.quant);
+    seg.rmsnorm(mb.x.buf, mb.x.buf, mb.weightsBuf(), mb.weightOffset(m.output_norm.bytes), c.dim, c.rms_eps);
+    segMatmulQuant(seg, mb.logits.buf, mb.weightsBuf(), mb.weightOffset(m.output_w.bytes), mb.x.buf, c.vocab_size, c.dim, m.output_w.quant);
     seg.commit() catch return error.UnsupportedWeightType;
 }
 

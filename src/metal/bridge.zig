@@ -248,6 +248,41 @@ pub const Device = struct {
         if (rc != 0) return error.MetalDispatchFailed;
     }
 
+    pub fn matmulMlxQ4(
+        self: Device,
+        out_buf: *Buf,
+        w_buf: *Buf,
+        w_offset: usize,
+        s_buf: *Buf,
+        s_offset: usize,
+        b_buf: *Buf,
+        b_offset: usize,
+        a_buf: *Buf,
+        a_offset: usize,
+        m: usize,
+        k: usize,
+        group_size: u32,
+        scale_is_bf16: bool,
+    ) DispatchError!void {
+        const rc = vtb_metal_matmul_mlx_q4(
+            self.handle,
+            out_buf,
+            w_buf,
+            w_offset,
+            s_buf,
+            s_offset,
+            b_buf,
+            b_offset,
+            a_buf,
+            a_offset,
+            m,
+            k,
+            group_size,
+            if (scale_is_bf16) 1 else 0,
+        );
+        if (rc != 0) return error.MetalDispatchFailed;
+    }
+
     pub fn segmentBegin(self: Device) DispatchError!Segment {
         const seg = vtb_metal_segment_begin(self.handle) orelse return error.MetalDispatchFailed;
         return .{ .handle = seg };
