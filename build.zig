@@ -56,14 +56,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addOptions("build_options", build_options);
-<<<<<<< HEAD
-=======
+
     if (metal) {
         // Attach to `mod` so test binaries (which link `mod` directly) resolve
         // the bridge symbols. Exe inherits the C source via its import of mod.
         attachMetal(b, mod);
     }
->>>>>>> refs/remotes/origin/main
 
     b.installArtifact(exe);
 
