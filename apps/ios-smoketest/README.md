@@ -1,49 +1,19 @@
 # ios-smoketest
 
-Minimal scaffold for validating vantablack on iOS. **Not yet runnable.**
+Skeleton for validating vantablack on iOS. **Library + header now ship;
+Swift wrapper still TODO.**
 
 ## Status
 
 - Zig static archive cross-compiles for `aarch64-ios` and
   `aarch64-ios-simulator` (see `build.zig`).
-- The Zig public API (`generateStream`, `Backend`, `PressureHub`) is **not
-  yet exposed as C symbols** — Zig dead-code-strips them in release
-  builds because nothing references them externally.
+- C ABI shim lives in `src/c_api.zig` — exports 9 `_vtb_*` symbols
+  (model_open/close, state_init/deinit, generate_stream,
+  signal_memory/thermal, version_string, has_metal).
+- C header lives in `include/vantablack.h`. The iOS build installs both
+  archive + header into `zig-out/`.
 
-## What's missing before this app runs
-
-A C ABI shim layer, e.g. `src/c_api.zig`, that re-exports the streaming
-+ pressure surface with `callconv(.c)` and `export`. The shim should
-roughly mirror this header:
-
-```c
-typedef struct VtbModel VtbModel;
-typedef struct VtbState VtbState;
-
-typedef int (*VtbTokenCb)(void *ctx,
-                          uint32_t token_id,
-                          const uint8_t *piece_bytes,
-                          size_t piece_len,
-                          uint8_t is_final);
-
-VtbModel *vtb_model_open(const char *path);
-void      vtb_model_close(VtbModel *m);
-
-VtbState *vtb_state_init(VtbModel *m);
-void      vtb_state_deinit(VtbState *s);
-
-int       vtb_generate_stream(VtbState *s,
-                              const char *prompt,
-                              size_t prompt_len,
-                              size_t max_tokens,
-                              VtbTokenCb cb,
-                              void *cb_ctx);
-
-void      vtb_signal_memory(uint8_t level);    // 0=normal, 1=warn, 2=critical
-void      vtb_signal_thermal(uint8_t state);   // 0..3
-```
-
-## Build flow once the shim lands
+## Build flow
 
 ```bash
 # 1. Cross-compile the static library for arm64 device + arm64 simulator.
@@ -56,10 +26,57 @@ mv zig-out/lib/libvantablack.a libvantablack-sim.a
 lipo -create -output libvantablack.a libvantablack-device.a libvantablack-sim.a
 lipo -info  libvantablack.a   # should show: arm64 (device + sim)
 
-# 3. Open Xcode, create an iOS app target, drag in libvantablack.a +
-#    vantablack.h (generated alongside the shim). Link the same
-#    frameworks that build.zig already attaches: Foundation, Metal,
-#    QuartzCore.
+# 3. Header is at zig-out/include/vantablack.h after either build.
+
+# 4. Open Xcode, create an iOS app target, drag in libvantablack.a +
+#    vantablack.h. Link the same frameworks that build.zig attaches:
+#    Foundation, Metal, QuartzCore.
+```
+
+## Minimal Swift call site
+
+```swift
+import Foundation
+
+class VantablackSession {
+    private var model: OpaquePointer?
+    private var state: OpaquePointer?
+
+    init?(modelPath: String) {
+        var cfg = VtbSamplerConfig(temperature: 0.7, top_k: 40, top_p: 0.95, seed: 0)
+        model = vtb_model_open(modelPath, 1)
+        guard model != nil else { return nil }
+        state = vtb_state_init(model, &cfg)
+        guard state != nil else {
+            vtb_model_close(model)
+            return nil
+        }
+    }
+
+    deinit {
+        vtb_state_deinit(state)
+        vtb_model_close(model)
+    }
+
+    func generate(prompt: String, maxTokens: Int, onToken: @escaping (String, Bool) -> Bool) {
+        let bytes = Array(prompt.utf8)
+        // Pass `self` (retained box) through cb_ctx; trampoline below.
+        let ctx = Unmanaged.passUnretained(Box(onToken)).toOpaque()
+        bytes.withUnsafeBufferPointer { bp in
+            _ = vtb_generate_stream(state, bp.baseAddress, bytes.count, maxTokens,
+                                    { ctx, _, piece, len, isFinal in
+                let box = Unmanaged<Box>.fromOpaque(ctx!).takeUnretainedValue()
+                let str = String(bytes: UnsafeBufferPointer(start: piece, count: len), encoding: .utf8) ?? ""
+                return box.fn(str, isFinal != 0) ? 1 : 0
+            }, ctx)
+        }
+    }
+
+    private final class Box {
+        let fn: (String, Bool) -> Bool
+        init(_ fn: @escaping (String, Bool) -> Bool) { self.fn = fn }
+    }
+}
 ```
 
 ## Pressure / thermal wiring (in Swift)

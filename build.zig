@@ -50,19 +50,37 @@ pub fn build(b: *std.Build) void {
     }
 
     // iOS builds skip the CLI executable and the HTTP server. The
-    // deliverable is a static archive consumed by a Swift wrapper.
+    // deliverable is a static archive consumed by a Swift wrapper. Strip
+    // is force-disabled for iOS: a stripped static archive would lose
+    // the C-ABI `export fn` symbols the consumer links against.
     if (is_ios) {
+        // Re-create the module with strip=false (the original `mod` may
+        // have been built with strip=true on release optimizes).
+        const lib_mod = b.addModule("vantablack-ios", .{
+            .root_source_file = b.path("src/vantablack.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = false,
+            .single_threaded = single_threaded,
+            .omit_frame_pointer = omit_frame_pointer,
+            .error_tracing = error_tracing,
+        });
+        lib_mod.addOptions("build_options", build_options);
+        if (metal) attachMetal(b, lib_mod, target_os);
         const lib = b.addLibrary(.{
             .name = "vantablack",
-            .root_module = mod,
+            .root_module = lib_mod,
             .linkage = .static,
         });
         b.installArtifact(lib);
+        // Drop the C header next to the static archive so a Swift host
+        // can `#include "vantablack.h"` from its bridging header.
+        b.installFile("include/vantablack.h", "include/vantablack.h");
 
         // Provide a `test` step that runs the library tests on the host
         // (iOS cannot run tests cross-compile; the library tests build
         // for host but the artifact is iOS).
-        const mod_tests = b.addTest(.{ .root_module = mod });
+        const mod_tests = b.addTest(.{ .root_module = lib_mod });
         const run_mod_tests = b.addRunArtifact(mod_tests);
         const test_step = b.step("test", "Run tests");
         test_step.dependOn(&run_mod_tests.step);

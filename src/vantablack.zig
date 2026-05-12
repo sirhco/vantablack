@@ -32,6 +32,14 @@ pub const pressure = @import("runtime/pressure.zig");
 pub const PressureHub = pressure.Hub;
 pub const PressureSink = pressure.Sink;
 
+// C ABI shim. The `comptime` block forces Zig to analyze every `export
+// fn` decl in c_api.zig — without this, lazy comptime evaluation skips
+// them and the linker has nothing to keep in the static archive.
+pub const c_api = @import("c_api.zig");
+comptime {
+    _ = c_api;
+}
+
 pub const Backend = backend.Backend;
 pub const BackendVTable = backend.VTable;
 pub const BackendCapabilities = backend.Capabilities;
