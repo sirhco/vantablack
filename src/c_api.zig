@@ -39,11 +39,20 @@ pub const VtbState = extern struct {
     _opaque: [0]u8 = .{},
 };
 
-// Internal Zig-side bookkeeping behind each opaque pointer.
+// Internal Zig-side bookkeeping behind each opaque pointer. The backing
+// `union(enum)` lets the same handle host either a GGUF mmap (single
+// file) or an HF/MLX bundle (directory with shards + tokenizer.json).
+// Downstream `vtb_state_init` / `vtb_generate_stream` are uniform over
+// both — the Backend vtable already hides the difference.
+const Backing = union(enum) {
+    gguf: vantablack.ModelMapper,
+    hf: vantablack.hf_loader.HfBundle,
+};
+
 const ModelHandle = struct {
     gpa: Allocator,
     arena_state: std.heap.ArenaAllocator,
-    mapper: vantablack.ModelMapper,
+    backing: Backing,
     model: vantablack.model.Model,
     metal: ?vantablack.MetalBackend,
     tokenizer: vantablack.Tokenizer,
@@ -111,24 +120,75 @@ fn vtbModelOpenImpl(path: []const u8, want_metal: bool) !*VtbModel {
     // resolution is simpler in the host language than here.
     if (!std.fs.path.isAbsolute(path)) return error.PathNotAbsolute;
 
-    handle.mapper = try vantablack.ModelMapper.init(gpa, defaultIo(), path);
-    errdefer handle.mapper.deinit();
+    var mapper = try vantablack.ModelMapper.init(gpa, defaultIo(), path);
+    errdefer mapper.deinit();
+    handle.backing = .{ .gguf = mapper };
 
-    handle.model = try vantablack.model.Model.init(gpa, &handle.mapper);
+    handle.model = try vantablack.model.Model.init(gpa, &handle.backing.gguf);
     errdefer handle.model.deinit(gpa);
 
     handle.metal = blk: {
         if (!want_metal) break :blk null;
         if (!vantablack.metal.metal_enabled) break :blk null;
-        break :blk vantablack.MetalBackend.init(gpa, &handle.mapper, handle.model.config) catch null;
+        break :blk vantablack.MetalBackend.init(gpa, &handle.backing.gguf, handle.model.config) catch null;
     };
     errdefer if (handle.metal) |*mb| mb.deinit(gpa);
     if (handle.metal) |*mb| mb.attachFusedWeights(gpa, &handle.model) catch {};
 
-    handle.tokenizer = try vantablack.Tokenizer.init(gpa, handle.mapper.catalog);
+    handle.tokenizer = try vantablack.Tokenizer.init(gpa, handle.backing.gguf.catalog);
     errdefer handle.tokenizer.deinit(gpa);
 
     // Metal does the heavy lifting; one worker is plenty in that mode.
+    const threads: usize = if (handle.metal != null) 1 else 0;
+    handle.pool = try vantablack.ThreadPool.init(gpa, threads);
+
+    return @ptrCast(handle);
+}
+
+/// Open an HF / MLX directory bundle (config.json + safetensors shards +
+/// tokenizer.json). Same surface as `vtb_model_open` but for the multi-
+/// file directory format `mlx-community/*` repos ship. `dir_path` must
+/// be an absolute path.
+export fn vtb_model_open_dir(dir_path: [*:0]const u8, metal_enabled: u8) callconv(.c) ?*VtbModel {
+    return vtbModelOpenDirImpl(std.mem.span(dir_path), metal_enabled != 0) catch null;
+}
+
+fn vtbModelOpenDirImpl(dir_path: []const u8, want_metal: bool) !*VtbModel {
+    const gpa = gpaAllocator();
+    var handle = try gpa.create(ModelHandle);
+    errdefer gpa.destroy(handle);
+
+    handle.gpa = gpa;
+    handle.arena_state = std.heap.ArenaAllocator.init(gpa);
+    errdefer handle.arena_state.deinit();
+
+    if (!std.fs.path.isAbsolute(dir_path)) return error.PathNotAbsolute;
+
+    var bundle = try vantablack.hf_loader.HfBundle.init(gpa, defaultIo(), dir_path);
+    errdefer bundle.deinit();
+    handle.backing = .{ .hf = bundle };
+
+    // Parse config.json. HfConfig holds slices into the supplied
+    // allocator's arena — use the handle's arena so the cfg lifetime
+    // matches the handle. (Model.initFromHf only reads scalar fields,
+    // but model_type / quantization slices remain alive.)
+    const cfg = try vantablack.hf_config.parse(handle.arena_state.allocator(), handle.backing.hf.config_json);
+
+    handle.model = try vantablack.model.Model.initFromHf(gpa, &handle.backing.hf, cfg);
+    errdefer handle.model.deinit(gpa);
+
+    handle.metal = blk: {
+        if (!want_metal) break :blk null;
+        if (!vantablack.metal.metal_enabled) break :blk null;
+        break :blk vantablack.MetalBackend.initFromHf(gpa, &handle.backing.hf, handle.model.config) catch null;
+    };
+    errdefer if (handle.metal) |*mb| mb.deinit(gpa);
+    if (handle.metal) |*mb| mb.attachFusedWeights(gpa, &handle.model) catch {};
+
+    const tok_bytes = handle.backing.hf.tokenizer_json orelse return error.NoTokenizerJson;
+    handle.tokenizer = try vantablack.Tokenizer.initFromHfJson(gpa, tok_bytes);
+    errdefer handle.tokenizer.deinit(gpa);
+
     const threads: usize = if (handle.metal != null) 1 else 0;
     handle.pool = try vantablack.ThreadPool.init(gpa, threads);
 
@@ -142,7 +202,10 @@ export fn vtb_model_close(m: ?*VtbModel) callconv(.c) void {
     handle.tokenizer.deinit(gpa);
     if (handle.metal) |*mb| mb.deinit(gpa);
     handle.model.deinit(gpa);
-    handle.mapper.deinit();
+    switch (handle.backing) {
+        .gguf => |*mapper| mapper.deinit(),
+        .hf => |*bundle| bundle.deinit(),
+    }
     handle.arena_state.deinit();
     gpa.destroy(handle);
 }

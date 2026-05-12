@@ -7,11 +7,13 @@ Swift wrapper still TODO.**
 
 - Zig static archive cross-compiles for `aarch64-ios` and
   `aarch64-ios-simulator` (see `build.zig`).
-- C ABI shim lives in `src/c_api.zig` — exports 9 `_vtb_*` symbols
-  (model_open/close, state_init/deinit, generate_stream,
-  signal_memory/thermal, version_string, has_metal).
+- C ABI shim lives in `src/c_api.zig` — exports 10 `_vtb_*` symbols
+  (model_open + **model_open_dir**, model_close, state_init/deinit,
+  generate_stream, signal_memory/thermal, version_string, has_metal).
 - C header lives in `include/vantablack.h`. The iOS build installs both
   archive + header into `zig-out/`.
+- **HF/MLX directories supported** via `vtb_model_open_dir` — point at
+  the snapshot dir from `huggingface-cli download mlx-community/...`.
 
 ## Build flow
 
@@ -42,9 +44,13 @@ class VantablackSession {
     private var model: OpaquePointer?
     private var state: OpaquePointer?
 
-    init?(modelPath: String) {
+    init?(modelPath: String, isDirectory: Bool) {
         var cfg = VtbSamplerConfig(temperature: 0.7, top_k: 40, top_p: 0.95, seed: 0)
-        model = vtb_model_open(modelPath, 1)
+        // GGUF single file → vtb_model_open
+        // HF/MLX directory  → vtb_model_open_dir
+        model = isDirectory
+            ? vtb_model_open_dir(modelPath, 1)
+            : vtb_model_open(modelPath, 1)
         guard model != nil else { return nil }
         state = vtb_state_init(model, &cfg)
         guard state != nil else {

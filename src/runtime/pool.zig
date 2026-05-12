@@ -24,6 +24,13 @@ pub const ThreadPool = struct {
     threads: []std.Thread,
     n_workers: usize, // includes main thread (worker_id 0)
 
+    /// Active worker count, mutable. `n_active <= n_workers`. Workers
+    /// with id >= n_active still spin on the epoch counter and bump
+    /// `completed` each epoch (so dispatch's wait target stays stable),
+    /// but skip calling the job function. Used for thermal-pressure
+    /// throttling — see `setActiveWorkersClamped`.
+    n_active: std.atomic.Value(usize),
+
     epoch: std.atomic.Value(u64),
     completed: std.atomic.Value(u64),
     job: std.atomic.Value(?*Job) align(64),
@@ -51,6 +58,7 @@ pub const ThreadPool = struct {
         self.* = .{
             .threads = &.{},
             .n_workers = n_workers,
+            .n_active = .init(n_workers),
             .epoch = .init(0),
             .completed = .init(0),
             .job = .init(null),
@@ -77,10 +85,13 @@ pub const ThreadPool = struct {
         allocator.destroy(self);
     }
 
-    /// Run `job_fn(worker_id, n_workers, ctx)` once per worker (0..n_workers).
-    /// Worker 0 runs on the calling thread.
+    /// Run `job_fn(worker_id, active_workers, ctx)` once per active
+    /// worker (0..active_workers). Worker 0 runs on the calling thread.
+    /// `active_workers` reflects the current `n_active` snapshot — see
+    /// `setActiveWorkersClamped` for the thermal-throttling hook.
     pub fn dispatch(self: *ThreadPool, job_fn: JobFn, ctx: *anyopaque) void {
-        if (self.n_workers == 1) {
+        const active = self.n_active.load(.acquire);
+        if (self.n_workers == 1 or active == 1) {
             job_fn(0, 1, ctx);
             return;
         }
@@ -90,9 +101,11 @@ pub const ThreadPool = struct {
         _ = self.epoch.fetchAdd(1, .release);
 
         // Main does worker 0.
-        job_fn(0, self.n_workers, ctx);
+        job_fn(0, active, ctx);
 
-        // Wait for n_workers-1 others.
+        // Wait for n_workers-1 others. ALL spawned workers complete
+        // every epoch (inactive ones just skip the job body), so the
+        // wait target is the fixed pool size, not the active count.
         const target: u64 = self.n_workers - 1;
         while (self.completed.load(.acquire) < target) {
             std.atomic.spinLoopHint();
@@ -106,13 +119,21 @@ pub const ThreadPool = struct {
         return self.n_workers;
     }
 
-    /// Throttle hook for thermal / memory-pressure callers. Currently a
-    /// no-op placeholder — true mid-flight worker count adjustment is
-    /// landing with the pressure-hooks task. Documented here so callers
-    /// can wire the API now without a future refactor.
+    /// Throttle hook for thermal / memory-pressure callers. Clamps
+    /// `target` to `[1, n_workers]` and stores it in the atomic
+    /// `n_active`. Next `dispatch` call observes the new value; any
+    /// in-flight dispatch finishes with the old value (no preemption).
+    /// Safe to call from any thread.
     pub fn setActiveWorkersClamped(self: *ThreadPool, target: usize) void {
-        _ = self;
-        _ = target;
+        const clamped = @max(1, @min(target, self.n_workers));
+        self.n_active.store(clamped, .release);
+    }
+
+    /// Snapshot of the active worker count. Mainly for introspection
+    /// and tests; the hot path reads `n_active` directly inside
+    /// `dispatch`.
+    pub fn activeWorkers(self: *const ThreadPool) usize {
+        return self.n_active.load(.acquire);
     }
 };
 
@@ -144,7 +165,13 @@ fn workerLoop(pool: *ThreadPool, worker_id: usize) void {
         }
         if (pool.shutdown.load(.acquire)) return;
         const job = pool.job.load(.acquire) orelse continue;
-        job.fn_ptr(worker_id, pool.n_workers, job.ctx);
+        const active = pool.n_active.load(.acquire);
+        // Inactive workers (id >= active) still acknowledge the epoch
+        // by bumping `completed`, so the main thread's wait target is
+        // satisfied. They just don't execute the job body.
+        if (worker_id < active) {
+            job.fn_ptr(worker_id, active, job.ctx);
+        }
         _ = pool.completed.fetchAdd(1, .release);
     }
 }
@@ -181,4 +208,52 @@ test "ThreadPool sums chunks" {
     var total: u64 = 0;
     for (partials) |p| total += p.load(.acquire);
     try std.testing.expectEqual(@as(u64, 1024 * 1025 / 2), total);
+}
+
+const Counter = struct {
+    flags: [8]std.atomic.Value(u8) = .{ .init(0), .init(0), .init(0), .init(0), .init(0), .init(0), .init(0), .init(0) },
+};
+
+fn markWorker(worker_id: usize, _: usize, ctx: *anyopaque) void {
+    const c: *Counter = @ptrCast(@alignCast(ctx));
+    c.flags[worker_id].store(1, .release);
+}
+
+test "ThreadPool.setActiveWorkersClamped restricts active worker set" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var pool = try ThreadPool.init(gpa, 4);
+    defer pool.deinit(gpa);
+
+    // Baseline: all 4 workers fire.
+    var c1: Counter = .{};
+    pool.dispatch(markWorker, &c1);
+    try std.testing.expectEqual(@as(usize, 4), pool.activeWorkers());
+    var hits1: usize = 0;
+    for (&c1.flags) |*f| {
+        if (f.load(.acquire) == 1) hits1 += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), hits1);
+
+    // Throttle to 2 workers.
+    pool.setActiveWorkersClamped(2);
+    try std.testing.expectEqual(@as(usize, 2), pool.activeWorkers());
+    var c2: Counter = .{};
+    pool.dispatch(markWorker, &c2);
+    var hits2: usize = 0;
+    for (&c2.flags) |*f| {
+        if (f.load(.acquire) == 1) hits2 += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), hits2);
+    // Only workers 0 and 1 should have fired.
+    try std.testing.expectEqual(@as(u8, 1), c2.flags[0].load(.acquire));
+    try std.testing.expectEqual(@as(u8, 1), c2.flags[1].load(.acquire));
+    try std.testing.expectEqual(@as(u8, 0), c2.flags[2].load(.acquire));
+    try std.testing.expectEqual(@as(u8, 0), c2.flags[3].load(.acquire));
+
+    // Out-of-range targets clamp.
+    pool.setActiveWorkersClamped(0);
+    try std.testing.expectEqual(@as(usize, 1), pool.activeWorkers());
+    pool.setActiveWorkersClamped(99);
+    try std.testing.expectEqual(@as(usize, 4), pool.activeWorkers());
 }

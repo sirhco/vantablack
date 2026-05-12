@@ -537,6 +537,15 @@ worker pool. Use this on shared boxes to reserve cores for other work.
 
 ---
 
+## Supported model formats
+
+| Format             | Status   | Notes                                                        |
+|--------------------|----------|--------------------------------------------------------------|
+| GGUF v2/v3         | shipped  | llama.cpp standard. Q8_0 + Q4_K + Q5_K + Q6_K + F32/F16/BF16 |
+| HF/MLX directories | shipped  | `mlx-community/*` Llama-family. 4/8-bit MLX kernels.         |
+| `.litertlm` Phase A| shipped  | Header parser + section index + `LlmMetadataProto`. `vantablack inspect` only — inference pending (items 19b–d). |
+| `.litertlm` full   | planned  | TFLite Model section parsing + int4/int8/fp16 kernels needed before forward path runs. |
+
 ## Supported models + quantizations
 
 Targets Llama-architecture GGUF v2/v3 files:
@@ -639,12 +648,38 @@ root cause: pure CPU matmul saturates every core. The fixes:
     throttle). Backend vtable slots `on_pressure` + `on_thermal` are
     wired; full KV-cache `shrinkToFit` + worker-count throttling lands
     with item 18.
-18. **KV-cache shrinkToFit + adaptive worker count** — *planned*.
-    Memory pressure callbacks today notify the backend but don't yet
-    re-size the KV cache or reduce active worker count. Hook into
-    `KvCache.shrinkToFit(new_max_seq)` + a real
-    `ThreadPool.setActiveWorkers` so the lib gracefully degrades on a
-    low-memory iPhone / thermally-throttled chassis.
+18. **KV-cache shrinkToFit + adaptive worker count** — *shipped*.
+    `KvCache.shrinkToFit(allocator, new_max_seq)` compacts each layer's
+    live prefix and shrinks the backing slice (heap path). Metal path
+    narrows the logical bound; the underlying `MTLBuffer` is not
+    re-allocated. `ThreadPool.setActiveWorkersClamped(n)` mid-flight
+    worker count adjustment — inactive workers still ack each epoch
+    so `dispatch` waits succeed. Wired through `Backend.onThermal`
+    (`.fair` → 3/4, `.serious` → 1/2, `.critical` → 1).
+19. **`.litertlm` model loader (Phase A)** — *shipped*. Header parser
+    (`core/litertlm.zig`) reads the 32-byte magic + version + 8-byte
+    `header_end_offset`, then walks the flatbuffer `LiteRTLMMetaData`
+    root table via a tiny read-only flatbuffer reader
+    (`core/flatbuffer.zig`). Section types enumerated:
+    `TFLiteModel`, `TFLiteWeights`, `SP_Tokenizer`, `HF_Tokenizer_Zlib`,
+    `LlmMetadataProto`, `GenericBinaryData`. `LlmMetadataProto` decoded
+    via a hand-rolled protobuf wire-format scanner
+    (`core/llm_metadata.zig`) — `max_num_tokens`, model-type tag
+    (Gemma 3 / Gemma 4 / Qwen3 / etc.), Jinja prompt template. CLI:
+    `vantablack inspect <model.litertlm>` prints the section table +
+    metadata. **Inference path NOT yet wired** — see items 19b–d below.
+19b. **TFLite Model section parser** — *planned*. The `.litertlm`
+     bundle's `TFLiteModel` section is itself a flatbuffer following the
+     TFLite schema (`tflite/schema_generated.fbs`). Need to map TFLite
+     tensor names → vantablack's Llama tensor layout (attn_q, attn_k,
+     ...) and surface them through `TypedTensor`.
+19c. **TFLite int4 / int8 / fp16 dequant + matmul kernels** — *planned*.
+     TFLite quantizes weights with its own layout (per-channel
+     int4/int8 with separate scale/zero arrays). Different from
+     GGUF Q4_K or MLX 4-bit. New kernels: CPU first, then Metal MSL.
+19d. **Forward-path parity vs `litert-lm` reference** — *planned*.
+     Bit-equal generation on `litert-community/gemma-4-E4B-it-litert-lm`
+     against Google's official runtime, same prompt + seed.
 
 Items 8 + 9 + 10 are the next perf pushes; items 18 + a C-ABI shim
 unlock real iOS app integration. Item 7's negative result shifted the

@@ -10,6 +10,7 @@ const usage =
     \\  vantablack <model.gguf> prompt <n> <text>            encode text, generate n more tokens
     \\  vantablack <model.gguf> chat <n> <user-message>      wrap in TinyLlama-Chat (zephyr) template
     \\  vantablack <model.gguf> serve [--host H] [--port P]  Ollama-compatible HTTP server (default 127.0.0.1:11434)
+    \\  vantablack inspect <model.litertlm>                 print sections + metadata of a LiteRT-LM bundle
     \\
     \\generate / prompt / chat accept sampler flags BEFORE the n value:
     \\  --temp <f>     temperature (0.0 = greedy)
@@ -40,6 +41,21 @@ pub fn main(init: std.process.Init) !void {
         try err.writeAll(usage);
         try err.flush();
         return error.MissingPath;
+    }
+
+    // inspect <model.litertlm>: parse Google's LiteRT-LM container header,
+    // list sections + metadata. Inference is not yet supported on
+    // .litertlm files — the TFLite tensor section parser is a follow-up
+    // (Phase B/C). This subcommand lets callers see what's in a bundle
+    // before deciding whether to convert to GGUF/MLX.
+    if (std.mem.eql(u8, args[1], "inspect")) {
+        if (args.len < 3) {
+            try err.writeAll("usage: vantablack inspect <model.litertlm>\n");
+            try err.flush();
+            return error.MissingArgs;
+        }
+        try runInspect(gpa, arena, io, args[2], out, err);
+        return;
     }
 
     // tokenize <tokenizer.json> <text>: load HF tokenizer.json, run encode,
@@ -378,6 +394,100 @@ fn ggmlTypeName(t: vantablack.GgmlType) []const u8 {
         .tq2_0 => "TQ2_0",
         _ => "?",
     };
+}
+
+// ----- LiteRT-LM (.litertlm) container inspection -------------------------
+
+fn runInspect(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: Io,
+    input_path: []const u8,
+    out: *Io.Writer,
+    err: *Io.Writer,
+) !void {
+    const abs_path = if (std.fs.path.isAbsolute(input_path))
+        try arena.dupe(u8, input_path)
+    else blk: {
+        const cwd = try std.process.currentPathAlloc(io, arena);
+        break :blk try std.fs.path.resolve(arena, &.{ cwd, input_path });
+    };
+
+    // mmap the file. The litertlm header lives at the start and section
+    // bodies are scattered through the rest; mmap is the cheapest way to
+    // address them without paging the whole file into RAM.
+    const file = try Io.Dir.openFileAbsolute(io, abs_path, .{ .allow_directory = false });
+    defer file.close(io);
+    const len = try file.length(io);
+    const len_us: usize = std.math.cast(usize, len) orelse return error.FileTooLarge;
+    if (len_us < 32) {
+        try err.writeAll("file too small to be a .litertlm bundle\n");
+        try err.flush();
+        return error.FileTooSmall;
+    }
+    const mapped = try std.posix.mmap(
+        null,
+        len_us,
+        .{ .READ = true },
+        .{ .TYPE = .PRIVATE },
+        file.handle,
+        0,
+    );
+    defer std.posix.munmap(mapped);
+
+    var bundle = vantablack.litertlm.Bundle.init(gpa, mapped) catch |e| {
+        try err.print("failed to parse litertlm header: {s}\n", .{@errorName(e)});
+        try err.flush();
+        return e;
+    };
+    defer bundle.deinit();
+
+    try out.print("litertlm bundle: {s}\n", .{abs_path});
+    try out.print("  version: {d}.{d}.{d}\n", .{ bundle.version.major, bundle.version.minor, bundle.version.patch });
+    try out.print("  size:    {d} bytes ({d:.2} MB)\n", .{ len_us, @as(f64, @floatFromInt(len_us)) / (1024.0 * 1024.0) });
+    try out.print("  sections: {d}\n", .{bundle.sections.len});
+    for (bundle.sections, 0..) |s, i| {
+        const size_mb: f64 = @as(f64, @floatFromInt(s.size())) / (1024.0 * 1024.0);
+        try out.print(
+            "    [{d}] {s:<20} offset={d:<12} size={d} ({d:.2} MB)\n",
+            .{ i, s.data_type.name(), s.begin, s.size(), size_mb },
+        );
+    }
+
+    // LlmMetadataProto: small, decode and dump key fields.
+    if (bundle.findSection(.llm_metadata_proto)) |s| {
+        const bytes = try bundle.sectionBytes(s);
+        var meta = try vantablack.llm_metadata.LlmMetadata.parse(arena, bytes);
+        defer meta.deinit();
+        try out.writeAll("  metadata:\n");
+        try out.print("    max_num_tokens: {d}\n", .{meta.max_num_tokens});
+        if (meta.llm_model_type_bytes) |mt| {
+            if (try vantablack.llm_metadata.detectModelType(mt)) |tag| {
+                try out.print("    model_type:     {s}\n", .{tag.name()});
+            } else {
+                try out.writeAll("    model_type:     <unset>\n");
+            }
+        }
+        if (meta.jinja_prompt_template) |tpl| {
+            const preview_len = @min(tpl.len, 80);
+            try out.print(
+                "    jinja_template: ({d} chars) {s}{s}\n",
+                .{ tpl.len, tpl[0..preview_len], if (tpl.len > preview_len) "..." else "" },
+            );
+        }
+        try out.print("    stop_tokens:    {d}\n", .{meta.stop_tokens_bytes.len});
+    }
+
+    // Tokenizer fingerprint (without decompressing — Phase A scope).
+    if (bundle.findSection(.hf_tokenizer_zlib)) |s| {
+        try out.print("  tokenizer (HF, zlib): {d} compressed bytes — decode pending\n", .{s.size()});
+    } else if (bundle.findSection(.sp_tokenizer)) |s| {
+        try out.print("  tokenizer (SentencePiece): {d} bytes\n", .{s.size()});
+    }
+
+    // Inference status.
+    try out.writeAll("  inference: TFLite tensor parsing pending — `prompt` not yet supported on .litertlm\n");
+    try out.flush();
 }
 
 // ----- HuggingFace / MLX directory mode -----------------------------------

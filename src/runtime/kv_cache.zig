@@ -131,6 +131,68 @@ pub const KvCache = struct {
         std.debug.assert(self.pos < self.max_seq);
         self.pos += 1;
     }
+
+    /// Reduce `max_seq` to `new_max_seq` and release the unused tail.
+    /// The first `pos * rowSize()` elements of every layer are preserved;
+    /// anything past `pos` is discarded (it was unwritten or stale).
+    ///
+    /// Heap-backed: try in-place `Allocator.resize`; fall back to alloc+
+    /// memcpy+free if the allocator can't shrink in place.
+    ///
+    /// Metal-backed: the underlying MTLBuffer is not shrunk (that would
+    /// need a new device allocation). The slice view is narrowed and
+    /// `max_seq` is reduced so future reads cap at the new bound. The
+    /// unused tail of the MTLBuffer continues to occupy GPU memory but
+    /// the live cache footprint at the API surface is now smaller.
+    pub fn shrinkToFit(self: *KvCache, allocator: Allocator, new_max_seq: usize) !void {
+        if (new_max_seq >= self.max_seq) return; // no-op
+        if (new_max_seq < self.pos) return error.NewMaxSeqBelowPos;
+        const old_per_layer = self.perLayer();
+        const new_per_layer = new_max_seq * self.rowSize();
+        const live_per_layer = self.pos * self.rowSize();
+
+        // Compact: move each layer's live prefix to its new (smaller)
+        // offset. Layer 0 stays put — its data is already at offset 0.
+        // Destination always precedes source so a forward copy is safe
+        // even for overlapping ranges.
+        var layer: usize = 1;
+        while (layer < self.n_layers) : (layer += 1) {
+            const old_off = layer * old_per_layer;
+            const new_off = layer * new_per_layer;
+            if (live_per_layer > 0) {
+                std.mem.copyForwards(f32, self.k[new_off..][0..live_per_layer], self.k[old_off..][0..live_per_layer]);
+                std.mem.copyForwards(f32, self.v[new_off..][0..live_per_layer], self.v[old_off..][0..live_per_layer]);
+            }
+        }
+
+        const new_total = self.n_layers * new_per_layer;
+
+        if (self.owns_buffers) {
+            // Try shrink-in-place first.
+            if (allocator.resize(self.k, new_total)) {
+                self.k = self.k[0..new_total];
+            } else {
+                const new_k = try allocator.alloc(f32, new_total);
+                @memcpy(new_k, self.k[0..new_total]);
+                allocator.free(self.k);
+                self.k = new_k;
+            }
+            if (allocator.resize(self.v, new_total)) {
+                self.v = self.v[0..new_total];
+            } else {
+                const new_v = try allocator.alloc(f32, new_total);
+                @memcpy(new_v, self.v[0..new_total]);
+                allocator.free(self.v);
+                self.v = new_v;
+            }
+        } else {
+            // Metal-backed: narrow the slice over the same MTLBuffer.
+            self.k = self.k[0..new_total];
+            self.v = self.v[0..new_total];
+        }
+
+        self.max_seq = new_max_seq;
+    }
 };
 
 test "KvCache slot/advance round-trip" {
@@ -165,4 +227,56 @@ test "KvCache slot/advance round-trip" {
     // Cross-layer isolation.
     const l1 = cache.keysFor(1, 1);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), l1[0], 1e-6);
+}
+
+test "KvCache.shrinkToFit preserves live data + caps further writes" {
+    const gpa = std.testing.allocator;
+    var cache = try KvCache.init(gpa, 2, 4, 8, 64, null);
+    defer cache.deinit(gpa);
+
+    // Advance to pos=10 with marker values so we can verify preservation.
+    for (0..10) |t| {
+        for (cache.keySlot(0), 0..) |*v, i| v.* = @as(f32, @floatFromInt(t * 1000 + i));
+        for (cache.valueSlot(0), 0..) |*v, i| v.* = @as(f32, @floatFromInt(t * 1000 + i)) + 0.5;
+        for (cache.keySlot(1), 0..) |*v, i| v.* = @as(f32, @floatFromInt(t * 1000 + i)) + 10000.0;
+        for (cache.valueSlot(1), 0..) |*v, i| v.* = @as(f32, @floatFromInt(t * 1000 + i)) + 10000.5;
+        cache.advance();
+    }
+    try std.testing.expectEqual(@as(usize, 10), cache.pos);
+
+    // Shrink from 64 → 32. Layer-1 data must be compacted to the new offset.
+    try cache.shrinkToFit(gpa, 32);
+    try std.testing.expectEqual(@as(usize, 32), cache.max_seq);
+    try std.testing.expectEqual(@as(usize, 10), cache.pos);
+
+    // Verify live data survives across both layers.
+    const l0_keys = cache.keysFor(0, 10);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), l0_keys[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 9000), l0_keys[9 * 4 * 8], 1e-6);
+
+    const l1_keys = cache.keysFor(1, 10);
+    try std.testing.expectApproxEqAbs(@as(f32, 10000), l1_keys[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 19000), l1_keys[9 * 4 * 8], 1e-6);
+
+    // Continue writing in the smaller cache — 22 more tokens fit (pos=10 → 32).
+    for (10..32) |t| {
+        for (cache.keySlot(0), 0..) |*v, i| v.* = @as(f32, @floatFromInt(t * 1000 + i));
+        cache.advance();
+    }
+    try std.testing.expectEqual(@as(usize, 32), cache.pos);
+}
+
+test "KvCache.shrinkToFit refuses to drop populated entries" {
+    const gpa = std.testing.allocator;
+    var cache = try KvCache.init(gpa, 1, 2, 4, 32, null);
+    defer cache.deinit(gpa);
+    for (0..20) |_| {
+        for (cache.keySlot(0)) |*v| v.* = 0;
+        cache.advance();
+    }
+    // pos=20 — shrinking below 20 must error rather than truncate.
+    try std.testing.expectError(error.NewMaxSeqBelowPos, cache.shrinkToFit(gpa, 10));
+    // No-op when target >= current.
+    try cache.shrinkToFit(gpa, 64);
+    try std.testing.expectEqual(@as(usize, 32), cache.max_seq);
 }

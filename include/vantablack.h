@@ -76,6 +76,13 @@ VtbModel *vtb_model_open(const char *path, uint8_t metal_enabled);
 // Free everything associated with `m`. Safe to pass null.
 void vtb_model_close(VtbModel *m);
 
+// Open an HF / MLX directory bundle (`mlx-community/*` Llama-family
+// checkpoints: config.json + multi-shard safetensors + tokenizer.json).
+// Path must be absolute. Returns null on failure. Use this when the
+// model on disk is a directory, not a single .gguf file. Lifetime
+// management and downstream calls are identical to `vtb_model_open`.
+VtbModel *vtb_model_open_dir(const char *dir_path, uint8_t metal_enabled);
+
 // ---------------------------------------------------------------------------
 // State lifecycle
 // ---------------------------------------------------------------------------
