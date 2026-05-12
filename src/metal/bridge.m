@@ -1162,6 +1162,67 @@ void vtb_metal_segment_attn_weighted_sum(
               threadsPerThreadgroup:MTLSizeMake(tg_x, tg_y, 1)];
 }
 
+// Host-side mirror of `MlxQ4Params` in the MSL source. Layout must match.
+struct MlxQ4ParamsHost {
+    uint32_t m;
+    uint32_t k;
+    uint32_t w_offset_bytes;
+    uint32_t scales_offset_bytes;
+    uint32_t biases_offset_bytes;
+    uint32_t group_size;
+    uint32_t scale_dtype_is_bf16;
+};
+
+int vtb_metal_matmul_mlx_q4(
+    VtbMetalCtx *ctx,
+    VtbMetalBuf *out_buf,
+    VtbMetalBuf *weight_buf, size_t weight_offset,
+    VtbMetalBuf *scales_buf, size_t scales_offset,
+    VtbMetalBuf *biases_buf, size_t biases_offset,
+    VtbMetalBuf *acts_buf,   size_t acts_offset,
+    size_t m, size_t k,
+    uint32_t group_size,
+    uint32_t scale_dtype_is_bf16)
+{
+    if (!ctx || !out_buf || !weight_buf || !scales_buf || !biases_buf || !acts_buf) return 1;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:ctx->pso_mlx_q4];
+        [enc setBuffer:out_buf->buffer    offset:0              atIndex:0];
+        [enc setBuffer:weight_buf->buffer offset:weight_offset  atIndex:1];
+        [enc setBuffer:scales_buf->buffer offset:scales_offset  atIndex:2];
+        [enc setBuffer:biases_buf->buffer offset:biases_offset  atIndex:3];
+        [enc setBuffer:acts_buf->buffer   offset:acts_offset    atIndex:4];
+
+        struct MlxQ4ParamsHost p = {
+            .m = (uint32_t)m,
+            .k = (uint32_t)k,
+            .w_offset_bytes = 0,
+            .scales_offset_bytes = 0,
+            .biases_offset_bytes = 0,
+            .group_size = group_size,
+            .scale_dtype_is_bf16 = scale_dtype_is_bf16,
+        };
+        [enc setBytes:&p length:sizeof(p) atIndex:5];
+
+        NSUInteger tg = 64;
+        if (tg > ctx->pso_mlx_q4.maxTotalThreadsPerThreadgroup)
+            tg = ctx->pso_mlx_q4.maxTotalThreadsPerThreadgroup;
+        [enc dispatchThreads:MTLSizeMake(m, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        if (cmd.status == MTLCommandBufferStatusError) {
+            NSLog(@"vtb_metal_matmul_mlx_q4: cmd failed: %@", cmd.error);
+            return 2;
+        }
+        return 0;
+    }
+}
+
 void vtb_metal_segment_matmul_mlx_q4(
     VtbMetalSeg *seg,
     VtbMetalBuf *out_buf,

@@ -4,6 +4,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const target_os = target.result.os.tag;
+    const is_ios = target_os == .ios;
+
     const is_release = optimize != .Debug;
     const strip: ?bool = if (is_release) true else null;
     // ReleaseSmall stays single-threaded for binary size; ReleaseFast/Safe
@@ -12,19 +15,25 @@ pub fn build(b: *std.Build) void {
     const omit_frame_pointer: ?bool = if (is_release) true else null;
     const error_tracing: ?bool = if (optimize == .ReleaseSmall) false else null;
 
-    // Optional Apple Metal GPU backend. Off by default (preserves pure-Zig
-    // path + ReleaseSmall binary size). When on, links Foundation + Metal +
-    // CoreGraphics frameworks and compiles the Objective-C bridge in
-    // src/metal/bridge.m. Requires macOS host.
-    const metal = b.option(bool, "metal", "build with Apple Metal GPU backend (macOS only)") orelse false;
+    // Apple Metal GPU backend. Off by default on macOS (preserves pure-Zig
+    // path + ReleaseSmall binary size); ON by default on iOS (every iOS
+    // target has a Metal GPU and consumers want hardware acceleration —
+    // no CPU-only fallback ships in the iOS library).
+    const metal_default = is_ios;
+    const metal = b.option(bool, "metal", "build with Apple Metal GPU backend") orelse metal_default;
     // Pre-concatenate Q/K/V and gate/up weights at Model.init so each fused
     // matmul reads activations once. Adds ~660 MB residency for TinyLlama
     // Q8_0 (~2x for the fused groups). Off by default.
     const weight_fusion = b.option(bool, "weight_fusion", "pre-concatenate Q/K/V + gate/up weights at init") orelse false;
+    // HTTP server (Ollama-compatible). On by default on desktop; OFF by
+    // default on iOS (the static archive should not pull in std.http).
+    const server_default = !is_ios;
+    const server = b.option(bool, "server", "include HTTP server (Ollama API)") orelse server_default;
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "metal", metal);
     build_options.addOption(bool, "weight_fusion", weight_fusion);
+    build_options.addOption(bool, "server", server);
 
     const mod = b.addModule("vantablack", .{
         .root_source_file = b.path("src/vantablack.zig"),
@@ -37,7 +46,27 @@ pub fn build(b: *std.Build) void {
     });
     mod.addOptions("build_options", build_options);
     if (metal) {
-        attachMetal(b, mod);
+        attachMetal(b, mod, target_os);
+    }
+
+    // iOS builds skip the CLI executable and the HTTP server. The
+    // deliverable is a static archive consumed by a Swift wrapper.
+    if (is_ios) {
+        const lib = b.addLibrary(.{
+            .name = "vantablack",
+            .root_module = mod,
+            .linkage = .static,
+        });
+        b.installArtifact(lib);
+
+        // Provide a `test` step that runs the library tests on the host
+        // (iOS cannot run tests cross-compile; the library tests build
+        // for host but the artifact is iOS).
+        const mod_tests = b.addTest(.{ .root_module = mod });
+        const run_mod_tests = b.addRunArtifact(mod_tests);
+        const test_step = b.step("test", "Run tests");
+        test_step.dependOn(&run_mod_tests.step);
+        return;
     }
 
     const exe = b.addExecutable(.{
@@ -56,12 +85,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addOptions("build_options", build_options);
-
-    if (metal) {
-        // Attach to `mod` so test binaries (which link `mod` directly) resolve
-        // the bridge symbols. Exe inherits the C source via its import of mod.
-        attachMetal(b, mod);
-    }
 
     b.installArtifact(exe);
 
@@ -84,11 +107,39 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
 }
 
-fn attachMetal(b: *std.Build, mod: *std.Build.Module) void {
+fn attachMetal(b: *std.Build, mod: *std.Build.Module, target_os: std.Target.Os.Tag) void {
     mod.link_libc = true; // Obj-C runtime needs libc
+
+    // iOS cross-compile from a macOS host needs the Xcode SDK path so
+    // clang can find Foundation.framework / Metal.framework. We invoke
+    // `xcrun` once at build configuration time and feed the result back
+    // into the module's framework + header search paths. Skipped when
+    // running on macOS native — those frameworks come from the active
+    // CommandLineTools install via Zig's default search path.
+    if (target_os == .ios) {
+        const sdk_path = resolveIosSdk(b) catch |err| {
+            std.debug.print("vantablack: failed to resolve iOS SDK via xcrun ({}); install Xcode + run `xcode-select --install`\n", .{err});
+            @panic("iOS SDK unavailable");
+        };
+        const frameworks_path = b.fmt("{s}/System/Library/Frameworks", .{sdk_path});
+        const include_path = b.fmt("{s}/usr/include", .{sdk_path});
+        const lib_path = b.fmt("{s}/usr/lib", .{sdk_path});
+        mod.addSystemFrameworkPath(.{ .cwd_relative = frameworks_path });
+        mod.addIncludePath(.{ .cwd_relative = include_path });
+        mod.addLibraryPath(.{ .cwd_relative = lib_path });
+    }
+
     mod.linkFramework("Foundation", .{});
     mod.linkFramework("Metal", .{});
-    mod.linkFramework("CoreGraphics", .{});
+    // CoreGraphics is macOS-only. On iOS, QuartzCore covers the analogous
+    // CALayer / display-link symbol surface. bridge.m doesn't currently
+    // touch either, but linking the right framework keeps a future
+    // bridge expansion from failing at link time.
+    if (target_os == .ios) {
+        mod.linkFramework("QuartzCore", .{});
+    } else {
+        mod.linkFramework("CoreGraphics", .{});
+    }
     mod.addCSourceFile(.{
         .file = b.path("src/metal/bridge.m"),
         .flags = &.{
@@ -98,4 +149,16 @@ fn attachMetal(b: *std.Build, mod: *std.Build.Module) void {
         },
         .language = .objective_c,
     });
+}
+
+/// Runs `xcrun --sdk iphoneos --show-sdk-path` at build-configuration
+/// time. Builds on macOS with Xcode installed; fails the build with a
+/// helpful message otherwise (Linux hosts can't cross-compile to iOS
+/// without a copy of the SDK).
+fn resolveIosSdk(b: *std.Build) ![]const u8 {
+    const stdout = b.run(&.{ "xcrun", "--sdk", "iphoneos", "--show-sdk-path" });
+    // Trim trailing newline.
+    var end = stdout.len;
+    while (end > 0 and (stdout[end - 1] == '\n' or stdout[end - 1] == '\r')) end -= 1;
+    return stdout[0..end];
 }

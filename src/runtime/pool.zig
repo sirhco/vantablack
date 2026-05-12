@@ -99,6 +99,21 @@ pub const ThreadPool = struct {
         }
         self.job.store(null, .release);
     }
+
+    /// Total worker count established at init (includes main thread).
+    /// Constant across the pool's lifetime.
+    pub fn workerCount(self: *const ThreadPool) usize {
+        return self.n_workers;
+    }
+
+    /// Throttle hook for thermal / memory-pressure callers. Currently a
+    /// no-op placeholder — true mid-flight worker count adjustment is
+    /// landing with the pressure-hooks task. Documented here so callers
+    /// can wire the API now without a future refactor.
+    pub fn setActiveWorkersClamped(self: *ThreadPool, target: usize) void {
+        _ = self;
+        _ = target;
+    }
 };
 
 /// After this many spin iterations without seeing a new epoch, the worker

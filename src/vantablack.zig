@@ -22,6 +22,23 @@ pub const chat_template = @import("runtime/chat_template.zig");
 pub const server = @import("runtime/server.zig");
 pub const metal = @import("metal/bridge.zig");
 pub const metal_backend = @import("runtime/metal_backend.zig");
+pub const backend = @import("runtime/backend.zig");
+pub const backend_cpu = @import("runtime/backend_cpu.zig");
+pub const backend_metal = @import("runtime/backend_metal.zig");
+pub const stream = @import("runtime/stream.zig");
+pub const generateStream = stream.generateStream;
+pub const TokenCallback = stream.TokenCallback;
+pub const pressure = @import("runtime/pressure.zig");
+pub const PressureHub = pressure.Hub;
+pub const PressureSink = pressure.Sink;
+
+pub const Backend = backend.Backend;
+pub const BackendVTable = backend.VTable;
+pub const BackendCapabilities = backend.Capabilities;
+pub const PressureLevel = backend.PressureLevel;
+pub const ThermalState = backend.ThermalState;
+pub const CpuBackend = backend_cpu.CpuBackend;
+pub const MetalDispatch = backend_metal.MetalDispatch;
 
 pub const ThreadPool = pool.ThreadPool;
 pub const Server = server.Server;

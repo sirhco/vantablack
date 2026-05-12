@@ -16,6 +16,7 @@ const kv_cache_mod = @import("kv_cache.zig");
 const pool_mod = @import("pool.zig");
 const metal_backend_mod = @import("metal_backend.zig");
 const metal_bridge = @import("../metal/bridge.zig");
+const backend_mod = @import("backend.zig");
 
 const Model = model_mod.Model;
 const TypedTensor = model_mod.TypedTensor;
@@ -111,6 +112,10 @@ pub const State = struct {
     }
 };
 
+/// Per-token forward pass. Picks the best `Backend` based on `metal` +
+/// model GPU-eligibility, then dispatches through the vtable. The whole
+/// per-layer + final-projection chain reads as one straight loop — no
+/// scattered `if (metal)` branches.
 pub fn step(
     m: *const Model,
     state: *State,
@@ -119,42 +124,64 @@ pub fn step(
     metal: ?*MetalBackend,
     token_id: u32,
 ) StepError!void {
-    const c = m.config;
-    if (token_id >= c.vocab_size) return error.TokenOutOfRange;
-    if (cache.pos >= c.max_seq) return error.KvCacheFull;
+    const backend_cpu = @import("backend_cpu.zig");
+    const backend_metal = @import("backend_metal.zig");
 
-    // Embed.
-    try gatherEmbedding(state.x, m.token_embd, token_id, c.dim);
-
-    // GPU fast path: per-layer ops are chained into 3 MTLCommandBuffers,
-    // each containing rmsnorm/matmul/rope/swiglu/residual dispatches. CPU
-    // only does KV-cache writes and attention. Fall back to the per-op CPU
-    // path when the model uses non-Q8_0 projections or non-f32 norms.
+    // Backend selection: pick Metal only when the model is *fully* GPU-
+    // eligible (every projection lands on a kernel we have). Mixed-quant
+    // models stay on the CPU backend; that backend can still offload
+    // individual matmuls via its `metal_fallback` field — the hybrid path
+    // older builds shipped.
     const gpu_ready: ?*MetalBackend = blk: {
         if (metal) |mb| if (modelGpuEligible(m)) break :blk mb;
         break :blk null;
     };
 
-    for (m.layers, 0..) |layer, l| {
-        if (gpu_ready) |mb| {
-            try gpuLayerStep(mb, layer, cache, c, l);
-        } else {
-            try cpuLayerStep(pool, metal, layer, state, cache, c, l);
-        }
+    if (gpu_ready) |mb| {
+        var disp = backend_metal.MetalDispatch.init(mb);
+        return stepWithBackend(m, state, cache, disp.backend(), token_id);
     }
+    var cpu = backend_cpu.CpuBackend{ .pool = pool, .metal_fallback = metal };
+    return stepWithBackend(m, state, cache, cpu.backend(), token_id);
+}
 
+/// Backend-explicit variant. Callers that already hold a `Backend` (e.g.
+/// the streaming API or future iOS hosts) skip the selection step. The
+/// embed / layer / final / drain sequence here is the entire per-token
+/// forward path; backend-specific decisions are hidden in the vtable.
+pub fn stepWithBackend(
+    m: *const Model,
+    state: *State,
+    cache: *KvCache,
+    be: backend_mod.Backend,
+    token_id: u32,
+) StepError!void {
+    const c = m.config;
+    if (token_id >= c.vocab_size) return error.TokenOutOfRange;
+    if (cache.pos >= c.max_seq) return error.KvCacheFull;
+
+    try gatherEmbedding(state.x, m.token_embd, token_id, c.dim);
+
+    for (m.layers, 0..) |layer, l| {
+        be.layerStep(&layer, cache, state, c, l) catch |err| return mapStepError(err);
+    }
     cache.advance();
 
-    if (gpu_ready) |mb| {
-        try gpuFinalStep(mb, m, c);
-        // Single per-token barrier: every prior segment commit was async, so
-        // the CPU must wait here before the sampler reads `state.logits` (a
-        // view over the shared-storage logits buffer the GPU just wrote).
-        mb.dev.waitIdle();
-    } else {
-        try rmsNormTyped(state.x, m.output_norm, c.rms_eps);
-        try matmulRuntime(pool, metal, state.logits, m.output_w, state.x, c.vocab_size, c.dim);
-    }
+    be.finalStep(m, c, state) catch |err| return mapStepError(err);
+    be.finalizeToken() catch |err| return mapStepError(err);
+}
+
+fn mapStepError(err: anyerror) StepError {
+    // Backend vtables return `anyerror!void`. Funnel back into the public
+    // `StepError` set so the existing call-site error handling continues
+    // to match. Anything outside the known set is reported as a dispatch
+    // failure (the backend impls themselves only produce StepError values).
+    return switch (err) {
+        error.TokenOutOfRange => error.TokenOutOfRange,
+        error.KvCacheFull => error.KvCacheFull,
+        error.UnsupportedWeightType => error.UnsupportedWeightType,
+        else => error.UnsupportedWeightType,
+    };
 }
 
 fn cpuAttention(state: *State, cache: *KvCache, c: model_mod.LlamaConfig, l: usize) void {
@@ -200,7 +227,7 @@ fn cpuAttention(state: *State, cache: *KvCache, c: model_mod.LlamaConfig, l: usi
     }
 }
 
-fn cpuLayerStep(
+pub fn cpuLayerStep(
     pool: *ThreadPool,
     metal: ?*MetalBackend,
     layer: model_mod.LayerWeights,
@@ -342,7 +369,7 @@ test "math.gegluApprox: per-element correctness already covered in math.zig" {
     // test which validates against reference values.
 }
 
-fn modelGpuEligible(m: *const Model) bool {
+pub fn modelGpuEligible(m: *const Model) bool {
     // GPU full-forward shape:
     //   - Llama: full causal attention + SwiGLU
     //   - Mistral: sliding-window via K/V offset shift, SwiGLU
@@ -389,7 +416,7 @@ fn segMatmulQuant(
     }
 }
 
-fn gpuLayerStep(
+pub fn gpuLayerStep(
     mb: *MetalBackend,
     layer: model_mod.LayerWeights,
     cache: *KvCache,
@@ -485,7 +512,7 @@ fn gpuLayerStep(
     seg.commit() catch return error.UnsupportedWeightType;
 }
 
-fn gpuFinalStep(mb: *MetalBackend, m: *const Model, c: model_mod.LlamaConfig) StepError!void {
+pub fn gpuFinalStep(mb: *MetalBackend, m: *const Model, c: model_mod.LlamaConfig) StepError!void {
     const seg = mb.dev.segmentBegin() catch return error.UnsupportedWeightType;
     seg.rmsnorm(mb.x.buf, mb.x.buf, mb.weightsBuf(), mb.weightOffset(m.output_norm.bytes), c.dim, c.rms_eps);
     segMatmulQuant(seg, mb.logits.buf, mb.weightsBuf(), mb.weightOffset(m.output_w.bytes), mb.x.buf, c.vocab_size, c.dim, m.output_w.quant);
@@ -522,7 +549,7 @@ fn matmulWorker(worker_id: usize, n_workers: usize, ctx_ptr: *anyopaque) void {
     }
 }
 
-fn matmulRuntime(
+pub fn matmulRuntime(
     pool: *ThreadPool,
     metal: ?*MetalBackend,
     out: []f32,

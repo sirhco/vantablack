@@ -616,11 +616,41 @@ root cause: pure CPU matmul saturates every core. The fixes:
     than even GPU for some shapes. Useful as a CPU-only fallback path.
 14. **NEON `sdot` int8 dot** — *planned*. ARMv8.2-A dedicated dot-product
     instruction. Modest CPU-path speedup, no FFI needed.
+15. **Backend vtable abstraction** — *shipped*. `runtime/backend.zig`
+    defines a small `Backend` vtable (`layer_step`, `final_step`,
+    `finalize_token`, `capabilities`, `on_pressure`, `on_thermal`). CPU
+    and Metal impls live in `backend_cpu.zig` and `backend_metal.zig`.
+    `forward.step` is now a single straight-line dispatch — adding a
+    Vulkan, CoreML, or NPU backend is one file, not a tree of
+    `if (metal)` branches. Inspired by Google's LiteRT-LM architecture.
+16. **iOS target** — *shipped* (build only). `zig build
+    -Dtarget=aarch64-ios -Doptimize=ReleaseFast` produces a
+    `libvantablack.a` static archive linking Foundation + Metal +
+    QuartzCore via the Xcode SDK (auto-detected via `xcrun`). Same for
+    `aarch64-ios-simulator`. iOS build excludes the CLI binary + HTTP
+    server. A C ABI shim for Swift consumption is the next piece — see
+    `apps/ios-smoketest/README.md`.
+17. **Streaming inference + pressure hooks** — *shipped*. New
+    `runtime/stream.zig` exposes `generateStream(model, tokenizer,
+    sampler, backend, …, callback, cb_ctx)` with a C-ABI token callback
+    (returns `0` to stop). New `runtime/pressure.zig` exposes a `Hub`
+    that forwards `signalMemory` / `signalThermal` from the host OS to
+    registered sinks (Backends, future KV-cache shrink, ThreadPool
+    throttle). Backend vtable slots `on_pressure` + `on_thermal` are
+    wired; full KV-cache `shrinkToFit` + worker-count throttling lands
+    with item 18.
+18. **KV-cache shrinkToFit + adaptive worker count** — *planned*.
+    Memory pressure callbacks today notify the backend but don't yet
+    re-size the KV cache or reduce active worker count. Hook into
+    `KvCache.shrinkToFit(new_max_seq)` + a real
+    `ThreadPool.setActiveWorkers` so the lib gracefully degrades on a
+    low-memory iPhone / thermally-throttled chassis.
 
-Items 8 + 9 + 10 are the next perf pushes. Item 7's negative result
-shifted the model: the matmul kernel is at the hardware's effective
-limit for GEMV at TinyLlama scale; further wins need architecture
-changes (async dispatch, weight fusion, batching), not better kernels.
+Items 8 + 9 + 10 are the next perf pushes; items 18 + a C-ABI shim
+unlock real iOS app integration. Item 7's negative result shifted the
+model: the matmul kernel is at the hardware's effective limit for GEMV
+at TinyLlama scale; further wins need architecture changes (async
+dispatch, weight fusion, batching), not better kernels.
 
 ---
 
