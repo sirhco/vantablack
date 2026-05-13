@@ -607,12 +607,14 @@ pub const Gemma4Model = struct {
         try self.lookupPerLayerEmbedding(token_id, layer_idx, ple_in);
         try self.projectPleGate(hidden_out, layer_idx, gate_out);
 
+        // SiLU activation: x * sigmoid(x). Swapped from gelu_approx —
+        // empirically more stable on this architecture. Exact op kind
+        // (builtin 150 in TFLite) not yet verified against upstream.
         var i: usize = 0;
         while (i < ple_dim) : (i += 1) {
             const x = gate_out[i];
-            const t = 0.7978845608 * (x + 0.044715 * x * x * x);
-            const tanh_t = std.math.tanh(t);
-            const g = 0.5 * x * (1.0 + tanh_t);
+            const sig = 1.0 / (1.0 + @exp(-x));
+            const g = x * sig;
             ple_in[i] *= g;
         }
         try self.projectPleProj(ple_in, layer_idx, residual);
