@@ -84,6 +84,12 @@ pub const Gemma4Layer = struct {
     norm_pre_ffw: ?*const tflite.Tensor = null,
     norm_post_ffw: ?*const tflite.Tensor = null,
     norm_post_per_layer: ?*const tflite.Tensor = null,
+    /// Q/K-norm scales applied after projection, before RoPE.
+    /// Shape [n_kv_heads * head_dim] (256 in Gemma 4 E2B). K-norm
+    /// applies elementwise on the K vector; Q-norm broadcasts over
+    /// the n_q_per_kv groups.
+    norm_query: ?*const tflite.Tensor = null,
+    norm_key: ?*const tflite.Tensor = null,
 };
 
 pub const Gemma4Model = struct {
@@ -409,6 +415,29 @@ pub const Gemma4Model = struct {
                 try self.projectK(h_norm, layer_idx, k_slice);
                 try self.projectV(h_norm, layer_idx, v_slice);
             }
+
+            // Q-norm + K-norm (Gemma 4) applied after projection, before
+            // RoPE. K-norm matches K's element count exactly; Q-norm
+            // scale [n_kv_heads * head_dim] is broadcast across the
+            // n_q_per_kv groups so each kv-head's q-fan-out shares the
+            // same per-feature scale.
+            if (layer.norm_query) |w_t| {
+                const w_f32: []const f32 = @as([*]const f32, @ptrCast(@alignCast(w_t.data.ptr)))[0..@intCast(w_t.shape[0])];
+                const group_size: usize = w_f32.len; // n_kv * head_dim
+                const groups: usize = q_dim_l / group_size;
+                var g: usize = 0;
+                while (g < groups) : (g += 1) {
+                    math.rmsNormGemma(q_slice[g * group_size ..][0..group_size], w_f32, rms_eps);
+                }
+            }
+            if (layer.k != null) {
+                if (layer.norm_key) |w_t| {
+                    const w_f32: []const f32 = @as([*]const f32, @ptrCast(@alignCast(w_t.data.ptr)))[0..@intCast(w_t.shape[0])];
+                    const k_slice2 = cached_k[0 .. n_kv_l * head_dim];
+                    math.rmsNormGemma(k_slice2, w_f32, rms_eps);
+                }
+            }
+
             // RoPE on Q + K (K only when freshly projected — once
             // cached, it's already rotated for pos 0).
             var hh: usize = 0;
@@ -860,7 +889,7 @@ pub fn initFromLitertlm(
     // outputs by name, and pin the scale input by elimination (the
     // input that's a constant tensor with FP32 [hidden] data).
     {
-        const NormRole = enum { pre_attn, post_attn, pre_ffw, post_ffw, post_per_layer, none };
+        const NormRole = enum { pre_attn, post_attn, pre_ffw, post_ffw, post_per_layer, query, key, none };
         for (decoder_tfl.operators) |op| {
             if (op.outputs.len != 1 or op.inputs.len < 2) continue;
             const out_idx_i: i32 = op.outputs[0];
@@ -887,12 +916,21 @@ pub fn initFromLitertlm(
                 .post_ffw
             else if (std.mem.indexOf(u8, name, "post_per_layer_input_norm") != null)
                 .post_per_layer
+            else if (std.mem.indexOf(u8, name, "query_norm") != null)
+                .query
+            else if (std.mem.indexOf(u8, name, "key_norm") != null)
+                .key
             else
                 .none;
             if (role == .none) continue;
 
-            // Find the scale input: an input tensor that is FP32, has
-            // shape [hidden], and carries non-empty data.
+            // Expected scale shape per role:
+            //   [hidden] for the 5 transformer-block norms
+            //   [n_kv_heads * head_dim] (256 in E2B) for Q/K-norm
+            const expected_dim: u32 = switch (role) {
+                .query, .key => @as(u32, @intCast(n_kv_heads)) * @as(u32, @intCast(head_dim)),
+                else => @as(u32, @intCast(hidden)),
+            };
             var scale_tensor: ?*const tflite.Tensor = null;
             for (op.inputs) |in_idx_i| {
                 if (in_idx_i < 0) continue;
@@ -902,7 +940,7 @@ pub fn initFromLitertlm(
                 if (in_t.dtype != .float32) continue;
                 if (in_t.data.len == 0) continue;
                 if (in_t.shape.len != 1) continue;
-                if (in_t.shape[0] != @as(i32, @intCast(hidden))) continue;
+                if (in_t.shape[0] != @as(i32, @intCast(expected_dim))) continue;
                 scale_tensor = in_t;
                 break;
             }
@@ -923,6 +961,12 @@ pub fn initFromLitertlm(
                     },
                     .post_per_layer => if (layer.norm_post_per_layer == null) {
                         layer.norm_post_per_layer = st;
+                    },
+                    .query => if (layer.norm_query == null) {
+                        layer.norm_query = st;
+                    },
+                    .key => if (layer.norm_key == null) {
+                        layer.norm_key = st;
                     },
                     .none => unreachable,
                 }
