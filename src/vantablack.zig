@@ -14,6 +14,7 @@ pub const kernels = @import("kernels/comptime_gen.zig");
 pub const simd = @import("kernels/simd.zig");
 pub const math = @import("kernels/math.zig");
 pub const mlx = @import("kernels/mlx.zig");
+pub const tflite_int4 = @import("kernels/tflite_int4.zig");
 pub const kv_cache = @import("runtime/kv_cache.zig");
 pub const model = @import("runtime/model.zig");
 pub const forward = @import("runtime/forward.zig");
