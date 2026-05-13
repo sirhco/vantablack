@@ -1,0 +1,24 @@
+Gemma 4 E2B — vantablack multi-token generation samples
+========================================================
+
+Generated via: vantablack gemma4-generate <model.litertlm> <N> <ids...>
+Model: ~/.cache/huggingface/hub/litertlm-models/gemma-4-E2B-it.litertlm
+
+--- prompt [105] → 10 tokens ---
+prompt: [105]
+generated (10 tokens): [100821 167872 65330 65330 167872 65330 167872 65330 167872 230178]
+
+--- prompt [2 105 4914] → 10 tokens ---
+prompt: [2 105 4914]
+generated (10 tokens): [100821 104474 236051 134709 206373 176649 134709 155046 188359 122185]
+
+--- prompt [2 1 105] → 12 tokens ---
+prompt: [2 1 105]
+generated (12 tokens): [114301 143735 16335 114301 143735 65330 159708 141679 142089 104506 798 142089]
+
+Notes:
+- Output not yet bit-equal vs Google's litert-lm reference.
+- Single-token prompts collapse to attractor tokens (limited context).
+- Multi-token prompts produce diverse output (real attention working).
+- See tests/golden/gemma4-e2b-architecture-notes.md for the full
+  list of structural fixes still needed for bit-equal.
