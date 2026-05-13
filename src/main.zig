@@ -11,6 +11,7 @@ const usage =
     \\  vantablack <model.gguf> chat <n> <user-message>      wrap in TinyLlama-Chat (zephyr) template
     \\  vantablack <model.gguf> serve [--host H] [--port P]  Ollama-compatible HTTP server (default 127.0.0.1:11434)
     \\  vantablack inspect <model.litertlm>                 print sections + metadata of a LiteRT-LM bundle
+    \\  vantablack inspect-section <m.litertlm> <idx>       deep-dump tensors + operator graph of one TFLite section
     \\  vantablack tokenize-litertlm <m.litertlm> <text>    encode text using HF tokenizer embedded in a .litertlm
     \\
     \\generate / prompt / chat accept sampler flags BEFORE the n value:
@@ -56,6 +57,21 @@ pub fn main(init: std.process.Init) !void {
             return error.MissingArgs;
         }
         try runTokenizeLitertlm(gpa, arena, io, args[2], args[3], out, err);
+        return;
+    }
+
+    // inspect-section <model.litertlm> <idx>: deep dump of a single
+    // TFLite section. Lists every weight tensor (sorted by size) and
+    // every operator with its input/output tensor indices. Lets a dev
+    // hand-trace the forward graph to inform Phase 19c tensor mapping.
+    if (std.mem.eql(u8, args[1], "inspect-section")) {
+        if (args.len < 4) {
+            try err.writeAll("usage: vantablack inspect-section <model.litertlm> <section_idx>\n");
+            try err.flush();
+            return error.MissingArgs;
+        }
+        const idx = try std.fmt.parseInt(usize, args[3], 10);
+        try runInspectSection(gpa, arena, io, args[2], idx, out, err);
         return;
     }
 
@@ -451,6 +467,106 @@ fn runTokenizeLitertlm(
         try out.print("{d}", .{id});
     }
     try out.writeByte('\n');
+    try out.flush();
+}
+
+fn runInspectSection(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: Io,
+    input_path: []const u8,
+    section_idx: usize,
+    out: *Io.Writer,
+    err: *Io.Writer,
+) !void {
+    const abs_path = if (std.fs.path.isAbsolute(input_path))
+        try arena.dupe(u8, input_path)
+    else blk: {
+        const cwd = try std.process.currentPathAlloc(io, arena);
+        break :blk try std.fs.path.resolve(arena, &.{ cwd, input_path });
+    };
+    const file = try Io.Dir.openFileAbsolute(io, abs_path, .{ .allow_directory = false });
+    defer file.close(io);
+    const len = try file.length(io);
+    const len_us: usize = std.math.cast(usize, len) orelse return error.FileTooLarge;
+    const mapped = try std.posix.mmap(null, len_us, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    defer std.posix.munmap(mapped);
+
+    var bundle = try vantablack.litertlm.Bundle.init(gpa, mapped);
+    defer bundle.deinit();
+
+    if (section_idx >= bundle.sections.len) {
+        try err.print("section index {d} out of range (bundle has {d} sections)\n", .{ section_idx, bundle.sections.len });
+        try err.flush();
+        return error.IndexOutOfRange;
+    }
+    const s = bundle.sections[section_idx];
+    if (s.data_type != .tflite_model) {
+        try err.print("section {d} is {s}, not TFLiteModel — nothing to deep-dump\n", .{ section_idx, s.data_type.name() });
+        try err.flush();
+        return error.WrongSectionType;
+    }
+
+    const bytes = try bundle.sectionBytes(s);
+    var tfl = try vantablack.tflite.Model.init(gpa, bytes);
+    defer tfl.deinit();
+
+    const size_mb: f64 = @as(f64, @floatFromInt(s.size())) / (1024.0 * 1024.0);
+    try out.print("section[{d}] TFLiteModel, {d:.2} MB, {d} tensors, {d} operators, {d} op_codes\n", .{
+        section_idx, size_mb, tfl.tensors.len, tfl.operators.len, tfl.operator_codes.len,
+    });
+
+    try out.writeAll("\noperator_codes:\n");
+    for (tfl.operator_codes, 0..) |oc, i| {
+        const custom = if (oc.custom_code) |c| c else "";
+        try out.print("  [{d}] builtin={d} ({s}) custom=\"{s}\" version={d}\n", .{
+            i, oc.builtin_code, vantablack.tflite.nameOfOp(oc.builtin_code), custom, oc.version,
+        });
+    }
+
+    try out.writeAll("\noperators (op #, opcode, inputs → outputs):\n");
+    for (tfl.operators, 0..) |op, i| {
+        const op_name = if (op.opcode_index < tfl.operator_codes.len)
+            vantablack.tflite.nameOfOp(tfl.operator_codes[op.opcode_index].builtin_code)
+        else
+            "?";
+        try out.print("  [{d:>4}] {s:<20} (idx={d}) inputs=[", .{ i, op_name, op.opcode_index });
+        for (op.inputs, 0..) |t, j| {
+            if (j > 0) try out.writeByte(',');
+            try out.print("{d}", .{t});
+        }
+        try out.writeAll("] outputs=[");
+        for (op.outputs, 0..) |t, j| {
+            if (j > 0) try out.writeByte(',');
+            try out.print("{d}", .{t});
+        }
+        try out.writeAll("]\n");
+    }
+
+    // Sort tensors by data size descending so the real weight blobs
+    // surface ahead of trivial scalars.
+    const ranked = try gpa.dupe(vantablack.tflite.Tensor, tfl.tensors);
+    defer gpa.free(ranked);
+    const SortCtx = struct {
+        fn gt(_: void, a: vantablack.tflite.Tensor, b: vantablack.tflite.Tensor) bool {
+            return a.data.len > b.data.len;
+        }
+    };
+    std.sort.pdq(vantablack.tflite.Tensor, ranked, {}, SortCtx.gt);
+
+    try out.writeAll("\ntensors (sorted by data size, all listed):\n");
+    for (ranked, 0..) |t, i| {
+        try out.print("  [{d:>4}] {s:<10} ", .{ i, t.dtype.name() });
+        try out.writeAll(t.name);
+        try out.writeAll(" shape=[");
+        for (t.shape, 0..) |d, j| {
+            if (j > 0) try out.writeByte(',');
+            try out.print("{d}", .{d});
+        }
+        const quant = if (t.scales.len > 0) " quant" else "";
+        try out.print("] data={d} bytes buffer={d}{s}\n", .{ t.data.len, t.buffer_index, quant });
+    }
+
     try out.flush();
 }
 

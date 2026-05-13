@@ -258,10 +258,18 @@ pub const Vector = struct {
         return @bitCast(try self.buf.readU64(self.data_off + i * 8));
     }
 
-    /// Raw byte slice covering all elements. Convenience for `[ubyte]` /
-    /// `[byte]` vectors where the caller wants the whole payload at once.
+    /// Raw byte slice covering all elements, assuming 1-byte elements
+    /// (`[ubyte]` / `[byte]` / `[bool]`). Returns `len` bytes.
     pub fn bytes(self: Vector) Error![]const u8 {
-        const end: usize = @as(usize, self.data_off) + @as(usize, self.len);
+        return self.bytesElemSize(1);
+    }
+
+    /// Raw byte slice covering all elements at the given element size.
+    /// Returns `len * elem_size` bytes. Caller re-interprets as []i32 /
+    /// []f32 / []i64 etc. via @ptrCast.
+    pub fn bytesElemSize(self: Vector, elem_size: usize) Error![]const u8 {
+        const total: usize = @as(usize, self.len) * elem_size;
+        const end: usize = @as(usize, self.data_off) + total;
         if (end > self.buf.bytes.len) return error.OutOfBounds;
         return self.buf.bytes[self.data_off..end];
     }

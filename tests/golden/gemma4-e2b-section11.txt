@@ -1,0 +1,505 @@
+section[11] TFLiteModel, 42.27 MB, 275 tensors, 198 operators, 25 op_codes
+
+operator_codes:
+  [0] builtin=114 (OP?) custom="" version=1
+  [1] builtin=9 (FULLY_CONNECTED) custom="" version=5
+  [2] builtin=6 (DEQUANTIZE) custom="" version=2
+  [3] builtin=206 (OP?) custom="" version=1
+  [4] builtin=22 (RESHAPE) custom="" version=1
+  [5] builtin=53 (OP?) custom="" version=1
+  [6] builtin=18 (MUL) custom="" version=1
+  [7] builtin=66 (OP?) custom="" version=1
+  [8] builtin=108 (OP?) custom="" version=1
+  [9] builtin=65 (OP?) custom="" version=1
+  [10] builtin=41 (SUB) custom="" version=1
+  [11] builtin=0 (ADD) custom="" version=1
+  [12] builtin=2 (CONCATENATION) custom="" version=1
+  [13] builtin=62 (OP?) custom="" version=1
+  [14] builtin=58 (OP?) custom="" version=1
+  [15] builtin=86 (OP?) custom="" version=1
+  [16] builtin=72 (OP?) custom="" version=1
+  [17] builtin=123 (OP?) custom="" version=1
+  [18] builtin=25 (SOFTMAX) custom="" version=1
+  [19] builtin=82 (OP?) custom="" version=1
+  [20] builtin=150 (OP?) custom="" version=1
+  [21] builtin=28 (TANH) custom="" version=1
+  [22] builtin=74 (OP?) custom="" version=1
+  [23] builtin=76 (MIRROR_PAD) custom="" version=1
+  [24] builtin=126 (OP?) custom="" version=1
+
+operators (op #, opcode, inputs → outputs):
+  [   0] OP?                  (idx=0) inputs=[1] outputs=[54]
+  [   1] FULLY_CONNECTED      (idx=1) inputs=[54,55,-1] outputs=[56]
+  [   2] DEQUANTIZE           (idx=2) inputs=[56] outputs=[57]
+  [   3] OP?                  (idx=3) inputs=[57,34] outputs=[58]
+  [   4] OP?                  (idx=0) inputs=[58] outputs=[59]
+  [   5] FULLY_CONNECTED      (idx=1) inputs=[59,60,-1] outputs=[61]
+  [   6] RESHAPE              (idx=4) inputs=[61,48] outputs=[62]
+  [   7] DEQUANTIZE           (idx=2) inputs=[62] outputs=[63]
+  [   8] OP?                  (idx=3) inputs=[63,32] outputs=[64]
+  [   9] OP?                  (idx=5) inputs=[0] outputs=[65]
+  [  10] RESHAPE              (idx=4) inputs=[65,44] outputs=[66]
+  [  11] MUL                  (idx=6) inputs=[66,14] outputs=[67]
+  [  12] RESHAPE              (idx=4) inputs=[67,43] outputs=[68]
+  [  13] OP?                  (idx=7) inputs=[68] outputs=[69]
+  [  14] OP?                  (idx=8) inputs=[68] outputs=[70]
+  [  15] OP?                  (idx=9) inputs=[64,13,12] outputs=[71]
+  [  16] OP?                  (idx=9) inputs=[64,11,12] outputs=[72]
+  [  17] MUL                  (idx=6) inputs=[71,70] outputs=[73]
+  [  18] MUL                  (idx=6) inputs=[72,69] outputs=[74]
+  [  19] SUB                  (idx=10) inputs=[73,74] outputs=[75]
+  [  20] MUL                  (idx=6) inputs=[72,70] outputs=[76]
+  [  21] MUL                  (idx=6) inputs=[71,69] outputs=[77]
+  [  22] ADD                  (idx=11) inputs=[76,77] outputs=[78]
+  [  23] CONCATENATION        (idx=12) inputs=[75,78] outputs=[79]
+  [  24] RESHAPE              (idx=4) inputs=[0,44] outputs=[80]
+  [  25] OP?                  (idx=13) inputs=[80,50] outputs=[81]
+  [  26] OP?                  (idx=14) inputs=[80,49] outputs=[82]
+  [  27] OP?                  (idx=15) inputs=[81,82] outputs=[83]
+  [  28] RESHAPE              (idx=4) inputs=[83,42] outputs=[84]
+  [  29] OP?                  (idx=3) inputs=[79,4,2] outputs=[85]
+  [  30] OP?                  (idx=5) inputs=[84] outputs=[86]
+  [  31] CONCATENATION        (idx=12) inputs=[86,86,86,86] outputs=[87]
+  [  32] OP?                  (idx=16) inputs=[87,41] outputs=[88]
+  [  33] RESHAPE              (idx=4) inputs=[88,40] outputs=[89]
+  [  34] OP?                  (idx=17) inputs=[89,85,39] outputs=[90]
+  [  35] SOFTMAX              (idx=18) inputs=[90] outputs=[91]
+  [  36] OP?                  (idx=3) inputs=[91,6,2] outputs=[92]
+  [  37] OP?                  (idx=19) inputs=[86,47] outputs=[93]
+  [  38] OP?                  (idx=16) inputs=[93,51] outputs=[94]
+  [  39] OP?                  (idx=17) inputs=[94,92,41] outputs=[95]
+  [  40] RESHAPE              (idx=4) inputs=[95,45] outputs=[96]
+  [  41] OP?                  (idx=0) inputs=[96] outputs=[97]
+  [  42] FULLY_CONNECTED      (idx=1) inputs=[97,98,-1] outputs=[99]
+  [  43] DEQUANTIZE           (idx=2) inputs=[99] outputs=[100]
+  [  44] OP?                  (idx=3) inputs=[100,36] outputs=[101]
+  [  45] ADD                  (idx=11) inputs=[57,101] outputs=[102]
+  [  46] OP?                  (idx=3) inputs=[102,33] outputs=[103]
+  [  47] OP?                  (idx=0) inputs=[103] outputs=[104]
+  [  48] FULLY_CONNECTED      (idx=1) inputs=[104,105,-1] outputs=[106]
+  [  49] DEQUANTIZE           (idx=2) inputs=[106] outputs=[107]
+  [  50] FULLY_CONNECTED      (idx=1) inputs=[104,108,-1] outputs=[109]
+  [  51] DEQUANTIZE           (idx=2) inputs=[109] outputs=[110]
+  [  52] OP?                  (idx=20) inputs=[107] outputs=[111]
+  [  53] MUL                  (idx=6) inputs=[111,110] outputs=[112]
+  [  54] OP?                  (idx=0) inputs=[112] outputs=[113]
+  [  55] FULLY_CONNECTED      (idx=1) inputs=[113,114,-1] outputs=[115]
+  [  56] DEQUANTIZE           (idx=2) inputs=[115] outputs=[116]
+  [  57] OP?                  (idx=3) inputs=[116,35] outputs=[117]
+  [  58] ADD                  (idx=11) inputs=[102,117] outputs=[118]
+  [  59] MUL                  (idx=6) inputs=[118,18] outputs=[119]
+  [  60] OP?                  (idx=3) inputs=[119,29] outputs=[120]
+  [  61] OP?                  (idx=0) inputs=[120] outputs=[121]
+  [  62] FULLY_CONNECTED      (idx=1) inputs=[121,122,-1] outputs=[123]
+  [  63] RESHAPE              (idx=4) inputs=[123,48] outputs=[124]
+  [  64] DEQUANTIZE           (idx=2) inputs=[124] outputs=[125]
+  [  65] OP?                  (idx=3) inputs=[125,32] outputs=[126]
+  [  66] OP?                  (idx=9) inputs=[126,13,12] outputs=[127]
+  [  67] OP?                  (idx=9) inputs=[126,11,12] outputs=[128]
+  [  68] MUL                  (idx=6) inputs=[127,70] outputs=[129]
+  [  69] MUL                  (idx=6) inputs=[128,69] outputs=[130]
+  [  70] SUB                  (idx=10) inputs=[129,130] outputs=[131]
+  [  71] MUL                  (idx=6) inputs=[128,70] outputs=[132]
+  [  72] MUL                  (idx=6) inputs=[127,69] outputs=[133]
+  [  73] ADD                  (idx=11) inputs=[132,133] outputs=[134]
+  [  74] CONCATENATION        (idx=12) inputs=[131,134] outputs=[135]
+  [  75] OP?                  (idx=3) inputs=[135,4,2] outputs=[136]
+  [  76] OP?                  (idx=17) inputs=[89,136,39] outputs=[137]
+  [  77] SOFTMAX              (idx=18) inputs=[137] outputs=[138]
+  [  78] OP?                  (idx=3) inputs=[138,6,2] outputs=[139]
+  [  79] OP?                  (idx=17) inputs=[94,139,41] outputs=[140]
+  [  80] RESHAPE              (idx=4) inputs=[140,45] outputs=[141]
+  [  81] OP?                  (idx=0) inputs=[141] outputs=[142]
+  [  82] FULLY_CONNECTED      (idx=1) inputs=[142,143,-1] outputs=[144]
+  [  83] DEQUANTIZE           (idx=2) inputs=[144] outputs=[145]
+  [  84] OP?                  (idx=3) inputs=[145,31] outputs=[146]
+  [  85] ADD                  (idx=11) inputs=[119,146] outputs=[147]
+  [  86] OP?                  (idx=3) inputs=[147,28] outputs=[148]
+  [  87] OP?                  (idx=0) inputs=[148] outputs=[149]
+  [  88] FULLY_CONNECTED      (idx=1) inputs=[149,150,-1] outputs=[151]
+  [  89] DEQUANTIZE           (idx=2) inputs=[151] outputs=[152]
+  [  90] FULLY_CONNECTED      (idx=1) inputs=[149,153,-1] outputs=[154]
+  [  91] DEQUANTIZE           (idx=2) inputs=[154] outputs=[155]
+  [  92] OP?                  (idx=20) inputs=[152] outputs=[156]
+  [  93] MUL                  (idx=6) inputs=[156,155] outputs=[157]
+  [  94] OP?                  (idx=0) inputs=[157] outputs=[158]
+  [  95] FULLY_CONNECTED      (idx=1) inputs=[158,159,-1] outputs=[160]
+  [  96] DEQUANTIZE           (idx=2) inputs=[160] outputs=[161]
+  [  97] OP?                  (idx=3) inputs=[161,30] outputs=[162]
+  [  98] ADD                  (idx=11) inputs=[147,162] outputs=[163]
+  [  99] MUL                  (idx=6) inputs=[163,17] outputs=[164]
+  [ 100] OP?                  (idx=3) inputs=[164,25] outputs=[165]
+  [ 101] OP?                  (idx=0) inputs=[165] outputs=[166]
+  [ 102] FULLY_CONNECTED      (idx=1) inputs=[166,167,-1] outputs=[168]
+  [ 103] RESHAPE              (idx=4) inputs=[168,48] outputs=[169]
+  [ 104] DEQUANTIZE           (idx=2) inputs=[169] outputs=[170]
+  [ 105] OP?                  (idx=3) inputs=[170,32] outputs=[171]
+  [ 106] OP?                  (idx=9) inputs=[171,13,12] outputs=[172]
+  [ 107] OP?                  (idx=9) inputs=[171,11,12] outputs=[173]
+  [ 108] MUL                  (idx=6) inputs=[172,70] outputs=[174]
+  [ 109] MUL                  (idx=6) inputs=[173,69] outputs=[175]
+  [ 110] SUB                  (idx=10) inputs=[174,175] outputs=[176]
+  [ 111] MUL                  (idx=6) inputs=[173,70] outputs=[177]
+  [ 112] MUL                  (idx=6) inputs=[172,69] outputs=[178]
+  [ 113] ADD                  (idx=11) inputs=[177,178] outputs=[179]
+  [ 114] CONCATENATION        (idx=12) inputs=[176,179] outputs=[180]
+  [ 115] OP?                  (idx=3) inputs=[180,4,2] outputs=[181]
+  [ 116] OP?                  (idx=17) inputs=[89,181,39] outputs=[182]
+  [ 117] SOFTMAX              (idx=18) inputs=[182] outputs=[183]
+  [ 118] OP?                  (idx=3) inputs=[183,6,2] outputs=[184]
+  [ 119] OP?                  (idx=17) inputs=[94,184,41] outputs=[185]
+  [ 120] RESHAPE              (idx=4) inputs=[185,45] outputs=[186]
+  [ 121] OP?                  (idx=0) inputs=[186] outputs=[187]
+  [ 122] FULLY_CONNECTED      (idx=1) inputs=[187,188,-1] outputs=[189]
+  [ 123] DEQUANTIZE           (idx=2) inputs=[189] outputs=[190]
+  [ 124] OP?                  (idx=3) inputs=[190,27] outputs=[191]
+  [ 125] ADD                  (idx=11) inputs=[164,191] outputs=[192]
+  [ 126] OP?                  (idx=3) inputs=[192,24] outputs=[193]
+  [ 127] OP?                  (idx=0) inputs=[193] outputs=[194]
+  [ 128] FULLY_CONNECTED      (idx=1) inputs=[194,195,-1] outputs=[196]
+  [ 129] DEQUANTIZE           (idx=2) inputs=[196] outputs=[197]
+  [ 130] FULLY_CONNECTED      (idx=1) inputs=[194,198,-1] outputs=[199]
+  [ 131] DEQUANTIZE           (idx=2) inputs=[199] outputs=[200]
+  [ 132] OP?                  (idx=20) inputs=[197] outputs=[201]
+  [ 133] MUL                  (idx=6) inputs=[201,200] outputs=[202]
+  [ 134] OP?                  (idx=0) inputs=[202] outputs=[203]
+  [ 135] FULLY_CONNECTED      (idx=1) inputs=[203,204,-1] outputs=[205]
+  [ 136] DEQUANTIZE           (idx=2) inputs=[205] outputs=[206]
+  [ 137] OP?                  (idx=3) inputs=[206,26] outputs=[207]
+  [ 138] ADD                  (idx=11) inputs=[192,207] outputs=[208]
+  [ 139] MUL                  (idx=6) inputs=[208,16] outputs=[209]
+  [ 140] OP?                  (idx=3) inputs=[209,20] outputs=[210]
+  [ 141] OP?                  (idx=0) inputs=[210] outputs=[211]
+  [ 142] FULLY_CONNECTED      (idx=1) inputs=[211,212,-1] outputs=[213]
+  [ 143] RESHAPE              (idx=4) inputs=[213,46] outputs=[214]
+  [ 144] DEQUANTIZE           (idx=2) inputs=[214] outputs=[215]
+  [ 145] OP?                  (idx=3) inputs=[215,23] outputs=[216]
+  [ 146] MUL                  (idx=6) inputs=[66,10] outputs=[217]
+  [ 147] RESHAPE              (idx=4) inputs=[217,37] outputs=[218]
+  [ 148] OP?                  (idx=7) inputs=[218] outputs=[219]
+  [ 149] OP?                  (idx=8) inputs=[218] outputs=[220]
+  [ 150] OP?                  (idx=9) inputs=[216,13,48] outputs=[221]
+  [ 151] OP?                  (idx=9) inputs=[216,9,48] outputs=[222]
+  [ 152] MUL                  (idx=6) inputs=[221,220] outputs=[223]
+  [ 153] MUL                  (idx=6) inputs=[222,219] outputs=[224]
+  [ 154] SUB                  (idx=10) inputs=[223,224] outputs=[225]
+  [ 155] MUL                  (idx=6) inputs=[222,220] outputs=[226]
+  [ 156] MUL                  (idx=6) inputs=[221,219] outputs=[227]
+  [ 157] ADD                  (idx=11) inputs=[226,227] outputs=[228]
+  [ 158] CONCATENATION        (idx=12) inputs=[225,228] outputs=[229]
+  [ 159] OP?                  (idx=3) inputs=[229,3,2] outputs=[230]
+  [ 160] OP?                  (idx=5) inputs=[5] outputs=[231]
+  [ 161] CONCATENATION        (idx=12) inputs=[231,231,231,231] outputs=[232]
+  [ 162] OP?                  (idx=16) inputs=[232,41] outputs=[233]
+  [ 163] RESHAPE              (idx=4) inputs=[233,40] outputs=[234]
+  [ 164] OP?                  (idx=17) inputs=[234,230,39] outputs=[235]
+  [ 165] SOFTMAX              (idx=18) inputs=[235] outputs=[236]
+  [ 166] OP?                  (idx=3) inputs=[236,7,2] outputs=[237]
+  [ 167] OP?                  (idx=19) inputs=[231,47] outputs=[238]
+  [ 168] OP?                  (idx=16) inputs=[238,51] outputs=[239]
+  [ 169] OP?                  (idx=17) inputs=[239,237,41] outputs=[240]
+  [ 170] RESHAPE              (idx=4) inputs=[240,38] outputs=[241]
+  [ 171] OP?                  (idx=0) inputs=[241] outputs=[242]
+  [ 172] FULLY_CONNECTED      (idx=1) inputs=[242,243,-1] outputs=[244]
+  [ 173] DEQUANTIZE           (idx=2) inputs=[244] outputs=[245]
+  [ 174] OP?                  (idx=3) inputs=[245,22] outputs=[246]
+  [ 175] ADD                  (idx=11) inputs=[209,246] outputs=[247]
+  [ 176] OP?                  (idx=3) inputs=[247,19] outputs=[248]
+  [ 177] OP?                  (idx=0) inputs=[248] outputs=[249]
+  [ 178] FULLY_CONNECTED      (idx=1) inputs=[249,250,-1] outputs=[251]
+  [ 179] DEQUANTIZE           (idx=2) inputs=[251] outputs=[252]
+  [ 180] FULLY_CONNECTED      (idx=1) inputs=[249,253,-1] outputs=[254]
+  [ 181] DEQUANTIZE           (idx=2) inputs=[254] outputs=[255]
+  [ 182] OP?                  (idx=20) inputs=[252] outputs=[256]
+  [ 183] MUL                  (idx=6) inputs=[256,255] outputs=[257]
+  [ 184] OP?                  (idx=0) inputs=[257] outputs=[258]
+  [ 185] FULLY_CONNECTED      (idx=1) inputs=[258,259,-1] outputs=[260]
+  [ 186] DEQUANTIZE           (idx=2) inputs=[260] outputs=[261]
+  [ 187] OP?                  (idx=3) inputs=[261,21] outputs=[262]
+  [ 188] ADD                  (idx=11) inputs=[247,262] outputs=[263]
+  [ 189] MUL                  (idx=6) inputs=[263,15] outputs=[264]
+  [ 190] OP?                  (idx=3) inputs=[264,53] outputs=[265]
+  [ 191] FULLY_CONNECTED      (idx=1) inputs=[265,266,-1] outputs=[267]
+  [ 192] MUL                  (idx=6) inputs=[267,8] outputs=[268]
+  [ 193] TANH                 (idx=21) inputs=[268] outputs=[269]
+  [ 194] MUL                  (idx=6) inputs=[269,52] outputs=[270]
+  [ 195] OP?                  (idx=0) inputs=[265] outputs=[271]
+  [ 196] FULLY_CONNECTED      (idx=1) inputs=[271,272,-1] outputs=[273]
+  [ 197] DEQUANTIZE           (idx=2) inputs=[273] outputs=[274]
+
+tensors (sorted by data size, all listed):
+  [   0] INT4       MtpDrafterModel.decode_softmax/transformer.decode_softmax/embedder.decode/composite shape=[262144,256] data=33554432 bytes buffer=267 quant
+  [   1] INT8       MtpDrafterModel.mtp_pre_project/mtp_pre_proj/btm,md->btd/dot_general shape=[256,3072] data=786432 bytes buffer=56 quant
+  [   2] INT8       layer_3/layer_3.post_qkv/attn.post_qkv/attn_vec_einsum/btH,Hd->btd/dot_general shape=[256,2048] data=524288 bytes buffer=244 quant
+  [   3] INT8       layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/reshape;layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/btd,dH->btH/dot_general shape=[2048,256] data=524288 bytes buffer=213 quant
+  [   4] INT8       MtpDrafterModel.mtp_post_project/mtp_post_proj/btd,dm->btm/dot_general shape=[1536,256] data=393216 bytes buffer=273 quant
+  [   5] INT4       layer_2/layer_2.post_qkv/mlp/gating_einsum2/btd,df->btf/dot_general shape=[2048,256] data=262144 bytes buffer=199 quant
+  [   6] INT4       layer_3/layer_3.post_qkv/mlp/gating_einsum1/btd,df->btf/dot_general shape=[2048,256] data=262144 bytes buffer=251 quant
+  [   7] INT4       layer_3/layer_3.post_qkv/mlp/gating_einsum2/btd,df->btf/dot_general shape=[2048,256] data=262144 bytes buffer=254 quant
+  [   8] INT4       layer_0/layer_0.post_qkv/mlp/gating_einsum1/btd,df->btf/dot_general shape=[2048,256] data=262144 bytes buffer=106 quant
+  [   9] INT8       layer_2/layer_2.post_qkv/attn.post_qkv/attn_vec_einsum/btH,Hd->btd/dot_general shape=[256,1024] data=262144 bytes buffer=189 quant
+  [  10] INT4       layer_2/layer_2.post_qkv/mlp/gating_einsum1/btd,df->btf/dot_general shape=[2048,256] data=262144 bytes buffer=196 quant
+  [  11] INT8       layer_2/layer_2.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/reshape;layer_2/layer_2.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/btd,dH->btH/dot_general shape=[1024,256] data=262144 bytes buffer=168 quant
+  [  12] INT4       layer_0/layer_0.post_qkv/mlp/gating_einsum2/btd,df->btf/dot_general shape=[2048,256] data=262144 bytes buffer=109 quant
+  [  13] INT4       layer_3/layer_3.post_qkv/mlp/linear/btf,fd->btd/dot_general shape=[256,2048] data=262144 bytes buffer=260 quant
+  [  14] INT4       layer_0/layer_0.post_qkv/mlp/linear/btf,fd->btd/dot_general shape=[256,2048] data=262144 bytes buffer=115 quant
+  [  15] INT4       layer_1/layer_1.post_qkv/mlp/linear/btf,fd->btd/dot_general shape=[256,2048] data=262144 bytes buffer=160 quant
+  [  16] INT8       layer_1/layer_1.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/reshape;layer_1/layer_1.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/btd,dH->btH/dot_general shape=[1024,256] data=262144 bytes buffer=123 quant
+  [  17] INT4       layer_1/layer_1.post_qkv/mlp/gating_einsum1/btd,df->btf/dot_general shape=[2048,256] data=262144 bytes buffer=151 quant
+  [  18] INT8       layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/reshape;layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/btd,dH->btH/dot_general shape=[1024,256] data=262144 bytes buffer=61 quant
+  [  19] INT8       layer_1/layer_1.post_qkv/attn.post_qkv/attn_vec_einsum/btH,Hd->btd/dot_general shape=[256,1024] data=262144 bytes buffer=144 quant
+  [  20] INT4       layer_1/layer_1.post_qkv/mlp/gating_einsum2/btd,df->btf/dot_general shape=[2048,256] data=262144 bytes buffer=154 quant
+  [  21] INT4       layer_2/layer_2.post_qkv/mlp/linear/btf,fd->btd/dot_general shape=[256,2048] data=262144 bytes buffer=205 quant
+  [  22] INT8       layer_0/layer_0.post_qkv/attn.post_qkv/attn_vec_einsum/btH,Hd->btd/dot_general shape=[256,1024] data=262144 bytes buffer=99 quant
+  [  23] INT32      arith.constant13 shape=[1,1,32003] data=128012 bytes buffer=50
+  [  24] INT32      arith.constant14 shape=[1,1,32003] data=128012 bytes buffer=51
+  [  25] FLOAT32    jax2tf_arg_39/ReadVariableOp;StatefulPartitionedCall shape=[512] data=2048 bytes buffer=24
+  [  26] FLOAT32    jax2tf_arg_43/ReadVariableOp;StatefulPartitionedCall shape=[256] data=1024 bytes buffer=23
+  [  27] FLOAT32    jax2tf_arg_32/ReadVariableOp;StatefulPartitionedCall shape=[256] data=1024 bytes buffer=28
+  [  28] FLOAT32    jax2tf_arg_33/ReadVariableOp;StatefulPartitionedCall shape=[256] data=1024 bytes buffer=27
+  [  29] FLOAT32    jax2tf_arg_23/ReadVariableOp;StatefulPartitionedCall shape=[256] data=1024 bytes buffer=30
+  [  30] FLOAT32    jax2tf_arg_22/ReadVariableOp;StatefulPartitionedCall shape=[256] data=1024 bytes buffer=31
+  [  31] FLOAT32    jax2tf_arg_21/ReadVariableOp;StatefulPartitionedCall shape=[256] data=1024 bytes buffer=32
+  [  32] FLOAT32    arith.constant3 shape=[256] data=1024 bytes buffer=33
+  [  33] FLOAT32    jax2tf_arg_13/ReadVariableOp;StatefulPartitionedCall shape=[256] data=1024 bytes buffer=34
+  [  34] FLOAT32    jax2tf_arg_34/ReadVariableOp;StatefulPartitionedCall shape=[256] data=1024 bytes buffer=26
+  [  35] FLOAT32    jax2tf_arg_11/ReadVariableOp;StatefulPartitionedCall shape=[256] data=1024 bytes buffer=36
+  [  36] FLOAT32    jax2tf_arg_10/ReadVariableOp;StatefulPartitionedCall shape=[256] data=1024 bytes buffer=37
+  [  37] FLOAT32    jax2tf_arg_35/ReadVariableOp;StatefulPartitionedCall shape=[256] data=1024 bytes buffer=25
+  [  38] FLOAT32    jax2tf_arg_0/ReadVariableOp;StatefulPartitionedCall shape=[256] data=1024 bytes buffer=54
+  [  39] FLOAT32    jax2tf_arg_44/ReadVariableOp;StatefulPartitionedCall shape=[256] data=1024 bytes buffer=22
+  [  40] FLOAT32    jax2tf_arg_45/ReadVariableOp;StatefulPartitionedCall shape=[256] data=1024 bytes buffer=21
+  [  41] FLOAT32    jax2tf_arg_46/ReadVariableOp;StatefulPartitionedCall shape=[256] data=1024 bytes buffer=20
+  [  42] FLOAT32    jax2tf_arg_12/ReadVariableOp;StatefulPartitionedCall shape=[256] data=1024 bytes buffer=35
+  [  43] FLOAT32    jax2tf_arg_24/ReadVariableOp;StatefulPartitionedCall shape=[256] data=1024 bytes buffer=29
+  [  44] FLOAT32    layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/div shape=[1,1,256] data=1024 bytes buffer=11
+  [  45] FLOAT32    layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/div; shape=[1,1,128] data=512 bytes buffer=15
+  [  46] INT32      arith.constant10 shape=[4] data=16 bytes buffer=47
+  [  47] INT32      arith.constant12 shape=[4] data=16 bytes buffer=49
+  [  48] INT32      layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/broadcast_in_dim shape=[4] data=16 bytes buffer=44
+  [  49] INT32      layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/vmap()/broadcast_in_dim shape=[4] data=16 bytes buffer=43
+  [  50] INT32      arith.constant6 shape=[4] data=16 bytes buffer=41
+  [  51] INT32      layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/broadcast_in_dim shape=[4] data=16 bytes buffer=38
+  [  52] INT32      arith.constant2 shape=[4] data=16 bytes buffer=14
+  [  53] INT32      arith.constant1 shape=[4] data=16 bytes buffer=13
+  [  54] INT32      arith.constant shape=[4] data=16 bytes buffer=12
+  [  55] INT32      layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/split shape=[4] data=16 bytes buffer=10
+  [  56] INT32      arith.constant9 shape=[3] data=12 bytes buffer=46
+  [  57] INT32      arith.constant8 shape=[3] data=12 bytes buffer=45
+  [  58] INT32      arith.constant4 shape=[3] data=12 bytes buffer=39
+  [  59] FLOAT32    layer_1/layer_1.post_qkv/layer_1._maybe_apply_skip_scale/broadcast_in_dim shape=[1,1,1] data=4 bytes buffer=18
+  [  60] FLOAT32    MtpDrafterModel.decode_softmax/transformer.decode_softmax/transformer._post_process_decoding/div1 shape=[] data=4 bytes buffer=53
+  [  61] FLOAT32    layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/convert_element_type shape=[1,1,1,1] data=4 bytes buffer=42
+  [  62] INT32      arith.constant11 shape=[1] data=4 bytes buffer=48
+  [  63] FLOAT32    arith.constant7 shape=[] data=4 bytes buffer=42
+  [  64] FLOAT32    arith.constant5 shape=[] data=4 bytes buffer=40
+  [  65] FLOAT32    layer_0/layer_0.post_qkv/layer_0._maybe_apply_skip_scale/broadcast_in_dim shape=[1,1,1] data=4 bytes buffer=19
+  [  66] FLOAT32    layer_2/layer_2.post_qkv/layer_2._maybe_apply_skip_scale/broadcast_in_dim shape=[1,1,1] data=4 bytes buffer=17
+  [  67] FLOAT32    layer_3/layer_3.post_qkv/layer_3._maybe_apply_skip_scale/broadcast_in_dim shape=[1,1,1] data=4 bytes buffer=16
+  [  68] FLOAT32    MtpDrafterModel.decode_softmax/transformer.decode_softmax/transformer._post_process_decoding/div shape=[] data=4 bytes buffer=9
+  [  69] FLOAT32    layer_1/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/composite shape=[1,1,4,32003] data=0 bytes buffer=137
+  [  70] FLOAT32    layer_2/layer_2.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/split shape=[1,1,4,128] data=0 bytes buffer=173
+  [  71] FLOAT32    layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/split shape=[1,1,4,128] data=0 bytes buffer=72
+  [  72] FLOAT32    layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/split1 shape=[1,1,4,128] data=0 bytes buffer=73
+  [  73] FLOAT32    layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul shape=[1,1,4,128] data=0 bytes buffer=74
+  [  74] FLOAT32    layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul1 shape=[1,1,4,128] data=0 bytes buffer=75
+  [  75] FLOAT32    layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/sub shape=[1,1,4,128] data=0 bytes buffer=76
+  [  76] FLOAT32    layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul;layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul shape=[1,1,4,128] data=0 bytes buffer=77
+  [  77] FLOAT32    layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul;layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul1 shape=[1,1,4,128] data=0 bytes buffer=78
+  [  78] FLOAT32    layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/add shape=[1,1,4,128] data=0 bytes buffer=79
+  [  79] FLOAT32    layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/concatenate shape=[1,1,4,256] data=0 bytes buffer=80
+  [  80] INT32      layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/vmap()/broadcast_in_dim1 shape=[1,1,1] data=0 bytes buffer=81
+  [  81] BOOL       layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/vmap()/ge shape=[1,1,32003] data=0 bytes buffer=82
+  [  82] BOOL       layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/vmap()/lt shape=[1,1,32003] data=0 bytes buffer=83
+  [  83] BOOL       layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/vmap()/and shape=[1,1,32003] data=0 bytes buffer=84
+  [  84] BOOL       layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/vmap()/broadcast_in_dim2 shape=[1,1,1,32003] data=0 bytes buffer=85
+  [  85] FLOAT32    layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/composite shape=[1,1,4,32003] data=0 bytes buffer=86
+  [  86] FLOAT32    layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/convert_element_type shape=[1,1,1,32003] data=0 bytes buffer=87
+  [  87] FLOAT32    layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/concatenate shape=[1,4,1,32003] data=0 bytes buffer=88
+  [  88] BOOL       layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/convert_element_type1 shape=[1,4,1,32003] data=0 bytes buffer=89
+  [  89] BOOL       layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/reshape shape=[1,1,4,32003] data=0 bytes buffer=90
+  [  90] FLOAT32    select_n shape=[1,1,4,32003] data=0 bytes buffer=91
+  [  91] FLOAT32    layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/div;layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/exp;layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/broadcast_in_dim;layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/reduce_sum;layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/reduce_max;layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/max;layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/sub shape=[1,1,4,32003] data=0 bytes buffer=92
+  [  92] FLOAT32    layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/composite1 shape=[1,1,4,256] data=0 bytes buffer=93
+  [  93] FLOAT32    layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/broadcast_in_dim;layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/reduce_max shape=[1,1,1,1] data=0 bytes buffer=94
+  [  94] BOOL       layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/convert_element_type1 shape=[1,1,1,1] data=0 bytes buffer=95
+  [  95] FLOAT32    select_n;broadcast_in_dim shape=[1,1,4,256] data=0 bytes buffer=96
+  [  96] FLOAT32    layer_0/layer_0.post_qkv/attn.post_qkv/attn_vec_einsum/reshape shape=[1,1,1024] data=0 bytes buffer=97
+  [  97] INT8       layer_0/layer_0.post_qkv/attn.post_qkv/attn_vec_einsum/composite shape=[1,1,1024] data=0 bytes buffer=98 quant
+  [  98] FLOAT32    layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/sin shape=[1,1,1,128] data=0 bytes buffer=70
+  [  99] INT8       layer_0/layer_0.post_qkv/attn.post_qkv/attn_vec_einsum/btH,Hd->btd/dot_general1 shape=[1,1,256] data=0 bytes buffer=100 quant
+  [ 100] FLOAT32    layer_0/layer_0.post_qkv/attn.post_qkv/attn_vec_einsum/composite1 shape=[1,1,256] data=0 bytes buffer=101
+  [ 101] FLOAT32    layer_0/layer_0.post_qkv/post_attention_norm/composite shape=[1,1,256] data=0 bytes buffer=102
+  [ 102] FLOAT32    layer_0/layer_0.post_qkv/add shape=[1,1,256] data=0 bytes buffer=103
+  [ 103] FLOAT32    layer_0/layer_0.post_qkv/pre_ffw_norm/composite shape=[1,1,256] data=0 bytes buffer=104
+  [ 104] INT8       layer_0/layer_0.post_qkv/mlp/gating_einsum1/composite shape=[1,1,256] data=0 bytes buffer=105 quant
+  [ 105] FLOAT32    layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/broadcast_in_dim2 shape=[1,1,1,128] data=0 bytes buffer=69
+  [ 106] INT8       layer_0/layer_0.post_qkv/mlp/gating_einsum1/btd,df->btf/dot_general1 shape=[1,1,2048] data=0 bytes buffer=107 quant
+  [ 107] FLOAT32    layer_0/layer_0.post_qkv/mlp/gating_einsum1/composite1 shape=[1,1,2048] data=0 bytes buffer=108
+  [ 108] FLOAT32    layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/div;1 shape=[1,1,128] data=0 bytes buffer=68
+  [ 109] INT8       layer_0/layer_0.post_qkv/mlp/gating_einsum2/btd,df->btf/dot_general1 shape=[1,1,2048] data=0 bytes buffer=110 quant
+  [ 110] FLOAT32    layer_0/layer_0.post_qkv/mlp/gating_einsum2/composite shape=[1,1,2048] data=0 bytes buffer=111
+  [ 111] FLOAT32    layer_0/layer_0.post_qkv/mlp/activation_fn/composite shape=[1,1,2048] data=0 bytes buffer=112
+  [ 112] FLOAT32    layer_0/layer_0.post_qkv/mlp/mul shape=[1,1,2048] data=0 bytes buffer=113
+  [ 113] INT8       layer_0/layer_0.post_qkv/mlp/linear/composite shape=[1,1,2048] data=0 bytes buffer=114 quant
+  [ 114] FLOAT32    layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/broadcast_in_dim1 shape=[1,1,1] data=0 bytes buffer=67
+  [ 115] INT8       layer_0/layer_0.post_qkv/mlp/linear/btf,fd->btd/dot_general1 shape=[1,1,256] data=0 bytes buffer=116 quant
+  [ 116] FLOAT32    layer_0/layer_0.post_qkv/mlp/linear/composite1 shape=[1,1,256] data=0 bytes buffer=117
+  [ 117] FLOAT32    layer_0/layer_0.post_qkv/post_ffw_norm/composite shape=[1,1,256] data=0 bytes buffer=118
+  [ 118] FLOAT32    layer_0/layer_0.post_qkv/add1 shape=[1,1,256] data=0 bytes buffer=119
+  [ 119] FLOAT32    layer_0/layer_0.post_qkv/layer_0._maybe_apply_skip_scale/mul shape=[1,1,256] data=0 bytes buffer=120
+  [ 120] FLOAT32    layer_1/layer_1.pre_q/pre_attention_norm/composite shape=[1,1,256] data=0 bytes buffer=121
+  [ 121] INT8       layer_1/layer_1.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/composite shape=[1,1,256] data=0 bytes buffer=122 quant
+  [ 122] FLOAT32    layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/convert_element_type shape=[1] data=0 bytes buffer=66
+  [ 123] INT8       layer_1/layer_1.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/reshape;layer_1/layer_1.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/btd,dH->btH/dot_general1 shape=[1,1,1024] data=0 bytes buffer=124 quant
+  [ 124] INT8       layer_1/layer_1.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/reshape;layer_1/layer_1.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/btd,dH->btH/dot_general2 shape=[1,1,4,256] data=0 bytes buffer=125 quant
+  [ 125] FLOAT32    layer_1/layer_1.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/composite1 shape=[1,1,4,256] data=0 bytes buffer=126
+  [ 126] FLOAT32    layer_1/layer_1.pre_q/attn.pre_q/attn._pre_attention_query_fn/query_norm/composite shape=[1,1,4,256] data=0 bytes buffer=127
+  [ 127] FLOAT32    layer_1/layer_1.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/split shape=[1,1,4,128] data=0 bytes buffer=128
+  [ 128] FLOAT32    layer_1/layer_1.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/split1 shape=[1,1,4,128] data=0 bytes buffer=129
+  [ 129] FLOAT32    layer_1/layer_1.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul;layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul shape=[1,1,4,128] data=0 bytes buffer=130
+  [ 130] FLOAT32    layer_1/layer_1.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul;layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul1 shape=[1,1,4,128] data=0 bytes buffer=131
+  [ 131] FLOAT32    layer_1/layer_1.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/sub shape=[1,1,4,128] data=0 bytes buffer=132
+  [ 132] FLOAT32    layer_1/layer_1.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul;layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul2 shape=[1,1,4,128] data=0 bytes buffer=133
+  [ 133] FLOAT32    layer_1/layer_1.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul;layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul3 shape=[1,1,4,128] data=0 bytes buffer=134
+  [ 134] FLOAT32    layer_1/layer_1.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/add shape=[1,1,4,128] data=0 bytes buffer=135
+  [ 135] FLOAT32    layer_1/layer_1.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/concatenate shape=[1,1,4,256] data=0 bytes buffer=136
+  [ 136] INT32      mtp_drafter_input_pos:0 shape=[1] data=0 bytes buffer=1
+  [ 137] FLOAT32    select_n1 shape=[1,1,4,32003] data=0 bytes buffer=138
+  [ 138] FLOAT32    layer_1/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/div;layer_1/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/exp;layer_1/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/broadcast_in_dim;layer_1/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/reduce_sum;layer_1/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/reduce_max;layer_1/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/max;layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/max;layer_1/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/sub shape=[1,1,4,32003] data=0 bytes buffer=139
+  [ 139] FLOAT32    layer_1/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/composite1 shape=[1,1,4,256] data=0 bytes buffer=140
+  [ 140] FLOAT32    select_n;broadcast_in_dim1 shape=[1,1,4,256] data=0 bytes buffer=141
+  [ 141] FLOAT32    layer_1/layer_1.post_qkv/attn.post_qkv/attn_vec_einsum/reshape shape=[1,1,1024] data=0 bytes buffer=142
+  [ 142] INT8       layer_1/layer_1.post_qkv/attn.post_qkv/attn_vec_einsum/composite shape=[1,1,1024] data=0 bytes buffer=143 quant
+  [ 143] FLOAT32    layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/query_norm/composite shape=[1,1,4,256] data=0 bytes buffer=65
+  [ 144] INT8       layer_1/layer_1.post_qkv/attn.post_qkv/attn_vec_einsum/btH,Hd->btd/dot_general1 shape=[1,1,256] data=0 bytes buffer=145 quant
+  [ 145] FLOAT32    layer_1/layer_1.post_qkv/attn.post_qkv/attn_vec_einsum/composite1 shape=[1,1,256] data=0 bytes buffer=146
+  [ 146] FLOAT32    layer_1/layer_1.post_qkv/post_attention_norm/composite shape=[1,1,256] data=0 bytes buffer=147
+  [ 147] FLOAT32    layer_1/layer_1.post_qkv/add shape=[1,1,256] data=0 bytes buffer=148
+  [ 148] FLOAT32    layer_1/layer_1.post_qkv/pre_ffw_norm/composite shape=[1,1,256] data=0 bytes buffer=149
+  [ 149] INT8       layer_1/layer_1.post_qkv/mlp/gating_einsum1/composite shape=[1,1,256] data=0 bytes buffer=150 quant
+  [ 150] FLOAT32    layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/composite1 shape=[1,1,4,256] data=0 bytes buffer=64
+  [ 151] INT8       layer_1/layer_1.post_qkv/mlp/gating_einsum1/btd,df->btf/dot_general1 shape=[1,1,2048] data=0 bytes buffer=152 quant
+  [ 152] FLOAT32    layer_1/layer_1.post_qkv/mlp/gating_einsum1/composite1 shape=[1,1,2048] data=0 bytes buffer=153
+  [ 153] INT8       layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/reshape;layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/btd,dH->btH/dot_general2 shape=[1,1,4,256] data=0 bytes buffer=63 quant
+  [ 154] INT8       layer_1/layer_1.post_qkv/mlp/gating_einsum2/btd,df->btf/dot_general1 shape=[1,1,2048] data=0 bytes buffer=155 quant
+  [ 155] FLOAT32    layer_1/layer_1.post_qkv/mlp/gating_einsum2/composite shape=[1,1,2048] data=0 bytes buffer=156
+  [ 156] FLOAT32    layer_1/layer_1.post_qkv/mlp/activation_fn/composite shape=[1,1,2048] data=0 bytes buffer=157
+  [ 157] FLOAT32    layer_1/layer_1.post_qkv/mlp/mul shape=[1,1,2048] data=0 bytes buffer=158
+  [ 158] INT8       layer_1/layer_1.post_qkv/mlp/linear/composite shape=[1,1,2048] data=0 bytes buffer=159 quant
+  [ 159] INT8       layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/reshape;layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/btd,dH->btH/dot_general1 shape=[1,1,1024] data=0 bytes buffer=62 quant
+  [ 160] INT8       layer_1/layer_1.post_qkv/mlp/linear/btf,fd->btd/dot_general1 shape=[1,1,256] data=0 bytes buffer=161 quant
+  [ 161] FLOAT32    layer_1/layer_1.post_qkv/mlp/linear/composite1 shape=[1,1,256] data=0 bytes buffer=162
+  [ 162] FLOAT32    layer_1/layer_1.post_qkv/post_ffw_norm/composite shape=[1,1,256] data=0 bytes buffer=163
+  [ 163] FLOAT32    layer_1/layer_1.post_qkv/add1 shape=[1,1,256] data=0 bytes buffer=164
+  [ 164] FLOAT32    layer_1/layer_1.post_qkv/layer_1._maybe_apply_skip_scale/mul shape=[1,1,256] data=0 bytes buffer=165
+  [ 165] FLOAT32    layer_2/layer_2.pre_q/pre_attention_norm/composite shape=[1,1,256] data=0 bytes buffer=166
+  [ 166] INT8       layer_2/layer_2.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/composite shape=[1,1,256] data=0 bytes buffer=167 quant
+  [ 167] INT8       layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/composite shape=[1,1,256] data=0 bytes buffer=60 quant
+  [ 168] INT8       layer_2/layer_2.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/reshape;layer_2/layer_2.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/btd,dH->btH/dot_general1 shape=[1,1,1024] data=0 bytes buffer=169 quant
+  [ 169] INT8       layer_2/layer_2.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/reshape;layer_2/layer_2.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/btd,dH->btH/dot_general2 shape=[1,1,4,256] data=0 bytes buffer=170 quant
+  [ 170] FLOAT32    layer_2/layer_2.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/composite1 shape=[1,1,4,256] data=0 bytes buffer=171
+  [ 171] FLOAT32    layer_2/layer_2.pre_q/attn.pre_q/attn._pre_attention_query_fn/query_norm/composite shape=[1,1,4,256] data=0 bytes buffer=172
+  [ 172] FLOAT32    layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/cos shape=[1,1,1,128] data=0 bytes buffer=71
+  [ 173] FLOAT32    layer_2/layer_2.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/split1 shape=[1,1,4,128] data=0 bytes buffer=174
+  [ 174] FLOAT32    layer_2/layer_2.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul;layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul shape=[1,1,4,128] data=0 bytes buffer=175
+  [ 175] FLOAT32    layer_2/layer_2.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul;layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul1 shape=[1,1,4,128] data=0 bytes buffer=176
+  [ 176] FLOAT32    layer_2/layer_2.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/sub shape=[1,1,4,128] data=0 bytes buffer=177
+  [ 177] FLOAT32    layer_2/layer_2.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul;layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul2 shape=[1,1,4,128] data=0 bytes buffer=178
+  [ 178] FLOAT32    layer_2/layer_2.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul;layer_0/layer_0.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul3 shape=[1,1,4,128] data=0 bytes buffer=179
+  [ 179] FLOAT32    layer_2/layer_2.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/add shape=[1,1,4,128] data=0 bytes buffer=180
+  [ 180] FLOAT32    layer_2/layer_2.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/concatenate shape=[1,1,4,256] data=0 bytes buffer=181
+  [ 181] FLOAT32    layer_2/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/composite shape=[1,1,4,32003] data=0 bytes buffer=182
+  [ 182] FLOAT32    select_n2 shape=[1,1,4,32003] data=0 bytes buffer=183
+  [ 183] FLOAT32    layer_2/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/div;layer_2/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/exp;layer_2/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/broadcast_in_dim;layer_2/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/reduce_sum;layer_2/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/reduce_max;layer_2/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/max;layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/max;layer_2/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/sub shape=[1,1,4,32003] data=0 bytes buffer=184
+  [ 184] FLOAT32    layer_2/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/composite1 shape=[1,1,4,256] data=0 bytes buffer=185
+  [ 185] FLOAT32    select_n;broadcast_in_dim2 shape=[1,1,4,256] data=0 bytes buffer=186
+  [ 186] FLOAT32    layer_2/layer_2.post_qkv/attn.post_qkv/attn_vec_einsum/reshape shape=[1,1,1024] data=0 bytes buffer=187
+  [ 187] INT8       layer_2/layer_2.post_qkv/attn.post_qkv/attn_vec_einsum/composite shape=[1,1,1024] data=0 bytes buffer=188 quant
+  [ 188] FLOAT32    layer_0/layer_0.pre_q/pre_attention_norm/composite shape=[1,1,256] data=0 bytes buffer=59
+  [ 189] INT8       layer_2/layer_2.post_qkv/attn.post_qkv/attn_vec_einsum/btH,Hd->btd/dot_general1 shape=[1,1,256] data=0 bytes buffer=190 quant
+  [ 190] FLOAT32    layer_2/layer_2.post_qkv/attn.post_qkv/attn_vec_einsum/composite1 shape=[1,1,256] data=0 bytes buffer=191
+  [ 191] FLOAT32    layer_2/layer_2.post_qkv/post_attention_norm/composite shape=[1,1,256] data=0 bytes buffer=192
+  [ 192] FLOAT32    layer_2/layer_2.post_qkv/add shape=[1,1,256] data=0 bytes buffer=193
+  [ 193] FLOAT32    layer_2/layer_2.post_qkv/pre_ffw_norm/composite shape=[1,1,256] data=0 bytes buffer=194
+  [ 194] INT8       layer_2/layer_2.post_qkv/mlp/gating_einsum1/composite shape=[1,1,256] data=0 bytes buffer=195 quant
+  [ 195] FLOAT32    MtpDrafterModel.mtp_pre_project/mtp_pre_proj/composite1 shape=[1,1,256] data=0 bytes buffer=58
+  [ 196] INT8       layer_2/layer_2.post_qkv/mlp/gating_einsum1/btd,df->btf/dot_general1 shape=[1,1,2048] data=0 bytes buffer=197 quant
+  [ 197] FLOAT32    layer_2/layer_2.post_qkv/mlp/gating_einsum1/composite1 shape=[1,1,2048] data=0 bytes buffer=198
+  [ 198] INT8       MtpDrafterModel.mtp_pre_project/mtp_pre_proj/btm,md->btd/dot_general1 shape=[1,1,256] data=0 bytes buffer=57 quant
+  [ 199] INT8       layer_2/layer_2.post_qkv/mlp/gating_einsum2/btd,df->btf/dot_general1 shape=[1,1,2048] data=0 bytes buffer=200 quant
+  [ 200] FLOAT32    layer_2/layer_2.post_qkv/mlp/gating_einsum2/composite shape=[1,1,2048] data=0 bytes buffer=201
+  [ 201] FLOAT32    layer_2/layer_2.post_qkv/mlp/activation_fn/composite shape=[1,1,2048] data=0 bytes buffer=202
+  [ 202] FLOAT32    layer_2/layer_2.post_qkv/mlp/mul shape=[1,1,2048] data=0 bytes buffer=203
+  [ 203] INT8       MtpDrafterModel.mtp_pre_project/mtp_pre_proj/composite shape=[1,1,3072] data=0 bytes buffer=55 quant
+  [ 204] INT8       layer_2/layer_2.post_qkv/mlp/linear/composite shape=[1,1,2048] data=0 bytes buffer=204 quant
+  [ 205] INT8       layer_2/layer_2.post_qkv/mlp/linear/btf,fd->btd/dot_general1 shape=[1,1,256] data=0 bytes buffer=206 quant
+  [ 206] FLOAT32    layer_2/layer_2.post_qkv/mlp/linear/composite1 shape=[1,1,256] data=0 bytes buffer=207
+  [ 207] FLOAT32    layer_2/layer_2.post_qkv/post_ffw_norm/composite shape=[1,1,256] data=0 bytes buffer=208
+  [ 208] FLOAT32    layer_2/layer_2.post_qkv/add1 shape=[1,1,256] data=0 bytes buffer=209
+  [ 209] FLOAT32    layer_2/layer_2.post_qkv/layer_2._maybe_apply_skip_scale/mul shape=[1,1,256] data=0 bytes buffer=210
+  [ 210] FLOAT32    layer_3/layer_3.pre_q/pre_attention_norm/composite shape=[1,1,256] data=0 bytes buffer=211
+  [ 211] INT8       layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/composite shape=[1,1,256] data=0 bytes buffer=212 quant
+  [ 212] INT8       mtp_drafter_kv_cache_v_14:0 shape=[1,1,512,32003] data=0 bytes buffer=8 quant
+  [ 213] INT8       layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/reshape;layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/btd,dH->btH/dot_general1 shape=[1,1,2048] data=0 bytes buffer=214 quant
+  [ 214] INT8       layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/reshape;layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/btd,dH->btH/dot_general2 shape=[1,1,4,512] data=0 bytes buffer=215 quant
+  [ 215] FLOAT32    layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/q_einsum/composite1 shape=[1,1,4,512] data=0 bytes buffer=216
+  [ 216] FLOAT32    layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/query_norm/composite shape=[1,1,4,512] data=0 bytes buffer=217
+  [ 217] FLOAT32    layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/div1 shape=[1,1,256] data=0 bytes buffer=218
+  [ 218] FLOAT32    layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/broadcast_in_dim1 shape=[1,1,1,256] data=0 bytes buffer=219
+  [ 219] FLOAT32    layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/sin shape=[1,1,1,256] data=0 bytes buffer=220
+  [ 220] FLOAT32    layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/cos shape=[1,1,1,256] data=0 bytes buffer=221
+  [ 221] FLOAT32    layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/split1 shape=[1,1,4,256] data=0 bytes buffer=222
+  [ 222] FLOAT32    layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/split2 shape=[1,1,4,256] data=0 bytes buffer=223
+  [ 223] FLOAT32    layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul shape=[1,1,4,256] data=0 bytes buffer=224
+  [ 224] FLOAT32    layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul1 shape=[1,1,4,256] data=0 bytes buffer=225
+  [ 225] FLOAT32    layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/sub shape=[1,1,4,256] data=0 bytes buffer=226
+  [ 226] FLOAT32    layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul;layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul shape=[1,1,4,256] data=0 bytes buffer=227
+  [ 227] FLOAT32    layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul;layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/mul1 shape=[1,1,4,256] data=0 bytes buffer=228
+  [ 228] FLOAT32    layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/add shape=[1,1,4,256] data=0 bytes buffer=229
+  [ 229] FLOAT32    layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_query_fn/maybe_rope/concatenate shape=[1,1,4,512] data=0 bytes buffer=230
+  [ 230] FLOAT32    layer_3/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/composite shape=[1,1,4,32003] data=0 bytes buffer=231
+  [ 231] FLOAT32    layer_3/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/convert_element_type shape=[1,1,1,32003] data=0 bytes buffer=232
+  [ 232] FLOAT32    layer_3/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/concatenate shape=[1,4,1,32003] data=0 bytes buffer=233
+  [ 233] BOOL       layer_3/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/convert_element_type1 shape=[1,4,1,32003] data=0 bytes buffer=234
+  [ 234] BOOL       layer_3/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/reshape shape=[1,1,4,32003] data=0 bytes buffer=235
+  [ 235] FLOAT32    select_n3 shape=[1,1,4,32003] data=0 bytes buffer=236
+  [ 236] FLOAT32    layer_3/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/div;layer_3/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/exp;layer_3/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/broadcast_in_dim;layer_3/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/reduce_sum;layer_3/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/reduce_max;layer_3/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/max;layer_0/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/max;layer_3/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/sub shape=[1,1,4,32003] data=0 bytes buffer=237
+  [ 237] FLOAT32    layer_3/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/dot_attn._qkv_fn/composite1 shape=[1,1,4,512] data=0 bytes buffer=238
+  [ 238] FLOAT32    layer_3/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/broadcast_in_dim;layer_3/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/reduce_max shape=[1,1,1,1] data=0 bytes buffer=239
+  [ 239] BOOL       layer_3/attn.dot_product_attention/attn.dot_product_attention_extensible/dot_attn/convert_element_type shape=[1,1,1,1] data=0 bytes buffer=240
+  [ 240] FLOAT32    select_n;broadcast_in_dim3 shape=[1,1,4,512] data=0 bytes buffer=241
+  [ 241] FLOAT32    layer_3/layer_3.post_qkv/attn.post_qkv/attn_vec_einsum/reshape shape=[1,1,2048] data=0 bytes buffer=242
+  [ 242] INT8       layer_3/layer_3.post_qkv/attn.post_qkv/attn_vec_einsum/composite shape=[1,1,2048] data=0 bytes buffer=243 quant
+  [ 243] INT8       mtp_drafter_kv_cache_v_13:0 shape=[1,1,256,32003] data=0 bytes buffer=7 quant
+  [ 244] INT8       layer_3/layer_3.post_qkv/attn.post_qkv/attn_vec_einsum/btH,Hd->btd/dot_general1 shape=[1,1,256] data=0 bytes buffer=245 quant
+  [ 245] FLOAT32    layer_3/layer_3.post_qkv/attn.post_qkv/attn_vec_einsum/composite1 shape=[1,1,256] data=0 bytes buffer=246
+  [ 246] FLOAT32    layer_3/layer_3.post_qkv/post_attention_norm/composite shape=[1,1,256] data=0 bytes buffer=247
+  [ 247] FLOAT32    layer_3/layer_3.post_qkv/add shape=[1,1,256] data=0 bytes buffer=248
+  [ 248] FLOAT32    layer_3/layer_3.post_qkv/pre_ffw_norm/composite shape=[1,1,256] data=0 bytes buffer=249
+  [ 249] INT8       layer_3/layer_3.post_qkv/mlp/gating_einsum1/composite shape=[1,1,256] data=0 bytes buffer=250 quant
+  [ 250] BOOL       mtp_drafter_mask:0 shape=[1,1,1,32003] data=0 bytes buffer=6
+  [ 251] INT8       layer_3/layer_3.post_qkv/mlp/gating_einsum1/btd,df->btf/dot_general1 shape=[1,1,2048] data=0 bytes buffer=252 quant
+  [ 252] FLOAT32    layer_3/layer_3.post_qkv/mlp/gating_einsum1/composite1 shape=[1,1,2048] data=0 bytes buffer=253
+  [ 253] INT8       mtp_drafter_kv_cache_k_13:0 shape=[1,1,32003,256] data=0 bytes buffer=5 quant
+  [ 254] INT8       layer_3/layer_3.post_qkv/mlp/gating_einsum2/btd,df->btf/dot_general1 shape=[1,1,2048] data=0 bytes buffer=255 quant
+  [ 255] FLOAT32    layer_3/layer_3.post_qkv/mlp/gating_einsum2/composite shape=[1,1,2048] data=0 bytes buffer=256
+  [ 256] FLOAT32    layer_3/layer_3.post_qkv/mlp/activation_fn/composite shape=[1,1,2048] data=0 bytes buffer=257
+  [ 257] FLOAT32    layer_3/layer_3.post_qkv/mlp/mul shape=[1,1,2048] data=0 bytes buffer=258
+  [ 258] INT8       layer_3/layer_3.post_qkv/mlp/linear/composite shape=[1,1,2048] data=0 bytes buffer=259 quant
+  [ 259] INT8       mtp_drafter_kv_cache_k_14:0 shape=[1,1,32003,512] data=0 bytes buffer=4 quant
+  [ 260] INT8       layer_3/layer_3.post_qkv/mlp/linear/btf,fd->btd/dot_general1 shape=[1,1,256] data=0 bytes buffer=261 quant
+  [ 261] FLOAT32    layer_3/layer_3.post_qkv/mlp/linear/composite1 shape=[1,1,256] data=0 bytes buffer=262
+  [ 262] FLOAT32    layer_3/layer_3.post_qkv/post_ffw_norm/composite shape=[1,1,256] data=0 bytes buffer=263
+  [ 263] FLOAT32    layer_3/layer_3.post_qkv/add1 shape=[1,1,256] data=0 bytes buffer=264
+  [ 264] FLOAT32    layer_3/layer_3.post_qkv/layer_3._maybe_apply_skip_scale/mul shape=[1,1,256] data=0 bytes buffer=265
+  [ 265] FLOAT32    mtp_final_norm/composite shape=[1,1,256] data=0 bytes buffer=266
+  [ 266] INT32      mtp_drafter_param_tensor:0 shape=[1,1,1,7] data=0 bytes buffer=3
+  [ 267] FLOAT32    MtpDrafterModel.decode_softmax/transformer.decode_softmax/embedder.decode/btd,md->btm/dot_general shape=[1,1,262144] data=0 bytes buffer=268
+  [ 268] FLOAT32    MtpDrafterModel.decode_softmax/transformer.decode_softmax/transformer._post_process_decoding/div2 shape=[1,1,262144] data=0 bytes buffer=269
+  [ 269] FLOAT32    MtpDrafterModel.decode_softmax/transformer.decode_softmax/transformer._post_process_decoding/tanh shape=[1,1,262144] data=0 bytes buffer=270
+  [ 270] FLOAT32    StatefulPartitionedCall:0 shape=[1,1,262144] data=0 bytes buffer=271
+  [ 271] INT8       MtpDrafterModel.mtp_post_project/mtp_post_proj/composite shape=[1,1,256] data=0 bytes buffer=272 quant
+  [ 272] FLOAT32    mtp_drafter_activations:0 shape=[1,1,3072] data=0 bytes buffer=2
+  [ 273] INT8       MtpDrafterModel.mtp_post_project/mtp_post_proj/btd,dm->btm/dot_general1 shape=[1,1,1536] data=0 bytes buffer=274 quant
+  [ 274] FLOAT32    StatefulPartitionedCall:1 shape=[1,1,1536] data=0 bytes buffer=275

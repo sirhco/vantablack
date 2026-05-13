@@ -195,6 +195,10 @@ pub const OperatorCode = struct {
 
 pub const Operator = struct {
     opcode_index: u32,
+    /// Tensor indices feeding this op. `-1` means optional/missing.
+    inputs: []const i32,
+    /// Tensor indices written by this op.
+    outputs: []const i32,
 };
 
 pub const Model = struct {
@@ -276,7 +280,19 @@ pub const Model = struct {
             var oi: u32 = 0;
             while (oi < ov.len) : (oi += 1) {
                 const op_t = ov.tableAt(oi) catch return error.TensorOutOfRange;
-                operators[oi] = .{ .opcode_index = op_t.readU32(0, 0) catch 0 };
+                // inputs (field 1, vector of int32 → 4-byte stride)
+                const in_v = op_t.readVector(1) catch null;
+                const in_bytes = if (in_v) |v| (v.bytesElemSize(4) catch &.{}) else &.{};
+                const in_slice: []const i32 = @as([*]const i32, @ptrCast(@alignCast(in_bytes.ptr)))[0 .. in_bytes.len / 4];
+                // outputs (field 2)
+                const out_v = op_t.readVector(2) catch null;
+                const out_bytes = if (out_v) |v| (v.bytesElemSize(4) catch &.{}) else &.{};
+                const out_slice: []const i32 = @as([*]const i32, @ptrCast(@alignCast(out_bytes.ptr)))[0 .. out_bytes.len / 4];
+                operators[oi] = .{
+                    .opcode_index = op_t.readU32(0, 0) catch 0,
+                    .inputs = in_slice,
+                    .outputs = out_slice,
+                };
             }
         }
 
@@ -290,18 +306,18 @@ pub const Model = struct {
             const dtype_raw = t.readU8(1, 0) catch 0;
             const buf_idx = t.readU32(2, 0) catch 0;
 
-            // shape is [int] → store as borrowed []const i32 reinterpretation.
+            // shape is [int] → 4-byte stride.
             const shape_v = t.readVector(0) catch null;
-            const shape_bytes = if (shape_v) |v| (v.bytes() catch &.{}) else &.{};
+            const shape_bytes = if (shape_v) |v| (v.bytesElemSize(4) catch &.{}) else &.{};
             const shape_i32: []const i32 = @as([*]const i32, @ptrCast(@alignCast(shape_bytes.ptr)))[0 .. shape_bytes.len / 4];
 
-            // Quantization params — keep raw bytes; caller re-interprets.
+            // Quantization params — scales: [float] (4 bytes), zero_point: [long] (8 bytes).
             var scales_bytes: []const u8 = &.{};
             var zp_bytes: []const u8 = &.{};
             var qdim: i32 = 0;
             if (t.readTable(4) catch null) |qp| {
-                if (qp.readVector(2) catch null) |sv| scales_bytes = sv.bytes() catch &.{};
-                if (qp.readVector(3) catch null) |zv| zp_bytes = zv.bytes() catch &.{};
+                if (qp.readVector(2) catch null) |sv| scales_bytes = sv.bytesElemSize(4) catch &.{};
+                if (qp.readVector(3) catch null) |zv| zp_bytes = zv.bytesElemSize(8) catch &.{};
                 qdim = @bitCast(qp.readU32(6, 0) catch 0);
             }
 

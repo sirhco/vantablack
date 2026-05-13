@@ -32,11 +32,11 @@ litertlm bundle: /Users/chrisolson/.cache/huggingface/hub/litertlm-models/gemma-
       MUL                  (18) 1
     weights: 7 tensors, 96.00 MB
     largest weight tensors (first 5 by size):
-      embedder.lookup_embedding_table/composite                    INT2       shape=[] data=100663296 bytes quantized
-      embedder.lookup_embedding_table/reshape                      INT32      shape=[] data=12 bytes
-      embedder.lookup_embedding_table/reshape1                     INT32      shape=[] data=4 bytes
+      embedder.lookup_embedding_table/composite                    INT2       shape=[262144,1536] data=100663296 bytes quantized
+      embedder.lookup_embedding_table/reshape                      INT32      shape=[3] data=12 bytes
+      embedder.lookup_embedding_table/reshape1                     INT32      shape=[1] data=4 bytes
       select_n                                                     INT32      shape=[] data=4 bytes
-      arith.constant                                               INT32      shape=[] data=4 bytes
+      arith.constant                                               INT32      shape=[1,1] data=4 bytes
   tflite_model[1] (section 3, 1225.01 MB): version=3, tensors=83, operators=42, op_codes=7
     op histogram:
       OP?                  (7) 35
@@ -48,11 +48,11 @@ litertlm bundle: /Users/chrisolson/.cache/huggingface/hub/litertlm-models/gemma-
       CONCATENATION        (2) 1
     weights: 40 tensors, 1120.00 MB
     largest weight tensors (first 5 by size):
-      per_layer_embedder.lookup_embedding_table/composite34        INT4       shape=[] data=33554432 bytes quantized
-      per_layer_embedder.lookup_embedding_table/composite13        INT4       shape=[] data=33554432 bytes quantized
-      per_layer_embedder.lookup_embedding_table/composite2         INT4       shape=[] data=33554432 bytes quantized
-      per_layer_embedder.lookup_embedding_table/composite3         INT4       shape=[] data=33554432 bytes quantized
-      per_layer_embedder.lookup_embedding_table/composite33        INT4       shape=[] data=33554432 bytes quantized
+      per_layer_embedder.lookup_embedding_table/composite34        INT4       shape=[262144,256] data=33554432 bytes quantized
+      per_layer_embedder.lookup_embedding_table/composite13        INT4       shape=[262144,256] data=33554432 bytes quantized
+      per_layer_embedder.lookup_embedding_table/composite2         INT4       shape=[262144,256] data=33554432 bytes quantized
+      per_layer_embedder.lookup_embedding_table/composite3         INT4       shape=[262144,256] data=33554432 bytes quantized
+      per_layer_embedder.lookup_embedding_table/composite33        INT4       shape=[262144,256] data=33554432 bytes quantized
   tflite_model[2] (section 4, 89.70 MB): version=3, tensors=2530, operators=2182, op_codes=25
     op histogram:
       MUL                  (18) 579
@@ -68,11 +68,11 @@ litertlm bundle: /Users/chrisolson/.cache/huggingface/hub/litertlm-models/gemma-
       ... (15 more op types)
     weights: 346 tensors, 86.45 MB
     largest weight tensors (first 5 by size):
-      jit(wrapper)/ConformerEncoder/ConformerEncoder.encoder/ou... FLOAT32    shape=[] data=6291456 bytes
-      jit(wrapper)/ConformerEncoder/ConformerEncoder.encoder/Co... FLOAT32    shape=[] data=4194304 bytes
-      jit(wrapper)/ConformerEncoder/ConformerEncoder.encoder/la... INT2       shape=[] data=1048576 bytes quantized
-      jit(wrapper)/ConformerEncoder/ConformerEncoder.encoder/la... INT4       shape=[] data=1048576 bytes quantized
-      jit(wrapper)/ConformerEncoder/ConformerEncoder.encoder/la... INT2       shape=[] data=1048576 bytes quantized
+      jit(wrapper)/ConformerEncoder/ConformerEncoder.encoder/ou... FLOAT32    shape=[1536,1024] data=6291456 bytes
+      jit(wrapper)/ConformerEncoder/ConformerEncoder.encoder/Co... FLOAT32    shape=[1024,1024] data=4194304 bytes
+      jit(wrapper)/ConformerEncoder/ConformerEncoder.encoder/la... INT2       shape=[4096,1024] data=1048576 bytes quantized
+      jit(wrapper)/ConformerEncoder/ConformerEncoder.encoder/la... INT4       shape=[2048,1024] data=1048576 bytes quantized
+      jit(wrapper)/ConformerEncoder/ConformerEncoder.encoder/la... INT2       shape=[1024,4096] data=1048576 bytes quantized
   tflite_model[3] (section 5, 9.00 MB): version=3, tensors=18, operators=11, op_codes=7
     op histogram:
       MUL                  (18) 4
@@ -84,16 +84,16 @@ litertlm bundle: /Users/chrisolson/.cache/huggingface/hub/litertlm-models/gemma-
       OP?                  (53) 1
     weights: 5 tensors, 9.00 MB
     largest weight tensors (first 5 by size):
-      jit(jax_fn)/AudioAdapter/audio_input_projection/btm,md->b... FLOAT32    shape=[] data=9437184 bytes
-      arith.constant                                               INT32      shape=[] data=12 bytes
+      jit(jax_fn)/AudioAdapter/audio_input_projection/btm,md->b... FLOAT32    shape=[1536,1536] data=9437184 bytes
+      arith.constant                                               INT32      shape=[3] data=12 bytes
       jit(jax_fn)/AudioAdapter/audio_soft_embedding_norm/div;ji... FLOAT32    shape=[] data=4 bytes
       jit(jax_fn)/AudioAdapter/audio_soft_embedding_norm/add;ji... FLOAT32    shape=[] data=4 bytes
-      jit(jax_fn)/AudioAdapter/audio_soft_embedding_norm/reduce... INT32      shape=[] data=4 bytes
+      jit(jax_fn)/AudioAdapter/audio_soft_embedding_norm/reduce... INT32      shape=[1] data=4 bytes
   tflite_model[4] (section 6, 0.01 MB): version=3, tensors=1, operators=0, op_codes=0
     op histogram:
     weights: 1 tensors, 0.01 MB
     largest weight tensors (first 5 by size):
-      StatefulPartitionedCall:0                                    FLOAT32    shape=[] data=6144 bytes
+      StatefulPartitionedCall:0                                    FLOAT32    shape=[1,1,1536] data=6144 bytes
   tflite_model[5] (section 7, 213.75 MB): version=3, tensors=1729, operators=1477, op_codes=34
     op histogram:
       MUL                  (18) 277
@@ -109,11 +109,11 @@ litertlm bundle: /Users/chrisolson/.cache/huggingface/hub/litertlm-models/gemma-
       ... (24 more op types)
     weights: 250 tensors, 206.45 MB
     largest weight tensors (first 5 by size):
-      VisionEncoder/entry/bls,sd->bld/dot_general                  FLOAT32    shape=[] data=31457280 bytes
-      VisionEncoder/entry/bls,sd->bld/dot_general1                 FLOAT32    shape=[] data=31457280 bytes
-      VisionEncoder/transformer/layer_7/layer_7.post_qkv/mlp/ga... INT8       shape=[] data=2359296 bytes quantized
-      VisionEncoder/transformer/layer_15/layer_15.post_qkv/mlp/... INT8       shape=[] data=2359296 bytes quantized
-      VisionEncoder/transformer/layer_0/layer_0.post_qkv/mlp/ga... INT8       shape=[] data=2359296 bytes quantized
+      VisionEncoder/entry/bls,sd->bld/dot_general                  FLOAT32    shape=[768,10240] data=31457280 bytes
+      VisionEncoder/entry/bls,sd->bld/dot_general1                 FLOAT32    shape=[768,10240] data=31457280 bytes
+      VisionEncoder/transformer/layer_7/layer_7.post_qkv/mlp/ga... INT8       shape=[3072,768] data=2359296 bytes quantized
+      VisionEncoder/transformer/layer_15/layer_15.post_qkv/mlp/... INT8       shape=[768,3072] data=2359296 bytes quantized
+      VisionEncoder/transformer/layer_0/layer_0.post_qkv/mlp/ga... INT8       shape=[3072,768] data=2359296 bytes quantized
   tflite_model[6] (section 8, 4.52 MB): version=3, tensors=21, operators=15, op_codes=6
     op histogram:
       MUL                  (18) 6
@@ -124,16 +124,16 @@ litertlm bundle: /Users/chrisolson/.cache/huggingface/hub/litertlm-models/gemma-
       FULLY_CONNECTED      (9) 1
     weights: 5 tensors, 4.50 MB
     largest weight tensors (first 5 by size):
-      GeminiModel.adapt_vision/mm_adapter/mm_adapter.project_so... FLOAT32    shape=[] data=4718592 bytes
-      arith.constant2                                              INT32      shape=[] data=12 bytes
+      GeminiModel.adapt_vision/mm_adapter/mm_adapter.project_so... FLOAT32    shape=[1536,768] data=4718592 bytes
+      arith.constant2                                              INT32      shape=[3] data=12 bytes
       arith.constant                                               FLOAT32    shape=[] data=4 bytes
       arith.constant1                                              FLOAT32    shape=[] data=4 bytes
-      arith.constant3                                              INT32      shape=[] data=4 bytes
+      arith.constant3                                              INT32      shape=[1] data=4 bytes
   tflite_model[7] (section 9, 0.01 MB): version=3, tensors=1, operators=0, op_codes=0
     op histogram:
     weights: 1 tensors, 0.01 MB
     largest weight tensors (first 5 by size):
-      StatefulPartitionedCall:0                                    FLOAT32    shape=[] data=6144 bytes
+      StatefulPartitionedCall:0                                    FLOAT32    shape=[1,1,1536] data=6144 bytes
   tflite_model[8] (section 10, 780.37 MB): version=3, tensors=2703, operators=2068, op_codes=31
     op histogram:
       OP?                  (206) 327
@@ -149,11 +149,11 @@ litertlm bundle: /Users/chrisolson/.cache/huggingface/hub/litertlm-models/gemma-
       ... (21 more op types)
     weights: 551 tensors, 741.94 MB
     largest weight tensors (first 5 by size):
-      LanguageModel.decode_graph/LanguageModel.decode_softmax/t... INT2       shape=[] data=100663296 bytes quantized
-      LanguageModel.decode_graph/LanguageModel.transformer_stac... INT8       shape=[] data=13762560 bytes quantized
-      LanguageModel.decode_graph/LanguageModel.transformer_stac... INT2       shape=[] data=4718592 bytes quantized
-      LanguageModel.decode_graph/LanguageModel.transformer_stac... INT2       shape=[] data=4718592 bytes quantized
-      LanguageModel.decode_graph/LanguageModel.transformer_stac... INT2       shape=[] data=4718592 bytes quantized
+      LanguageModel.decode_graph/LanguageModel.decode_softmax/t... INT2       shape=[262144,1536] data=100663296 bytes quantized
+      LanguageModel.decode_graph/LanguageModel.transformer_stac... INT8       shape=[8960,1536] data=13762560 bytes quantized
+      LanguageModel.decode_graph/LanguageModel.transformer_stac... INT2       shape=[1536,12288] data=4718592 bytes quantized
+      LanguageModel.decode_graph/LanguageModel.transformer_stac... INT2       shape=[12288,1536] data=4718592 bytes quantized
+      LanguageModel.decode_graph/LanguageModel.transformer_stac... INT2       shape=[1536,12288] data=4718592 bytes quantized
   tflite_model[9] (section 11, 42.27 MB): version=3, tensors=275, operators=198, op_codes=25
     op histogram:
       OP?                  (206) 29
@@ -169,9 +169,9 @@ litertlm bundle: /Users/chrisolson/.cache/huggingface/hub/litertlm-models/gemma-
       ... (15 more op types)
     weights: 69 tensors, 38.89 MB
     largest weight tensors (first 5 by size):
-      MtpDrafterModel.decode_softmax/transformer.decode_softmax... INT4       shape=[] data=33554432 bytes quantized
-      MtpDrafterModel.mtp_pre_project/mtp_pre_proj/btm,md->btd/... INT8       shape=[] data=786432 bytes quantized
-      layer_3/layer_3.post_qkv/attn.post_qkv/attn_vec_einsum/bt... INT8       shape=[] data=524288 bytes quantized
-      layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_quer... INT8       shape=[] data=524288 bytes quantized
-      MtpDrafterModel.mtp_post_project/mtp_post_proj/btd,dm->bt... INT8       shape=[] data=393216 bytes quantized
+      MtpDrafterModel.decode_softmax/transformer.decode_softmax... INT4       shape=[262144,256] data=33554432 bytes quantized
+      MtpDrafterModel.mtp_pre_project/mtp_pre_proj/btm,md->btd/... INT8       shape=[256,3072] data=786432 bytes quantized
+      layer_3/layer_3.post_qkv/attn.post_qkv/attn_vec_einsum/bt... INT8       shape=[256,2048] data=524288 bytes quantized
+      layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_quer... INT8       shape=[2048,256] data=524288 bytes quantized
+      MtpDrafterModel.mtp_post_project/mtp_post_proj/btd,dm->bt... INT8       shape=[1536,256] data=393216 bytes quantized
   inference: TFLite tensor → vantablack model mapping pending (Phase B/C/D — see README roadmap items 19b–d)
