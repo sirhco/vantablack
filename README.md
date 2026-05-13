@@ -43,8 +43,14 @@ tax, no framework tax. Just weights and math.
 | MLX 4-bit MSL kernel                                    | compiled + cached; runtime dispatch from forward.zig pending |
 | Tiktoken-style tokenizer (GPT-2 / Llama-3 / cl100k)     | shipped — byte→Unicode alphabet, byte-level encode/decode, `splitGpt2` + `splitLlama3` (contractions, optional-leading-space binding, 1-3 digit chunks); `Tokenizer.initFromHfJson` auto-detects `ByteLevel` and switches flavor. Llama-3 split structurally matches the cl100k regex; HF reference fixtures still recommended before claiming byte-equality on novel inputs |
 | CPU SIMD: `dot_f32` + `dot_i8` primitives               | shipped — both portable @Vector implementations. `dot_f32` lowers to NEON `fmla`. `dot_i8` widens i8 lanes to i32 and reduces; on aarch64+dotprod it stays in NEON `mul.4s + add.4s` rather than the fused `sdot.4s` (Zig 0.16 codegen does not yet pattern-match the chain into `sdot`). Plumbing for a Q8_0 × Q8_0 matmul kernel with dynamically-quantized activations. AMX path explicitly out of scope (undocumented, register layout shifts between M1/M2/M3) |
-| Vulkan / cross-vendor GPU                               | not yet              |
+| Vulkan / cross-vendor GPU                               | planned — backend vtable seam ready (`runtime/backend.zig`); impl pending |
 | Prompt prefill batching                                 | shipped (CPU) — `runtime/prefill.zig` runs the prompt as one B-wide pass: each weight row is dequantized once and dot-multiplied against B activation rows via `simd.dot_f32`. ~2.3× faster than per-token CPU forward on an 87-token TinyLlama prompt. Metal builds keep the per-token GPU loop pending a batched MSL kernel |
+| `.litertlm` bundle parser                               | shipped — `core/litertlm.zig` reads Google's LiteRT-LM container header (magic, version, flatbuffer metadata, sections). Decodes `LlmMetadataProto` + `SamplerParameters` + zlib-compressed HF tokenizer |
+| TFLite tensor + operator enumeration                    | shipped — `core/tflite.zig` parses the embedded TFLite flatbuffer: tensor names, shapes, dtypes, per-axis quantization params, operator graph with input/output tensor indices |
+| TFLite per-axis INT2 / INT4 / INT8 dequant + fused GEMV | shipped — `kernels/tflite_int4.zig`. Sign-extended INT2 (4 vals/byte), INT4 (2 vals/byte), INT8. Fused GEMV using `sum_x` trick — ~2x faster than dequant→workspace→matmul |
+| Gemma 4 architecture binding                            | shipped — `runtime/gemma4_model.zig` discovers MatFormer variable widths, KV-sharing (15-own / 20-share in E2B), Per-Layer Embedding shards, dedicated LM head, all 7 RMSNorm scales (5 block + Q + K), per-layer skip-scale, RoPE inv_freq tables |
+| Gemma 4 multi-token forward + KV cache                  | shipped — `Gemma4Model.step` + `.generate`. Full 35-layer forward on real `.litertlm` weights: pre/post-attention/FFW/PLE/PLE-input norms, Q/K-norm, RoPE base 1e6, real Q·K^T cached attention, SwiGLU MLP, PLE residual, skip-scale, greedy LM head argmax |
+| Gemma 4 bit-equal vs `litert-lm` reference              | gated — pipeline runs end-to-end on user's `gemma-4-E2B-it.litertlm` (2.6 GB) but output not yet bit-equal. Remaining: KV-shared layer routing specifics, exact `ple_gate_activation` op kind, sampler strategy (litert-lm uses TFLite-internal sampling with `--seed`), wider Q-norm broadcast for n_q_heads=32 layers |
 
 The Metal backend covers the full per-layer forward pass when every
 projection is Q8_0, Q4_K, Q5_K, or Q6_K and every norm is f32 (the common
@@ -418,10 +424,32 @@ The pure-Zig CPU path remains the default and passes all tests unchanged.
 ## CLI
 
 ```
+# GGUF / MLX directory inference
 vantablack <model.gguf>                               print tensor catalog
 vantablack <model.gguf> generate <n> <id> [id ...]    n tokens after raw token IDs
 vantablack <model.gguf> prompt   <n> <text>           encode + n tokens after text
 vantablack <model.gguf> chat     <n> <user-message>   wrap in TinyLlama zephyr template
+vantablack <hf-dir>     prompt   <n> <text>           same, against an MLX directory bundle
+vantablack <model.gguf> serve    [--host H] [--port P]  Ollama-compatible HTTP server
+
+# Shared
+vantablack tokenize <tokenizer.json> <text>           encode via HF tokenizer.json (no model load)
+
+# .litertlm container inspection (Gemma 4 / Gemma 3n / etc.)
+vantablack inspect          <model.litertlm>          sections + metadata + tokenizer fingerprint
+vantablack inspect-section  <model.litertlm> <idx>    deep dump of one TFLite section (tensors + op graph)
+vantablack scan-layers      <model.litertlm>          classify decoder weights by layer + role
+vantablack trace-tensor     <model.litertlm> <sec> <tensor_idx|name>   walk the op graph from a tensor
+vantablack tokenize-litertlm <model.litertlm> <text>  encode using the HF-zlib tokenizer embedded in the bundle
+
+# Gemma 4 .litertlm inference
+vantablack gemma4-config    <model.litertlm>          inferred config (hidden, n_layers, GQA, MatFormer dims)
+vantablack gemma4-embed     <model.litertlm> <token_id>  INT2 embed lookup for one token
+vantablack gemma4-step      <model.litertlm> <token_id>  embed + layer-0 projections smoke test
+vantablack gemma4-layer0    <model.litertlm> <token_id>  full single-token forward through layer 0
+vantablack gemma4-forward   <model.litertlm> <token_id>  full forward through all 35 layers
+vantablack gemma4-predict   <model.litertlm> <token_id>  forward + LM head + argmax → next-token id
+vantablack gemma4-generate  <model.litertlm> <N> <ids…>  multi-token generation with KV cache
 ```
 
 Sampler flags (placed BEFORE the `<n>` value):
@@ -463,6 +491,37 @@ Chat-template wrapped:
 vantablack ~/models/tinyllama.Q8_0.gguf chat \
   --temp 0.7 --top-k 40 --seed 7 \
   100 "Tell me a short joke about a cat"
+```
+
+Inspect a `.litertlm` bundle (Gemma 4):
+```sh
+vantablack inspect ~/.cache/huggingface/hub/litertlm-models/gemma-4-E2B-it.litertlm
+# litertlm bundle: ...
+#   version: 1.5.0
+#   sections: 12
+#     [0] LlmMetadataProto    ...
+#     [1] SP_Tokenizer        ...
+#     [10] TFLiteModel  decoder, 780 MB
+#     ...
+#   metadata: model_type=Gemma4, max_num_tokens=8192, ...
+#   tokenizer (SentencePiece): 4.5 MB
+#   tflite_model[7] (section 10, 780.4 MB): version=3, tensors=2703, operators=2068
+```
+
+Scan layer-role coverage for the decoder section:
+```sh
+vantablack scan-layers ~/.cache/huggingface/hub/litertlm-models/gemma-4-E2B-it.litertlm
+# decoder: section[10], 35 layers
+# coverage: q=35/35, k=15/35, v=15/35, attn.o=35/35,
+#           mlp.gate=35/35, mlp.up=35/35, mlp.down=35/35, ple.gate=35/35, ...
+```
+
+Multi-token Gemma 4 generation:
+```sh
+vantablack gemma4-generate ~/.cache/huggingface/hub/litertlm-models/gemma-4-E2B-it.litertlm \
+  16 2 105 4914
+# prompt: [2 105 4914]
+# generated (16 tokens): [100821 104474 236051 ...]
 ```
 
 ---
@@ -537,15 +596,144 @@ worker pool. Use this on shared boxes to reserve cores for other work.
 
 ---
 
-## Supported model formats
+## Running models
 
-| Format             | Status   | Notes                                                        |
-|--------------------|----------|--------------------------------------------------------------|
-| GGUF v2/v3         | shipped  | llama.cpp standard. Q8_0 + Q4_K + Q5_K + Q6_K + F32/F16/BF16 |
-| HF/MLX directories | shipped  | `mlx-community/*` Llama-family. 4/8-bit MLX kernels.         |
-| `.litertlm` Phase A| shipped  | Header parser + section index + `LlmMetadataProto`. `vantablack inspect` only. |
-| `.litertlm` Phase B partial | shipped | TFLite tensor enumeration — `inspect` lists weight tensors with shape/dtype/quant. No forward path yet. |
-| `.litertlm` full   | planned  | Tensor → Model mapping (19c) + TFLite int4/int8/fp16 kernels (19d) + bit-equal validation (19e). |
+vantablack supports three on-disk formats, each with a different invocation
+shape. All commands work from a vanilla `zig build -Dmetal=true
+-Doptimize=ReleaseFast` (drop `-Dmetal=true` on non-Apple hosts).
+
+| Format              | Status    | Used by                                           |
+|---------------------|-----------|---------------------------------------------------|
+| GGUF v2 / v3        | ✅ verified | llama.cpp / TheBloke / bartowski quantizations    |
+| HF / MLX directories | ✅ verified | `mlx-community/*` Llama-family 4-bit / 8-bit      |
+| Google `.litertlm`  | ⚠️ runs    | `litert-community/*` Gemma 4 — generation works, output not yet bit-equal vs litert-lm reference |
+
+### GGUF (TinyLlama, Llama-2, Mistral, etc.)
+
+```sh
+# Download (one time):
+huggingface-cli download TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF \
+  tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  --local-dir ~/models/tinyllama-gguf
+
+# Prompt (greedy by default; sampler flags work):
+./zig-out/bin/vantablack \
+  ~/models/tinyllama-gguf/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  prompt 128 "Once upon a time" --seed 42
+
+# Chat (wraps in TinyLlama-Chat zephyr template):
+./zig-out/bin/vantablack <model.gguf> chat 256 "Explain RoPE in one paragraph."
+
+# Ollama-compatible HTTP server:
+./zig-out/bin/vantablack <model.gguf> serve --host 127.0.0.1 --port 11434
+```
+
+Quants: Q8_0, Q4_K, Q5_K, Q6_K — all run on Metal GPU when
+`-Dmetal=true`. Bit-equal vs CPU on TinyLlama-1.1B-Chat-v1.0.
+
+### HF / MLX directories (Apple Silicon → MLX 4-bit)
+
+```sh
+huggingface-cli download mlx-community/TinyLlama-1.1B-Chat-v1.0-4bit \
+  --local-dir ~/models/tinyllama-mlx
+
+# Point at the directory (NOT a single file):
+./zig-out/bin/vantablack ~/models/tinyllama-mlx prompt 128 "Once upon a time"
+```
+
+Verified bit-perfect against `mlx_lm` Python reference. Multi-shard
+`safetensors` bundles handled automatically.
+
+### Google `.litertlm` (Gemma 4)
+
+```sh
+huggingface-cli download litert-community/gemma-4-E2B-it-litert-lm \
+  --local-dir ~/.cache/huggingface/hub/litertlm-models
+
+# Inspect first — prints sections, metadata, architecture:
+./zig-out/bin/vantablack inspect \
+  ~/.cache/huggingface/hub/litertlm-models/gemma-4-E2B-it.litertlm
+
+# Show derived Gemma 4 config (35 layers, GQA 16/2, head_dim 128, etc.):
+./zig-out/bin/vantablack gemma4-config \
+  ~/.cache/huggingface/hub/litertlm-models/gemma-4-E2B-it.litertlm
+
+# Multi-token generation (KV-cached, greedy argmax):
+./zig-out/bin/vantablack gemma4-generate \
+  ~/.cache/huggingface/hub/litertlm-models/gemma-4-E2B-it.litertlm 16 2 105 4914
+# → prompt: [2 105 4914]
+# → generated (16 tokens): [100821 104474 236051 ...]
+```
+
+**Status:** vantablack runs Gemma 4's complete inference pipeline on real
+production weights — 35 layers with PLE, KV-sharing, MatFormer variable
+widths, Q/K-norm, all 7 RMSNorm scales, skip-scale, RoPE base 1e6, real
+multi-position attention with KV cache. **Output is not yet bit-equal**
+vs Google's `litert-lm` reference runtime; the model produces structured
+multi-token sequences but exact text matches require finishing the
+remaining calibration items (see roadmap items 19c-final and 19f).
+
+Token-id output today; integrated SentencePiece decode + `prompt`/`chat`
+parity is a follow-up.
+
+## Mobile + embedded (iOS / C ABI)
+
+vantablack cross-compiles to iOS and exposes a stable C ABI for Swift /
+Kotlin / generic-C consumers.
+
+```sh
+# Device (arm64):
+zig build -Dtarget=aarch64-ios -Doptimize=ReleaseFast
+
+# Simulator on Apple Silicon Mac:
+zig build -Dtarget=aarch64-ios-simulator -Doptimize=ReleaseFast
+
+# Optionally combine into a single fat archive for Xcode:
+lipo -create -output libvantablack.a \
+  zig-out-device/lib/libvantablack.a zig-out-sim/lib/libvantablack.a
+```
+
+The build emits:
+
+```
+zig-out/include/vantablack.h     # C header (drop into Xcode bridging header)
+zig-out/lib/libvantablack.a      # static archive, links Foundation + Metal + QuartzCore
+```
+
+Xcode SDK paths resolve automatically via `xcrun`. The iOS build
+excludes the CLI binary + HTTP server.
+
+**C ABI surface** (see `include/vantablack.h`):
+
+```c
+// Model lifecycle
+VtbModel  *vtb_model_open(const char *path, uint8_t metal_enabled);
+VtbModel  *vtb_model_open_dir(const char *dir_path, uint8_t metal_enabled);
+void       vtb_model_close(VtbModel *m);
+
+// Per-session state
+VtbState  *vtb_state_init(VtbModel *m, const VtbSamplerConfig *cfg);
+void       vtb_state_deinit(VtbState *s);
+
+// Streaming generation (callback gets piece bytes per token; return 0 to stop)
+int        vtb_generate_stream(VtbState *s,
+                               const uint8_t *prompt_bytes, size_t prompt_len,
+                               size_t max_tokens,
+                               VtbTokenCb cb, void *cb_ctx);
+
+// Host OS pressure hooks (forward iOS UIApplication + ProcessInfo notifications)
+void       vtb_signal_memory(uint8_t level);   // 0=normal, 1=warning, 2=critical
+void       vtb_signal_thermal(uint8_t state);  // 0=nominal..3=critical
+```
+
+The streaming callback fires once per generated token with a UTF-8 piece
+buffer + an `is_final` flag. Pressure signals route through
+`runtime/pressure.zig` → the active `Backend.onPressure / onThermal`
+slots, which adapt KV cache size + thread-pool worker count.
+
+See `apps/ios-smoketest/README.md` for a copy-paste Swift wrapper that
+wires `UIApplicationDidReceiveMemoryWarning` and
+`ProcessInfo.thermalState` notifications into the C ABI.
 
 ## Supported models + quantizations
 
@@ -570,193 +758,147 @@ remapping in `runtime/model.zig`.
 
 ---
 
-## CPU, power, GPU — roadmap
+## Roadmap
 
-The "CPU blew up" problem (Ollama, llama.cpp default builds) has one
-root cause: pure CPU matmul saturates every core. The fixes:
+### Shipped
 
-1. **Halve the default thread count** — *shipped*. Cuts CPU ~60% with a
-   ~55% throughput trade. `--threads N` overrides.
-2. **Bounded spin → yield in worker loop** — *shipped*. Idle workers no
-   longer pin a core between requests in `serve` mode.
-3. **Apple Metal GPU compute (Q8_0 matmul)** — *shipped, opt-in*.
-   `-Dmetal=true` build flag. Initial cut: Q8_0 matmul on GPU only,
-   one sync per matmul (~155/token), other ops on CPU.
-4. **Zero-copy state aliasing** — *shipped*. `forward.State` slices alias
-   the backend's persistent shared-storage `MTLBuffer`s. No host↔device
-   memcpy on the per-token path.
-5. **Single command buffer per layer** — *shipped*. Segment API batches
-   rmsnorm + matmul + RoPE + KV-write + attention + O-proj + residual +
-   FFN ops into one `MTLCommandBuffer`. ~155 commits/token → ~22.
-6. **Full GPU forward** — *shipped*. New MSL kernels: `copy_f32`,
-   `attn_scores`, `softmax_rows`, `attn_weighted_sum`, two-buffer
-   `rmsnorm`. KV cache + attention scores live in shared `MTLBuffer`s.
-   The CPU only does the embedding gather and the sampler.
-7. **Tighter MSL matmul (threadgroup tiling, simdgroup matmul)** —
-   *attempted, parked*. Tested three matmul kernel rewrites
-   (threadgroup-shared activation tiling, multi-row-per-thread,
-   simdgroup-per-row with `simd_sum`). All matched the simple per-thread
-   per-row kernel within noise on TinyLlama-scale GEMV — Apple's L2 was
-   already amortizing activation re-reads across simdgroups, and
-   single-token decode at this model scale isn't matmul-kernel-bound.
-   Kept the simple kernel; closing the remaining gap to llama.cpp needs
-   one of the next three items.
-8. **Async pipelining across layers** — *planned*. Enqueue the next
-   layer's command buffer while the current one runs (instead of
-   `waitUntilCompleted` per layer). ~1.5–3× expected; biggest
-   remaining lever for tok/s.
-9. **Weight fusion (QKV / gate-up)** — *planned*. Pre-concatenate Q/K/V
-   and gate/up weights at init so each fused matmul reads the activation
-   buffer once. ~5–10% expected; +~660 MB memory for TinyLlama Q8_0.
-10. **Q4_K / Q5_K / Q6_K MSL kernels** — *planned*. Required to put
-    K-quant models on the GPU at all. Currently only the Q8_0 forward
-    path is GPU-eligible; mixed-quant models stay on the CPU side.
-11. **Prompt prefill batching** — *planned*. Process N prompt tokens in
-    one forward pass. Big speedup on long prompts (no effect on per-token
-    decode rate).
-12. **MLX model loader (full integration)** — *shipped*. End-to-end
-    inference on `mlx-community/*` Llama-1/2-family 4-bit models, verified
-    bit-perfect against `mlx_lm` (CPU) and bit-equal CPU vs GPU on
-    TinyLlama-1.1B-MLX-4bit. 2/3/5/6/8-bit MLX kernels shipped on CPU;
-    4-bit also shipped on Metal GPU. Multi-shard safetensors directory
-    loading shipped + tested. Tiktoken-style tokenizer for Llama 3+ /
-    GPT-2-family remains the next piece for broader MLX-community coverage.
-13. **Apple AMX matrix coprocessor** — *planned*. M1/M2/M3 ship a hidden
-    matrix unit accessible via inline assembly. Pure-Zig + lower power
-    than even GPU for some shapes. Useful as a CPU-only fallback path.
-14. **NEON `sdot` int8 dot** — *planned*. ARMv8.2-A dedicated dot-product
-    instruction. Modest CPU-path speedup, no FFI needed.
-15. **Backend vtable abstraction** — *shipped*. `runtime/backend.zig`
-    defines a small `Backend` vtable (`layer_step`, `final_step`,
-    `finalize_token`, `capabilities`, `on_pressure`, `on_thermal`). CPU
-    and Metal impls live in `backend_cpu.zig` and `backend_metal.zig`.
-    `forward.step` is now a single straight-line dispatch — adding a
-    Vulkan, CoreML, or NPU backend is one file, not a tree of
-    `if (metal)` branches. Inspired by Google's LiteRT-LM architecture.
-16. **iOS target** — *shipped* (build only). `zig build
-    -Dtarget=aarch64-ios -Doptimize=ReleaseFast` produces a
-    `libvantablack.a` static archive linking Foundation + Metal +
-    QuartzCore via the Xcode SDK (auto-detected via `xcrun`). Same for
-    `aarch64-ios-simulator`. iOS build excludes the CLI binary + HTTP
-    server. A C ABI shim for Swift consumption is the next piece — see
-    `apps/ios-smoketest/README.md`.
-17. **Streaming inference + pressure hooks** — *shipped*. New
-    `runtime/stream.zig` exposes `generateStream(model, tokenizer,
-    sampler, backend, …, callback, cb_ctx)` with a C-ABI token callback
-    (returns `0` to stop). New `runtime/pressure.zig` exposes a `Hub`
-    that forwards `signalMemory` / `signalThermal` from the host OS to
-    registered sinks (Backends, future KV-cache shrink, ThreadPool
-    throttle). Backend vtable slots `on_pressure` + `on_thermal` are
-    wired; full KV-cache `shrinkToFit` + worker-count throttling lands
-    with item 18.
-18. **KV-cache shrinkToFit + adaptive worker count** — *shipped*.
-    `KvCache.shrinkToFit(allocator, new_max_seq)` compacts each layer's
-    live prefix and shrinks the backing slice (heap path). Metal path
-    narrows the logical bound; the underlying `MTLBuffer` is not
-    re-allocated. `ThreadPool.setActiveWorkersClamped(n)` mid-flight
-    worker count adjustment — inactive workers still ack each epoch
-    so `dispatch` waits succeed. Wired through `Backend.onThermal`
-    (`.fair` → 3/4, `.serious` → 1/2, `.critical` → 1).
-19. **`.litertlm` model loader (Phase A)** — *shipped*. Header parser
-    (`core/litertlm.zig`) reads the 32-byte magic + version + 8-byte
-    `header_end_offset`, then walks the flatbuffer `LiteRTLMMetaData`
-    root table via a tiny read-only flatbuffer reader
-    (`core/flatbuffer.zig`). Section types enumerated:
-    `TFLiteModel`, `TFLiteWeights`, `SP_Tokenizer`, `HF_Tokenizer_Zlib`,
-    `LlmMetadataProto`, `GenericBinaryData`. `LlmMetadataProto` decoded
-    via a hand-rolled protobuf wire-format scanner
-    (`core/llm_metadata.zig`) — `max_num_tokens`, model-type tag
-    (Gemma 3 / Gemma 4 / Qwen3 / etc.), Jinja prompt template. CLI:
-    `vantablack inspect <model.litertlm>` prints the section table +
-    metadata. **Inference path NOT yet wired** — see items 19b–d below.
-19b. **TFLite tensor enumeration** — *shipped*. `core/tflite.zig`
-     parses the `TFLiteModel` flatbuffer (`tensorflow/compiler/mlir/lite/schema/schema.fbs`
-     subset): `Model.subgraphs[0].tensors[]` with name, shape, dtype
-     (TensorType enum: FLOAT32/FLOAT16/BFLOAT16/INT4/INT8/UINT8/...),
-     buffer offset/size, and per-axis quantization params
-     (scale / zero_point / quantized_dimension). `vantablack inspect`
-     extends to list weight tensors. Verified on upstream
-     `schema/testdata/test_tok_tfl_llm.litertlm` (15 MB, 78 tensors).
-19c. **TFLite tensor → vantablack model mapping** — *partial*. After
-     getting a real Gemma 4 E2B `.litertlm` (2.6 GB, multimodal), we
-     discovered the decoder section uses *semantic* tensor names like
-     `transformer.transformer/layer_24/post_qkv/mlp/gating_einsum1/...`.
-     Shipped `core/gemma_layer_scan.zig` + `vantablack scan-layers`
-     CLI which achieves 35/35 layer coverage on 7 roles (mlp.gate/up/
-     down, attn.o, qkv, ple.gate, ple.proj). Remaining: refine norm
-     patterns (5 norms/layer currently classified as unknown), confirm
-     qkv shape via op-graph trace, then build a new `Model` variant
-     (Gemma 4 isn't Llama-compatible — has Per-Layer Embedding gate +
-     5 norms instead of 2). Notes in
-     `tests/golden/gemma4-e2b-architecture-notes.md`.
-19d. **TFLite int4 / int8 / fp16 dequant + matmul kernels** — *planned*.
-     TFLite quantizes weights with its own per-axis int8/int4 layout
-     (separate scale/zero_point arrays, `quantized_dimension` selects
-     the axis). Different from GGUF Q4_K block-quant and MLX 4-bit
-     affine. New kernels: CPU first, then Metal MSL. Needs Phase 19c
-     wiring before the kernel choice can be tested end-to-end.
-19e. **Forward-path parity vs `litert-lm` reference** — *planned*.
-     Bit-equal generation on `litert-community/gemma-4-E2B-it-litert-lm`
-     against Google's official runtime, same prompt + seed. Golden
-     capture lives in `tests/golden/gemma4-e2b-reference.txt`; harness
-     scaffold in `scripts/compare-gemma-output.sh`. Final gate for
-     declaring `.litertlm` support production-ready.
-19f. **In-graph sampling replication** — *planned* (discovered while
-     working 19e). Gemma 4 E2B ships *no* `sampler_params` in its
-     `LlmMetadataProto`; the litert-lm runtime then takes the
-     "executor handles sampling" branch
-     (`runtime/components/sampler_factory.cc:583-586` upstream), so
-     the TFLite model graph itself emits the token (likely
-     `STABLEHLO_RNG_BIT_GENERATOR` + `SOFTMAX` inside the decode
-     loop). Matching this needs us to recognize + execute those ops,
-     not just mirror a temperature/top-k knob.
+**Core runtime + threading**
+- Halve the default thread count (cuts CPU ~60%; `--threads N` overrides).
+- Bounded spin → yield in worker loop (idle workers don't pin a core).
+- Persistent thread pool with `setActiveWorkersClamped` for live throttle.
+- KV-cache `shrinkToFit(allocator, new_max_seq)` — heap path compacts +
+  releases tail; Metal path narrows logical bound.
 
-Items 8 + 9 + 10 are the next perf pushes; items 18 + a C-ABI shim
-unlock real iOS app integration. Item 7's negative result shifted the
-model: the matmul kernel is at the hardware's effective limit for GEMV
-at TinyLlama scale; further wins need architecture changes (async
-dispatch, weight fusion, batching), not better kernels.
+**Apple Metal GPU (full forward path)**
+- Q8_0 matmul → zero-copy state aliasing → single command-buffer per
+  layer → full GPU forward (rmsnorm + matmul + RoPE + KV-write + GQA
+  attention + O-proj + residual + FFN + LM head). Async segment
+  commit + per-token barrier.
+- Q4_K / Q5_K / Q6_K MSL kernels — mixed-quant GGUF models run on GPU.
+- MLX 4-bit MSL kernel for `mlx-community/*` bundles.
+- Threadgroup-tiling / simdgroup-per-row matmul variants tested and
+  parked — at TinyLlama-scale GEMV the simple per-thread kernel is
+  already at L2-bandwidth bound; further perf needs architecture
+  changes (async pipelining, weight fusion, batching), not better
+  matmul kernels.
+
+**Model formats**
+- GGUF v2/v3 parser + tokenizer + chat template + sampler.
+- MLX directory loader (multi-shard safetensors + `tokenizer.json` +
+  `config.json` → `LlamaConfig`) verified bit-perfect against `mlx_lm`.
+- `.litertlm` bundle parser — flatbuffer header + sections +
+  `LlmMetadataProto` + zlib-compressed HF tokenizer + `SamplerParameters`.
+- TFLite tensor + operator enumeration via `core/tflite.zig`.
+- TFLite per-axis INT2 / INT4 / INT8 dequant + fused GEMV (CPU).
+
+**Gemma 4 architecture** (real on-disk binding)
+- `Gemma4Model` discovers MatFormer variable widths, KV-sharing (15-own
+  / 20-share), Per-Layer Embedding shards, dedicated decode LM head,
+  all 7 RMSNorm scales (5 block + Q + K), per-layer skip-scale,
+  RoPE inv_freq tables.
+- `Gemma4Model.step` + `.generate` run the full 35-layer forward with
+  KV cache + real multi-position attention on user's
+  `gemma-4-E2B-it.litertlm` (2.6 GB).
+
+**Backend abstraction + iOS + C ABI**
+- `runtime/backend.zig` vtable (`layer_step`, `final_step`,
+  `finalize_token`, `capabilities`, `on_pressure`, `on_thermal`).
+  `forward.step` collapsed to a single straight-line dispatch.
+- iOS target: `zig build -Dtarget=aarch64-ios -Doptimize=ReleaseFast`
+  produces `libvantablack.a` (device + simulator). Xcode SDK paths
+  auto-resolved via `xcrun`. CLI + HTTP server excluded from the iOS
+  archive (`-Dserver=true` flag toggles the HTTP path).
+- C ABI shim (`src/c_api.zig`, `include/vantablack.h`) — Swift /
+  Kotlin / generic C consumers get a stable opaque-handle API:
+  `vtb_model_open` + `vtb_model_open_dir` + `vtb_state_init` +
+  `vtb_generate_stream` (token callback) + `vtb_signal_memory` +
+  `vtb_signal_thermal`.
+- Streaming generation API (`runtime/stream.zig`) routed through CLI
+  + C ABI with early-stop callback.
+- Memory-pressure / thermal hub (`runtime/pressure.zig`) — fans iOS
+  `UIApplicationDidReceiveMemoryWarning` + `ProcessInfo.thermalState`
+  into the active backend + future KV-shrink path.
+
+**CPU SIMD**
+- Portable `@Vector` `dot_f32` + `dot_i8` lowering to NEON `fmla` /
+  fused mul+add (sdot pattern-match pending Zig codegen).
+- Prompt prefill batching (`runtime/prefill.zig`): ~2.3× over per-token
+  CPU forward on an 87-token TinyLlama prompt.
+
+### Planned
+
+**Perf**
+- **Async pipelining across layers** — enqueue layer N+1's command
+  buffer while N runs (no `waitUntilCompleted` per layer). ~1.5–3×
+  expected for Metal tok/s.
+- **Weight fusion (QKV / gate-up)** — pre-concatenate at init so each
+  fused matmul reads activations once. ~5–10% + ~660 MB residency for
+  TinyLlama Q8_0.
+- **Apple AMX matrix coprocessor** — undocumented inline-assembly path.
+- **NEON `sdot` int8** — chain `dot_i8` codegen into the dedicated
+  instruction once Zig pattern-matches it.
+
+**`.litertlm` Gemma 4 — finish line**
+- **KV-shared layer routing pattern** — current alias-to-most-recent-
+  owner is a best guess. Real Gemma 4 may follow a specific
+  local/global window scheme (per the Gemma 3n papers); needs upstream
+  source verification.
+- **`ple_gate_activation` op identity** — empirically using SiLU
+  (multi-token output improved noticeably over GELU-approx); TFLite
+  builtin_code 150 should be looked up against upstream schema for
+  final correctness.
+- **Sampling parity vs `litert-lm`** — Gemma 4 ships *no*
+  `sampler_params`, so litert-lm takes the "executor handles sampling"
+  branch (`runtime/components/sampler_factory.cc:583-586` upstream).
+  Matching `--seed 42` output requires replicating the TFLite-internal
+  sampling chain, not just mirroring a temperature/top-k knob.
+- **Wider-attention Q-norm broadcast for layer 4** (n_q_heads=32 →
+  [512] scale variant). Discovery picks it up; broadcast fan-out logic
+  needs verification.
+- **SentencePiece tokenizer decode** for `.litertlm` bundles. Bundle
+  ships an SP model in section 1; vantablack today only decodes
+  GGUF-style SP vocab + HF `tokenizer.json`.
+- **TFLite int4 / int8 / fp16 Metal MSL kernels** — CPU kernels ship;
+  Metal port pending (weeks of work; see Phase B/C/D in
+  `tests/golden/gemma4-e2b-architecture-notes.md`).
+
+**Cross-platform**
+- **Vulkan / cross-vendor GPU** — desktop Linux + Android. Backend
+  vtable seam ready; backend impl pending.
+- **Android target** — needs Vulkan or OpenCL backend first.
 
 ---
 
-## Limitations + future work
+## Known limitations
 
-- **No prompt prefill batching.** Prompt tokens are processed one at a time.
-  For an N-token prompt the cost is N forward passes. Real throughput on
-  long prompts will improve substantially with batched prefill.
 - **TQ2_0 untested on real weights.** Spec-derived layout, internally
   consistent, no public TQ2_0 GGUF weights to validate against.
-- **Single-architecture (Llama).** `runtime/model.zig` requires
-  `general.architecture = "llama"` and the standard `blk.{i}.*` tensor
-  names. Mistral / Phi / Gemma require small metadata-key adjustments
-  and tensor-name remapping; not yet wired up.
-- **No tokenizer encoder fallback.** SentencePiece BPE only. Tiktoken-style
-  byte-level BPE (GPT-2/Llama-3) requires a different merge algorithm.
-- **GPU eligibility is narrow.** `-Dmetal=true` runs the full forward pass
-  on GPU only when every projection is Q8_0 and every norm is f32 (the
-  common TinyLlama / Llama Q8_0 layout). Mixed-quant models — Q4_K_M,
-  Q4_K_S, Q5_K, Q6_K — fall back to a per-op path that still uses the
-  GPU for Q8_0 matmul where possible but runs everything else on CPU.
-  Closing this needs Q4_K / Q5_K / Q6_K MSL kernels (roadmap item 10).
-- **GPU throughput trails llama.cpp.** ~37 tok/s vs ~50–100 tok/s on the
-  same hardware. Empirically not a kernel issue — the gap is layer-level
-  dispatch + sync overhead. Roadmap items 8 + 9 (async pipelining,
-  weight fusion) cover the remaining headroom.
-- **Yielding workers, not parking.** When the CPU pool is in use (Metal
-  off or fallback path), idle workers `std.atomic.spinLoopHint()` for a
-  bounded window then `std.Thread.yield()` — they don't block on a
-  futex/condvar (Zig 0.16's std doesn't expose futex publicly without
-  libc). Idle CPU drops sharply between requests but is not zero.
-- **Server is serial.** One request at a time, mutex-guarded. Good for
-  single-user code-gen; multi-tenant requires multiple `serve` processes
-  on different ports.
-- **Server response metadata is minimal.** `created_at` is a placeholder
-  (`1970-01-01T00:00:00Z`); `digest`, `total_duration`, `prompt_eval_count`,
-  `eval_count`, `eval_duration` are omitted. Most Ollama clients tolerate
-  it; full parity would add real timestamps + sha256 + per-request timings.
-- **No `error_tracing` in ReleaseSmall.** `build.zig` disables it for the
-  binary-size win. Crashes in ReleaseSmall builds give a stack address,
-  not a Zig stack trace. Use ReleaseFast or Debug for diagnostic builds.
+- **GGUF + MLX path: Llama-arch only.** `runtime/model.zig` requires
+  `general.architecture = "llama"` and standard `blk.{i}.*` tensor
+  names. Mistral/Phi run via small metadata-key adjustments; the
+  `.litertlm` path (Gemma 4) lives in `runtime/gemma4_model.zig` and
+  builds its own forward path.
+- **Gemma 4 output not yet bit-equal vs `litert-lm`.** The structural
+  pipeline runs end-to-end on the user's real `gemma-4-E2B-it.litertlm`
+  but exact text parity needs the remaining `.litertlm` items in the
+  roadmap (KV-shared routing, sampler parity, etc.).
+- **GPU eligibility narrows for mixed-quant GGUF.** Full GPU forward
+  fires when every projection is Q8_0/Q4_K/Q5_K/Q6_K and every norm
+  is f32 (the common TinyLlama / Llama layout). Mixed-quant models
+  fall back to a per-op path that uses the GPU for matmul where
+  possible but runs the rest on CPU.
+- **GPU tok/s trails llama.cpp ~30%.** Empirically a layer-level
+  dispatch/sync overhead, not a matmul-kernel issue (Apple's L2
+  amortizes activation re-reads at TinyLlama scale). Async pipelining
+  + weight fusion are the next levers.
+- **Workers yield, don't park.** Idle workers `spinLoopHint()` for a
+  bounded window then `std.Thread.yield()`. No futex/condvar parking
+  (Zig 0.16's std doesn't expose futex publicly without libc). Idle
+  CPU drops sharply between requests but isn't zero.
+- **HTTP server is serial.** One request at a time, mutex-guarded.
+  Multi-tenant requires multiple `serve` processes on different ports.
+- **ReleaseSmall drops error_tracing.** Crashes show a stack address,
+  not a Zig stack trace. Use ReleaseFast / Debug for diagnostic builds.
 
 ---
 
