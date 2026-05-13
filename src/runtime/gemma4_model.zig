@@ -95,6 +95,17 @@ pub const Gemma4Layer = struct {
     /// the next layer. FP32 [1,1,1] = 4 bytes total. Gemma 4's
     /// `_maybe_apply_skip_scale` mechanism.
     skip_scale: ?*const tflite.Tensor = null,
+    /// Per-layer head dimension. Gemma 4 E2B has MatFormer-style
+    /// variable head_dim: sliding-window-local layers use 256,
+    /// global-attention layers use 512. Derived from K shape (own
+    /// or parent's): `head_dim = k_shape[0] / n_kv_heads`. n_kv is
+    /// uniform at 1.
+    head_dim: u32,
+    /// Per-layer RoPE base. 10_000 for sliding-window-local layers,
+    /// 1_000_000 for global-attention layers. Inferred from the
+    /// per-layer rope_inv_freq table (which encodes
+    /// `base^(-i/(head_dim/2))` for i ∈ [0, head_dim/2)).
+    rope_base: f32 = 1_000_000.0,
 };
 
 pub const Gemma4Model = struct {
@@ -439,11 +450,6 @@ math.gegluApprox(gate, up);
         const math = @import("../kernels/math.zig");
         if (hidden_out.len != self.config.hidden) return error.ShapeMismatch;
 
-        const head_dim: usize = self.config.head_dim;
-        // Gemma 2/3/4 use 1e6 for the RoPE base (Llama default is 1e4).
-        // At pos=0 this is a no-op; matters once KV history exists.
-        const rope_base: f32 = 1_000_000.0;
-
         try self.lookupEmbedding(token_id, hidden_out);
 
         // Per-layer scratch buffers. Q-output / KV-output / FFN dims
@@ -497,13 +503,25 @@ math.gegluApprox(gate, up);
         var layer_idx: usize = 0;
         while (layer_idx < self.layers.len) : (layer_idx += 1) {
             const layer = self.layers[layer_idx];
+            const head_dim: usize = layer.head_dim;
+            const rope_base: f32 = layer.rope_base;
             // Per-layer attention shapes.
             const q_dim_l: usize = @intCast(layer.q.shape[0]);
             const n_q_l: usize = q_dim_l / head_dim;
+            // For KV-shared layers, derive n_kv from parent's head_dim
+            // (parent may have different head_dim, e.g. layer 19 shares
+            // from layer 14 with hd=512 while this layer also runs at
+            // hd=512). Use the same cycle as initKvCache.
             const n_kv_l: usize = if (layer.k) |k_t|
                 @as(usize, @intCast(k_t.shape[0])) / head_dim
-            else
-                self.config.n_kv_heads;
+            else blk: {
+                const cycle_parent: usize = if (layer_idx >= 14 and ((layer_idx - 14) % 5) == 0) 14 else 13;
+                const parent_layer = self.layers[cycle_parent];
+                if (parent_layer.k) |pk| {
+                    break :blk @as(usize, @intCast(pk.shape[0])) / parent_layer.head_dim;
+                }
+                break :blk 1;
+            };
 
             // Pre-attention norm (learned scale if available).
             @memcpy(h_norm, hidden_out);
@@ -677,11 +695,8 @@ math.gegluApprox(gate, up);
         if (hidden_out.len != self.config.hidden) return error.ShapeMismatch;
         if (position >= cache.max_seq) return error.KvCacheFull;
 
-        const head_dim: usize = self.config.head_dim;
-        const rope_base: f32 = 1_000_000.0;
         const rms_eps: f32 = 1.0e-6;
         const seq_len: usize = position + 1;
-        const inv_sqrt_hd: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
         try self.lookupEmbedding(token_id, hidden_out);
 
@@ -724,12 +739,19 @@ math.gegluApprox(gate, up);
         var layer_idx: usize = 0;
         while (layer_idx < self.layers.len) : (layer_idx += 1) {
             const layer = self.layers[layer_idx];
+            const head_dim: usize = layer.head_dim;
+            const rope_base: f32 = layer.rope_base;
+            const inv_sqrt_hd: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
             const q_dim_l: usize = @intCast(layer.q.shape[0]);
             const n_q_l: usize = q_dim_l / head_dim;
             const n_kv_l: usize = if (layer.k) |k_t|
                 @as(usize, @intCast(k_t.shape[0])) / head_dim
-            else
-                @as(usize, @intCast(self.layers[cache.parent_of_shared[layer_idx]].k.?.shape[0])) / head_dim;
+            else blk: {
+                const parent_idx = cache.parent_of_shared[layer_idx];
+                const parent_k = self.layers[parent_idx].k.?;
+                const parent_hd = self.layers[parent_idx].head_dim;
+                break :blk @as(usize, @intCast(parent_k.shape[0])) / parent_hd;
+            };
             const kv_dim_l: usize = n_kv_l * head_dim;
 
             // Pre-attention norm.
@@ -1122,6 +1144,8 @@ pub fn initFromLitertlm(
             .ple_gate = pg,
             .ple_proj = pp,
             .rope_inv_freq = b.rope_inv_freq,
+            .head_dim = 0, // filled in below
+            .rope_base = 1_000_000.0,
         };
         resolved += 1;
     }
@@ -1148,19 +1172,41 @@ pub fn initFromLitertlm(
         break :blk q_out; // last-resort guess
     };
 
-    // RoPE inv_freq table shape is [1, 1, head_dim].
+    // Per-layer head_dim (MatFormer variable widths). Gemma 4 E2B has
+    // sliding-window-local layers (head_dim=256, base=10000) and
+    // global-attention layers (head_dim=512, base=1e6). Derive from
+    // each layer's own K shape; for KV-shared layers, fall back to a
+    // neighbouring owner's shape based on the same cycle used in
+    // initKvCache (layers {14, 19, 24, 29, 34} reuse layer 14; others
+    // reuse layer 13).
+    //
+    // Q always lays out as [n_q * head_dim, hidden] with
+    // n_q_heads = 8 uniformly across Gemma 4 E2B. So:
+    //   head_dim_l = q_shape[0] / 8
+    // and head_dim must equal n_kv * (k_shape[0] / n_kv) = k_shape[0]
+    // since n_kv_heads = 1.
+    const N_Q_HEADS_GEMMA4: u32 = 8;
+    const N_KV_HEADS_GEMMA4: u32 = 1;
+    for (final_layers) |*layer| {
+        const q_rows: u32 = @intCast(layer.q.shape[0]);
+        const hd: u32 = q_rows / N_Q_HEADS_GEMMA4;
+        layer.head_dim = hd;
+        // RoPE base: 10000 for narrow (sliding-window) heads, 1e6 for
+        // wide (global) heads. Pattern verified against the stored
+        // rope_inv_freq tables on layers 0 (hd=256, base=1e4) and 4
+        // (hd=512, base=1e6).
+        layer.rope_base = if (hd <= 256) 10_000.0 else 1_000_000.0;
+    }
+    // The struct-level `head_dim` used by `config` keeps the narrow
+    // (sliding-window) value for backwards-compatible scratch sizing.
+    // Per-layer paths use `layer.head_dim` instead.
     const head_dim: u32 = blk: {
-        for (final_layers) |layer| {
-            if (layer.rope_inv_freq) |rf| if (rf.shape.len >= 1) {
-                break :blk @intCast(rf.shape[rf.shape.len - 1]);
-            };
-        }
-        // Fallback: assume head_dim divides Q output evenly. Gemma 4
-        // E2B uses head_dim=128.
-        break :blk 128;
+        for (final_layers) |layer| if (layer.head_dim != 0) break :blk layer.head_dim;
+        break :blk 256;
     };
-    const n_q_heads: u32 = q_out / head_dim;
-    const n_kv_heads: u32 = kv_out / head_dim;
+    const n_q_heads: u32 = N_Q_HEADS_GEMMA4;
+    const n_kv_heads: u32 = N_KV_HEADS_GEMMA4;
+    _ = kv_out;
 
     // PLE width from PLE projection shape [hidden, ple_dim].
     const ple_dim: u32 = if (l0.ple_proj.shape.len >= 2)
