@@ -139,6 +139,75 @@ pub const Gemma4Model = struct {
         self.* = undefined;
     }
 
+    /// Per-layer KV cache. Each layer's slot holds [max_seq * kv_dim_l]
+    /// FP32 floats for both K and V. KV-shared layers re-use the
+    /// previous full-attention layer's slot — they don't allocate own
+    /// storage.
+    pub const KvCache = struct {
+        k_per_layer: [][]f32, // one slice per layer; alias for shared layers
+        v_per_layer: [][]f32,
+        owned: []bool, // true if slot is heap-owned (vs aliased)
+        parent_of_shared: []usize, // for diagnostic
+        max_seq: usize,
+        pos: usize,
+        allocator: std.mem.Allocator,
+
+        pub fn deinit(self: *KvCache) void {
+            for (self.k_per_layer, self.owned) |slot, own| {
+                if (own) self.allocator.free(slot);
+            }
+            for (self.v_per_layer, self.owned) |slot, own| {
+                if (own) self.allocator.free(slot);
+            }
+            self.allocator.free(self.k_per_layer);
+            self.allocator.free(self.v_per_layer);
+            self.allocator.free(self.owned);
+            self.allocator.free(self.parent_of_shared);
+            self.* = undefined;
+        }
+    };
+
+    pub fn initKvCache(self: *const Gemma4Model, allocator: std.mem.Allocator, max_seq: usize) !KvCache {
+        const n = self.layers.len;
+        const k_slots = try allocator.alloc([]f32, n);
+        errdefer allocator.free(k_slots);
+        const v_slots = try allocator.alloc([]f32, n);
+        errdefer allocator.free(v_slots);
+        const owned = try allocator.alloc(bool, n);
+        errdefer allocator.free(owned);
+        const parents = try allocator.alloc(usize, n);
+        errdefer allocator.free(parents);
+
+        const head_dim: usize = self.config.head_dim;
+        var last_owner: usize = 0;
+        for (self.layers, 0..) |layer, i| {
+            parents[i] = i;
+            if (layer.k) |k_t| {
+                const kv_dim_l: usize = @as(usize, @intCast(k_t.shape[0]));
+                k_slots[i] = try allocator.alloc(f32, max_seq * kv_dim_l);
+                v_slots[i] = try allocator.alloc(f32, max_seq * kv_dim_l);
+                owned[i] = true;
+                last_owner = i;
+                _ = head_dim;
+            } else {
+                // KV-shared: alias the most-recent owner's slot.
+                k_slots[i] = k_slots[last_owner];
+                v_slots[i] = v_slots[last_owner];
+                owned[i] = false;
+                parents[i] = last_owner;
+            }
+        }
+        return .{
+            .k_per_layer = k_slots,
+            .v_per_layer = v_slots,
+            .owned = owned,
+            .parent_of_shared = parents,
+            .max_seq = max_seq,
+            .pos = 0,
+            .allocator = allocator,
+        };
+    }
+
     /// Generic per-row GEMV against a borrowed weight tensor. Dispatches
     /// on tensor dtype: INT4 (2/byte), INT2 (4/byte) — the two packings
     /// Gemma 4 E2B uses for matmul weights. INT8 has its own helper
@@ -557,6 +626,197 @@ pub const Gemma4Model = struct {
         math.addInto(hidden_out, residual);
     }
 
+    /// Single-step forward at the given absolute position, with KV
+    /// cache. Updates `cache.pos` to `position + 1` on return.
+    pub fn step(
+        self: *const Gemma4Model,
+        allocator: std.mem.Allocator,
+        token_id: u32,
+        position: usize,
+        cache: *KvCache,
+        hidden_out: []f32,
+    ) !void {
+        const math = @import("../kernels/math.zig");
+        if (hidden_out.len != self.config.hidden) return error.ShapeMismatch;
+        if (position >= cache.max_seq) return error.KvCacheFull;
+
+        const head_dim: usize = self.config.head_dim;
+        const rope_base: f32 = 1_000_000.0;
+        const rms_eps: f32 = 1.0e-6;
+        const seq_len: usize = position + 1;
+        const inv_sqrt_hd: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+        try self.lookupEmbedding(token_id, hidden_out);
+
+        // Determine scratch buffer sizes (max across all layers).
+        var max_q: usize = 0;
+        var max_kv: usize = 0;
+        var max_ffn: usize = 0;
+        for (self.layers, 0..) |layer, i| {
+            const q_sz: usize = @intCast(layer.q.shape[0]);
+            if (q_sz > max_q) max_q = q_sz;
+            if (layer.k) |kt| {
+                const kvs: usize = @intCast(kt.shape[0]);
+                if (kvs > max_kv) max_kv = kvs;
+            }
+            if (self.config.ffn_dim_per_layer[i] > max_ffn) max_ffn = self.config.ffn_dim_per_layer[i];
+        }
+        if (max_kv == 0) max_kv = max_q;
+
+        const q = try allocator.alloc(f32, max_q);
+        defer allocator.free(q);
+        const k_curr = try allocator.alloc(f32, max_kv);
+        defer allocator.free(k_curr);
+        const v_curr = try allocator.alloc(f32, max_kv);
+        defer allocator.free(v_curr);
+        const attn_in = try allocator.alloc(f32, max_q);
+        defer allocator.free(attn_in);
+        const attn_out = try allocator.alloc(f32, self.config.hidden);
+        defer allocator.free(attn_out);
+        const gate = try allocator.alloc(f32, max_ffn);
+        defer allocator.free(gate);
+        const up = try allocator.alloc(f32, max_ffn);
+        defer allocator.free(up);
+        const ffn_out = try allocator.alloc(f32, self.config.hidden);
+        defer allocator.free(ffn_out);
+        const h_norm = try allocator.alloc(f32, self.config.hidden);
+        defer allocator.free(h_norm);
+        const scores = try allocator.alloc(f32, seq_len);
+        defer allocator.free(scores);
+
+        var layer_idx: usize = 0;
+        while (layer_idx < self.layers.len) : (layer_idx += 1) {
+            const layer = self.layers[layer_idx];
+            const q_dim_l: usize = @intCast(layer.q.shape[0]);
+            const n_q_l: usize = q_dim_l / head_dim;
+            const n_kv_l: usize = if (layer.k) |k_t|
+                @as(usize, @intCast(k_t.shape[0])) / head_dim
+            else
+                @as(usize, @intCast(self.layers[cache.parent_of_shared[layer_idx]].k.?.shape[0])) / head_dim;
+            const kv_dim_l: usize = n_kv_l * head_dim;
+
+            // Pre-attention norm.
+            @memcpy(h_norm, hidden_out);
+            if (layer.norm_pre_attn) |w_t| {
+                const w_f32: []const f32 = @as([*]const f32, @ptrCast(@alignCast(w_t.data.ptr)))[0..self.config.hidden];
+                math.rmsNormGemma(h_norm, w_f32, rms_eps);
+            } else {
+                math.rmsNormUnit(h_norm, rms_eps);
+            }
+
+            // Project Q, K, V (K/V only on owner layers — write into cache slot).
+            const q_slice = q[0..q_dim_l];
+            try self.projectQ(h_norm, layer_idx, q_slice);
+
+            if (layer.k != null) {
+                const k_slot = cache.k_per_layer[layer_idx][position * kv_dim_l ..][0..kv_dim_l];
+                const v_slot = cache.v_per_layer[layer_idx][position * kv_dim_l ..][0..kv_dim_l];
+                try self.projectK(h_norm, layer_idx, k_slot);
+                try self.projectV(h_norm, layer_idx, v_slot);
+                @memcpy(k_curr[0..kv_dim_l], k_slot);
+                @memcpy(v_curr[0..kv_dim_l], v_slot);
+
+                // Q/K-norm + RoPE on the fresh K vector before caching.
+                // Actually applied above to k_slot already (need to redo).
+                // For simplicity apply norms+rope to k_curr and copy back.
+                if (layer.norm_key) |w_t| {
+                    const w_f32: []const f32 = @as([*]const f32, @ptrCast(@alignCast(w_t.data.ptr)))[0..@intCast(w_t.shape[0])];
+                    math.rmsNormGemma(k_curr[0..kv_dim_l], w_f32, rms_eps);
+                }
+                var hh: usize = 0;
+                while (hh < n_kv_l) : (hh += 1) {
+                    math.ropeHalf(k_curr[hh * head_dim ..][0..head_dim], position, rope_base);
+                }
+                @memcpy(k_slot, k_curr[0..kv_dim_l]);
+            }
+            // Q-norm + RoPE.
+            if (layer.norm_query) |w_t| {
+                const w_f32: []const f32 = @as([*]const f32, @ptrCast(@alignCast(w_t.data.ptr)))[0..@intCast(w_t.shape[0])];
+                const group_size: usize = w_f32.len;
+                const groups: usize = q_dim_l / group_size;
+                var g: usize = 0;
+                while (g < groups) : (g += 1) {
+                    math.rmsNormGemma(q_slice[g * group_size ..][0..group_size], w_f32, rms_eps);
+                }
+            }
+            var hh: usize = 0;
+            while (hh < n_q_l) : (hh += 1) {
+                math.ropeHalf(q_slice[hh * head_dim ..][0..head_dim], position, rope_base);
+            }
+
+            // Real attention over the cached prefix.
+            const k_cache = cache.k_per_layer[layer_idx];
+            const v_cache = cache.v_per_layer[layer_idx];
+            const attn_in_slice = attn_in[0..q_dim_l];
+            @memset(attn_in_slice, 0);
+            var qh: usize = 0;
+            while (qh < n_q_l) : (qh += 1) {
+                const kv_h = (qh * n_kv_l) / n_q_l;
+                const q_h = q_slice[qh * head_dim ..][0..head_dim];
+
+                // scores[t] = (q_h · k_cache[t, kv_h]) * inv_sqrt_hd
+                var t: usize = 0;
+                while (t < seq_len) : (t += 1) {
+                    const k_row = k_cache[t * kv_dim_l + kv_h * head_dim ..][0..head_dim];
+                    var s: f32 = 0;
+                    for (q_h, k_row) |qv, kv| s += qv * kv;
+                    scores[t] = s * inv_sqrt_hd;
+                }
+                math.softmax(scores);
+
+                const out_h = attn_in_slice[qh * head_dim ..][0..head_dim];
+                t = 0;
+                while (t < seq_len) : (t += 1) {
+                    const v_row = v_cache[t * kv_dim_l + kv_h * head_dim ..][0..head_dim];
+                    const w = scores[t];
+                    for (out_h, v_row) |*o, vv| o.* += w * vv;
+                }
+            }
+
+            try self.projectAttnO(attn_in_slice, layer_idx, attn_out);
+            if (layer.norm_post_attn) |w_t| {
+                const w_f32: []const f32 = @as([*]const f32, @ptrCast(@alignCast(w_t.data.ptr)))[0..self.config.hidden];
+                math.rmsNormGemma(attn_out, w_f32, rms_eps);
+            }
+            math.addInto(hidden_out, attn_out);
+
+            // Pre-MLP norm + MLP block.
+            @memcpy(h_norm, hidden_out);
+            if (layer.norm_pre_ffw) |w_t| {
+                const w_f32: []const f32 = @as([*]const f32, @ptrCast(@alignCast(w_t.data.ptr)))[0..self.config.hidden];
+                math.rmsNormGemma(h_norm, w_f32, rms_eps);
+            } else {
+                math.rmsNormUnit(h_norm, rms_eps);
+            }
+            const ffn = self.config.ffn_dim_per_layer[layer_idx];
+            const gate_slice = gate[0..ffn];
+            const up_slice = up[0..ffn];
+            try self.projectMlpGate(h_norm, layer_idx, gate_slice);
+            try self.projectMlpUp(h_norm, layer_idx, up_slice);
+            math.swiglu(gate_slice, up_slice);
+            try self.projectMlpDown(gate_slice, layer_idx, ffn_out);
+            if (layer.norm_post_ffw) |w_t| {
+                const w_f32: []const f32 = @as([*]const f32, @ptrCast(@alignCast(w_t.data.ptr)))[0..self.config.hidden];
+                math.rmsNormGemma(ffn_out, w_f32, rms_eps);
+            }
+            math.addInto(hidden_out, ffn_out);
+
+            // PLE residual.
+            if (layer_idx < self.per_layer_embedder.len and self.per_layer_embedder[layer_idx] != null) {
+                ple_scratch_residual_add(self, allocator, token_id, layer_idx, hidden_out) catch {};
+            }
+
+            // Skip-scale.
+            if (layer.skip_scale) |s_t| {
+                const s: f32 = @as([*]const f32, @ptrCast(@alignCast(s_t.data.ptr)))[0];
+                var ii: usize = 0;
+                while (ii < hidden_out.len) : (ii += 1) hidden_out[ii] *= s;
+            }
+        }
+
+        cache.pos = position + 1;
+    }
+
     /// LM head: computes vocab-size logits from the post-stack hidden
     /// state. Uses `lm_head` (Gemma 4's dedicated decode-time embedder
     /// living inside the decoder section) when present; falls back to
@@ -574,6 +834,61 @@ pub const Gemma4Model = struct {
         if (scales.len < m or zps.len < m) return error.ShapeMismatch;
         const tflite_int4 = @import("../kernels/tflite_int4.zig");
         try tflite_int4.gemvInt2PerRow(t.data, scales, zps, hidden, logits, m, k);
+    }
+
+    /// Generate `n_new` tokens greedily starting from `prompt_ids`.
+    /// Caller-owned output buffer; populates with newly-generated ids.
+    /// Returns the number actually written (could be less if cache fills).
+    pub fn generate(
+        self: *const Gemma4Model,
+        allocator: std.mem.Allocator,
+        prompt_ids: []const u32,
+        n_new: usize,
+        max_seq: usize,
+        out_tokens: []u32,
+    ) !usize {
+        const math = @import("../kernels/math.zig");
+        var cache = try self.initKvCache(allocator, max_seq);
+        defer cache.deinit();
+
+        const hidden = try allocator.alloc(f32, self.config.hidden);
+        defer allocator.free(hidden);
+        const logits = try allocator.alloc(f32, self.config.vocab_size);
+        defer allocator.free(logits);
+
+        // Prefill the prompt; keep the last hidden state to predict next.
+        var pos: usize = 0;
+        for (prompt_ids) |tid| {
+            if (pos >= max_seq) break;
+            try self.step(allocator, tid, pos, &cache, hidden);
+            pos += 1;
+        }
+        if (pos == 0) return 0;
+
+        var produced: usize = 0;
+        while (produced < n_new and produced < out_tokens.len and pos < max_seq) : (produced += 1) {
+            // hidden currently holds the post-stack state for the last
+            // fed token. RMSNorm + LM head argmax → next.
+            const h_copy = try allocator.alloc(f32, self.config.hidden);
+            defer allocator.free(h_copy);
+            @memcpy(h_copy, hidden);
+            math.rmsNormUnit(h_copy, 1.0e-6);
+            try self.lmHead(h_copy, logits);
+            var best: u32 = 0;
+            var best_v: f32 = logits[0];
+            var i: usize = 1;
+            while (i < logits.len) : (i += 1) {
+                if (logits[i] > best_v) {
+                    best_v = logits[i];
+                    best = @intCast(i);
+                }
+            }
+            out_tokens[produced] = best;
+            // Feed the new token for the next round.
+            try self.step(allocator, best, pos, &cache, hidden);
+            pos += 1;
+        }
+        return produced;
     }
 
     /// End-to-end: token_id → next-token argmax. Runs forwardSingleToken,

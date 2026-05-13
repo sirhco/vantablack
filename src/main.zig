@@ -20,6 +20,7 @@ const usage =
     \\  vantablack gemma4-layer0 <m.litertlm> <token_id>    full single-token forward through layer 0 (no KV history)
     \\  vantablack gemma4-forward <m.litertlm> <token_id>   full single-token forward through ALL 35 layers
     \\  vantablack gemma4-predict <m.litertlm> <token_id>   forward + LM head + argmax → next-token id
+    \\  vantablack gemma4-generate <m.litertlm> <N> <ids…>  multi-token greedy generation (KV cache)
     \\  vantablack tokenize-litertlm <m.litertlm> <text>    encode text using HF tokenizer embedded in a .litertlm
     \\
     \\generate / prompt / chat accept sampler flags BEFORE the n value:
@@ -65,6 +66,20 @@ pub fn main(init: std.process.Init) !void {
             return error.MissingArgs;
         }
         try runTokenizeLitertlm(gpa, arena, io, args[2], args[3], out, err);
+        return;
+    }
+
+    // gemma4-generate <model.litertlm> <max_new> <token_id> [token_id ...]:
+    // Multi-token greedy generation with KV cache. Feeds the prompt
+    // through `step`, then generates `max_new` new tokens by argmax.
+    if (std.mem.eql(u8, args[1], "gemma4-generate")) {
+        if (args.len < 5) {
+            try err.writeAll("usage: vantablack gemma4-generate <model.litertlm> <max_new> <token_id> [token_id ...]\n");
+            try err.flush();
+            return error.MissingArgs;
+        }
+        const n_new = try std.fmt.parseInt(usize, args[3], 10);
+        try runGemma4Generate(gpa, arena, io, args[2], n_new, args[4..], out, err);
         return;
     }
 
@@ -595,6 +610,57 @@ fn runTokenizeLitertlm(
         try out.print("{d}", .{id});
     }
     try out.writeByte('\n');
+    try out.flush();
+}
+
+fn runGemma4Generate(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: Io,
+    input_path: []const u8,
+    n_new: usize,
+    prompt_args: []const []const u8,
+    out: *Io.Writer,
+    err: *Io.Writer,
+) !void {
+    _ = err;
+    const abs_path = if (std.fs.path.isAbsolute(input_path))
+        try arena.dupe(u8, input_path)
+    else blk: {
+        const cwd = try std.process.currentPathAlloc(io, arena);
+        break :blk try std.fs.path.resolve(arena, &.{ cwd, input_path });
+    };
+    const file = try Io.Dir.openFileAbsolute(io, abs_path, .{ .allow_directory = false });
+    defer file.close(io);
+    const len = try file.length(io);
+    const len_us: usize = std.math.cast(usize, len) orelse return error.FileTooLarge;
+    const mapped = try std.posix.mmap(null, len_us, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    defer std.posix.munmap(mapped);
+
+    var bundle = try vantablack.litertlm.Bundle.init(gpa, mapped);
+    defer bundle.deinit();
+    var model = try vantablack.gemma4_model.initFromLitertlm(gpa, &bundle);
+    defer model.deinit();
+
+    const prompt = try arena.alloc(u32, prompt_args.len);
+    for (prompt_args, 0..) |s, i| prompt[i] = try std.fmt.parseInt(u32, s, 10);
+
+    const out_buf = try gpa.alloc(u32, n_new);
+    defer gpa.free(out_buf);
+    const max_seq: usize = 32; // capped for first multi-token smoke test
+    const wrote = try model.generate(gpa, prompt, n_new, max_seq, out_buf);
+
+    try out.print("prompt: [", .{});
+    for (prompt, 0..) |t, i| {
+        if (i > 0) try out.writeByte(' ');
+        try out.print("{d}", .{t});
+    }
+    try out.print("]\ngenerated ({d} tokens): [", .{wrote});
+    for (out_buf[0..wrote], 0..) |t, i| {
+        if (i > 0) try out.writeByte(' ');
+        try out.print("{d}", .{t});
+    }
+    try out.writeAll("]\n");
     try out.flush();
 }
 
