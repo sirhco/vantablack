@@ -90,6 +90,13 @@ pub const Gemma4Model = struct {
     /// quantization scales tuned for hidden → vocab projection.
     /// Falls back to `embedder` (weight tying) when absent.
     lm_head: ?*const tflite.Tensor = null,
+    /// Per-layer embedder lookup tables (Gemma's PLE mechanism).
+    /// 35 INT4 tensors shape [vocab, ple_dim], indexed by layer.
+    /// Slot is null if a layer's per-layer embed couldn't be located.
+    per_layer_embedder: []?*const tflite.Tensor = &.{},
+    /// TFLite Model holding the per_layer_embedder shards (section 3).
+    /// Kept alive so the borrowed pointers stay valid.
+    per_layer_tfl: ?tflite.Model = null,
     /// Underlying TFLite Model for the decoder section. Kept alive so
     /// the borrowed tensor pointers stay valid.
     decoder_tfl: tflite.Model,
@@ -105,8 +112,10 @@ pub const Gemma4Model = struct {
     pub fn deinit(self: *Gemma4Model) void {
         self.config.deinit(self.allocator);
         self.allocator.free(self.layers);
+        if (self.per_layer_embedder.len > 0) self.allocator.free(self.per_layer_embedder);
         self.decoder_tfl.deinit();
         if (self.embedder_tfl) |*tfl| tfl.deinit();
+        if (self.per_layer_tfl) |*tfl| tfl.deinit();
         self.* = undefined;
     }
 
@@ -418,7 +427,56 @@ pub const Gemma4Model = struct {
             math.swiglu(gate_slice, up_slice);
             try self.projectMlpDown(gate_slice, layer_idx, ffn_out);
             math.addInto(hidden_out, ffn_out);
+
+            // PLE residual mix (Gemma's per-layer-embedding contribution).
+            // Skipped when no per-layer-embedder shard for this layer.
+            if (layer_idx < self.per_layer_embedder.len and self.per_layer_embedder[layer_idx] != null) {
+                ple_scratch_residual_add(self, allocator, token_id, layer_idx, hidden_out) catch {};
+            }
         }
+    }
+
+    /// Run the PLE residual block for `layer_idx`:
+    ///   ple_in[ple_dim] = lookupPerLayerEmbedding(token, layer)
+    ///   gate_out[ple_dim] = projectPleGate(hidden_out)
+    ///   gated[ple_dim] = ple_in * gelu(gate_out)        // approximate
+    ///   residual[hidden] = projectPleProj(gated)
+    ///   hidden_out += residual
+    ///
+    /// Activation choice (`gelu`) is best-guess until verified against
+    /// the actual `ple_gate_activation` op in section 10. Skip the
+    /// post_per_layer_input_norm step until we have its scale.
+    fn ple_scratch_residual_add(
+        self: *const Gemma4Model,
+        allocator: std.mem.Allocator,
+        token_id: u32,
+        layer_idx: usize,
+        hidden_out: []f32,
+    ) !void {
+        const math = @import("../kernels/math.zig");
+        const ple_dim: usize = self.config.ple_dim;
+        const ple_in = try allocator.alloc(f32, ple_dim);
+        defer allocator.free(ple_in);
+        const gate_out = try allocator.alloc(f32, ple_dim);
+        defer allocator.free(gate_out);
+        const residual = try allocator.alloc(f32, self.config.hidden);
+        defer allocator.free(residual);
+
+        try self.lookupPerLayerEmbedding(token_id, layer_idx, ple_in);
+        try self.projectPleGate(hidden_out, layer_idx, gate_out);
+
+        // ple_in[i] *= gelu_approx(gate_out[i])
+        // gelu(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
+        var i: usize = 0;
+        while (i < ple_dim) : (i += 1) {
+            const x = gate_out[i];
+            const t = 0.7978845608 * (x + 0.044715 * x * x * x);
+            const tanh_t = std.math.tanh(t);
+            const g = 0.5 * x * (1.0 + tanh_t);
+            ple_in[i] *= g;
+        }
+        try self.projectPleProj(ple_in, layer_idx, residual);
+        math.addInto(hidden_out, residual);
     }
 
     /// LM head: computes vocab-size logits from the post-stack hidden
@@ -479,6 +537,38 @@ pub const Gemma4Model = struct {
         const weights: []const i8 = @as([*]const i8, @ptrCast(t.data.ptr))[0..t.data.len];
         const tflite_int4 = @import("../kernels/tflite_int4.zig");
         try tflite_int4.gemvInt8PerRow(weights, scales, zps, x, y, m, k);
+    }
+
+    /// Decode one row of the INT4 per-layer embedder for `layer_idx`.
+    /// `out.len == config.ple_dim` (256 for Gemma 4 E2B).
+    pub fn lookupPerLayerEmbedding(
+        self: *const Gemma4Model,
+        token_id: u32,
+        layer_idx: usize,
+        out: []f32,
+    ) !void {
+        if (layer_idx >= self.per_layer_embedder.len) return error.LayerOutOfRange;
+        const t = self.per_layer_embedder[layer_idx] orelse return error.NoPerLayerEmbedder;
+        if (token_id >= self.config.vocab_size) return error.TokenOutOfRange;
+        if (out.len != self.config.ple_dim) return error.ShapeMismatch;
+
+        const k = self.config.ple_dim;
+        const row_bytes_per_token = (k + 1) / 2; // INT4 = 2 values per byte
+        const row_off_bytes = @as(usize, token_id) * row_bytes_per_token;
+        const row_bytes = t.data[row_off_bytes .. row_off_bytes + row_bytes_per_token];
+
+        const scales = tflite.scalesAsF32(t.scales);
+        const zps = tflite.zeroPointsAsI64(t.zero_points);
+        if (scales.len <= token_id or zps.len <= token_id) return error.ShapeMismatch;
+        const scale = scales[token_id];
+        const zp = zps[token_id];
+        const tflite_int4 = @import("../kernels/tflite_int4.zig");
+        var col: usize = 0;
+        while (col < k) : (col += 1) {
+            const v: i32 = tflite_int4.unpackInt4(row_bytes, col);
+            const centered: i32 = v - @as(i32, @intCast(zp));
+            out[col] = @as(f32, @floatFromInt(centered)) * scale;
+        }
     }
 
     /// Decode one row of the INT2 text embedder into FP32. `token_id`
@@ -683,6 +773,51 @@ pub fn initFromLitertlm(
         tfl.deinit();
     }
 
+    // Discover the 35 per-layer-embedder lookup tables. They live in
+    // a section separate from both decoder + embedder (section 3 in
+    // E2B, 1.2 GB total). Naming: `per_layer_embedder.lookup_embedding_table/composite[N]`
+    // where N is the layer index (suffix "" means layer 0).
+    const n_layers_usize: usize = final_layers.len;
+    const ple_table = try allocator.alloc(?*const tflite.Tensor, n_layers_usize);
+    errdefer allocator.free(ple_table);
+    @memset(ple_table, null);
+    var per_layer_tfl_opt: ?tflite.Model = null;
+
+    for (bundle.sections, 0..) |s, sec_i| {
+        if (s.data_type != .tflite_model) continue;
+        if (sec_i == sec_idx) continue;
+        if (embedder_section_idx) |e| if (sec_i == e) continue;
+        const bytes = bundle.sectionBytes(s) catch continue;
+        var tfl = tflite.Model.init(allocator, bytes) catch continue;
+        var matched_any = false;
+        for (tfl.tensors) |*t| {
+            if (t.data.len == 0) continue;
+            const prefix = "per_layer_embedder.lookup_embedding_table/composite";
+            const pos = std.mem.indexOf(u8, t.name, prefix) orelse continue;
+            const after = t.name[pos + prefix.len ..];
+            // Suffix may be empty (layer 0), an integer (layer N), or
+            // include trailing path components. Trim at first '/'.
+            const num_end = std.mem.indexOfScalar(u8, after, '/') orelse after.len;
+            const num_str = after[0..num_end];
+            const layer_n: u32 = if (num_str.len == 0)
+                0
+            else
+                std.fmt.parseInt(u32, num_str, 10) catch continue;
+            if (layer_n >= n_layers_usize) continue;
+            // Prefer larger tensors when slot already filled.
+            if (ple_table[layer_n]) |existing| {
+                if (t.data.len <= existing.data.len) continue;
+            }
+            ple_table[layer_n] = t;
+            matched_any = true;
+        }
+        if (matched_any) {
+            per_layer_tfl_opt = tfl;
+            break;
+        }
+        tfl.deinit();
+    }
+
     return .{
         .config = .{
             .hidden = hidden,
@@ -697,8 +832,10 @@ pub fn initFromLitertlm(
         .layers = final_layers,
         .embedder = embedder_tensor,
         .lm_head = lm_head_tensor,
+        .per_layer_embedder = ple_table,
         .decoder_tfl = decoder_tfl,
         .embedder_tfl = embedder_tfl_opt,
+        .per_layer_tfl = per_layer_tfl_opt,
         .decoder_section_idx = sec_idx,
         .allocator = allocator,
     };
