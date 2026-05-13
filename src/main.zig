@@ -562,18 +562,23 @@ fn runInspect(
         try out.print("  tokenizer (SentencePiece): {d} bytes\n", .{s.size()});
     }
 
-    // TFLite Model section — Phase B partial: enumerate tensors.
-    if (bundle.findSection(.tflite_model)) |s| {
+    // TFLite Model sections — Phase B partial. Real Gemma 4 splits its
+    // weights across multiple TFLite sections (embedder, decode loop,
+    // KV cache layouts, etc.). Walk every TFLite section.
+    var tfl_idx: usize = 0;
+    for (bundle.sections, 0..) |s, sec_idx| {
+        if (s.data_type != .tflite_model) continue;
         const tfl_bytes = try bundle.sectionBytes(s);
         var tfl_model = vantablack.tflite.Model.init(gpa, tfl_bytes) catch |e| {
-            try out.print("  tflite_model: parse failed ({s})\n", .{@errorName(e)});
-            try out.flush();
-            return;
+            try out.print("  tflite_model[{d}] (section {d}): parse failed ({s})\n", .{ tfl_idx, sec_idx, @errorName(e) });
+            tfl_idx += 1;
+            continue;
         };
         defer tfl_model.deinit();
+        const size_mb: f64 = @as(f64, @floatFromInt(s.size())) / (1024.0 * 1024.0);
         try out.print(
-            "  tflite_model: version={d}, tensors={d}, operators={d}, op_codes={d}\n",
-            .{ tfl_model.version, tfl_model.tensors.len, tfl_model.operators.len, tfl_model.operator_codes.len },
+            "  tflite_model[{d}] (section {d}, {d:.2} MB): version={d}, tensors={d}, operators={d}, op_codes={d}\n",
+            .{ tfl_idx, sec_idx, size_mb, tfl_model.version, tfl_model.tensors.len, tfl_model.operators.len, tfl_model.operator_codes.len },
         );
 
         // Op histogram — surfaces which BuiltinOperators the forward
@@ -595,20 +600,42 @@ fn runInspect(
             }
         }
 
-        // Print up to the first 20 tensors with a populated buffer (i.e.
-        // weights, not transient activations). Full dump available via
-        // `--tflite-tensors` later if needed.
-        var shown: usize = 0;
+        // Top weight tensors by size — most informative for figuring out
+        // which section holds which model component (embedder, attention,
+        // FFN, etc.).
+        var weight_count: usize = 0;
+        var weight_bytes: usize = 0;
         for (tfl_model.tensors) |t| {
-            if (t.data.len == 0) continue; // skip activations
-            if (shown == 0) try out.writeAll("    weight tensors (first 20):\n");
-            if (shown >= 20) {
-                try out.print("    ... ({d} more weight tensors)\n", .{tfl_model.tensors.len - shown});
-                break;
+            if (t.data.len > 0) {
+                weight_count += 1;
+                weight_bytes += t.data.len;
             }
-            shown += 1;
-            try printTensorRow(out, t);
         }
+        const weight_mb: f64 = @as(f64, @floatFromInt(weight_bytes)) / (1024.0 * 1024.0);
+        try out.print("    weights: {d} tensors, {d:.2} MB\n", .{ weight_count, weight_mb });
+
+        // Sort tensors by data size descending so the genuine weight
+        // blobs surface (not index/scalar constants that happen to
+        // appear first).
+        const ranked = gpa.dupe(vantablack.tflite.Tensor, tfl_model.tensors) catch null;
+        defer if (ranked) |r| gpa.free(r);
+        if (ranked) |r| {
+            const SortCtx = struct {
+                fn gt(_: void, a: vantablack.tflite.Tensor, b: vantablack.tflite.Tensor) bool {
+                    return a.data.len > b.data.len;
+                }
+            };
+            std.sort.pdq(vantablack.tflite.Tensor, r, {}, SortCtx.gt);
+            var shown: usize = 0;
+            for (r) |t| {
+                if (t.data.len == 0) break;
+                if (shown == 0) try out.writeAll("    largest weight tensors (first 5 by size):\n");
+                if (shown >= 5) break;
+                shown += 1;
+                try printTensorRow(out, t);
+            }
+        }
+        tfl_idx += 1;
     }
 
     // Inference status — honest about what's missing.

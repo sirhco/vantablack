@@ -1,0 +1,177 @@
+litertlm bundle: /Users/chrisolson/.cache/huggingface/hub/litertlm-models/gemma-4-E2B-it.litertlm
+  version: 1.5.0
+  size:    2588147712 bytes (2468.25 MB)
+  sections: 12
+    [0] LlmMetadataProto     offset=16384        size=12192 (0.01 MB)
+    [1] SP_Tokenizer         offset=32768        size=4689013 (4.47 MB)
+    [2] TFLiteModel          offset=4734976      size=103811720 (99.00 MB)
+    [3] TFLiteModel          offset=108560384    size=1284518392 (1225.01 MB)
+    [4] TFLiteModel          offset=1393082368   size=94052280 (89.70 MB)
+    [5] TFLiteModel          offset=1487142912   size=9441244 (9.00 MB)
+    [6] TFLiteModel          offset=1496596480   size=6772 (0.01 MB)
+    [7] TFLiteModel          offset=1496612864   size=224137936 (213.75 MB)
+    [8] TFLiteModel          offset=1720762368   size=4742928 (4.52 MB)
+    [9] TFLiteModel          offset=1725513728   size=6772 (0.01 MB)
+    [10] TFLiteModel          offset=1725530112   size=818275184 (780.37 MB)
+    [11] TFLiteModel          offset=2543812608   size=44325712 (42.27 MB)
+  metadata:
+    max_num_tokens: 0
+    model_type:     Gemma4
+    jinja_template: (11995 chars) {%- macro format_parameters(properties, required) -%}
+    {%- set standard_keys ...
+    stop_tokens:    3
+  tokenizer (SentencePiece): 4689013 bytes
+  tflite_model[0] (section 2, 99.00 MB): version=3, tensors=16, operators=8, op_codes=7
+    op histogram:
+      RESHAPE              (22) 2
+      OP?                  (62) 1
+      OP?                  (58) 1
+      OP?                  (86) 1
+      OP?                  (123) 1
+      OP?                  (7) 1
+      MUL                  (18) 1
+    weights: 7 tensors, 96.00 MB
+    largest weight tensors (first 5 by size):
+      embedder.lookup_embedding_table/composite                    INT2       shape=[] data=100663296 bytes quantized
+      embedder.lookup_embedding_table/reshape                      INT32      shape=[] data=12 bytes
+      embedder.lookup_embedding_table/reshape1                     INT32      shape=[] data=4 bytes
+      select_n                                                     INT32      shape=[] data=4 bytes
+      arith.constant                                               INT32      shape=[] data=4 bytes
+  tflite_model[1] (section 3, 1225.01 MB): version=3, tensors=83, operators=42, op_codes=7
+    op histogram:
+      OP?                  (7) 35
+      RESHAPE              (22) 2
+      OP?                  (62) 1
+      OP?                  (58) 1
+      OP?                  (86) 1
+      OP?                  (123) 1
+      CONCATENATION        (2) 1
+    weights: 40 tensors, 1120.00 MB
+    largest weight tensors (first 5 by size):
+      per_layer_embedder.lookup_embedding_table/composite34        INT4       shape=[] data=33554432 bytes quantized
+      per_layer_embedder.lookup_embedding_table/composite13        INT4       shape=[] data=33554432 bytes quantized
+      per_layer_embedder.lookup_embedding_table/composite2         INT4       shape=[] data=33554432 bytes quantized
+      per_layer_embedder.lookup_embedding_table/composite3         INT4       shape=[] data=33554432 bytes quantized
+      per_layer_embedder.lookup_embedding_table/composite33        INT4       shape=[] data=33554432 bytes quantized
+  tflite_model[2] (section 4, 89.70 MB): version=3, tensors=2530, operators=2182, op_codes=25
+    op histogram:
+      MUL                  (18) 579
+      RESHAPE              (22) 439
+      ADD                  (0) 170
+      DEQUANTIZE           (6) 132
+      FULLY_CONNECTED      (9) 122
+      OP?                  (74) 112
+      MIRROR_PAD           (76) 110
+      TRANSPOSE            (39) 96
+      OP?                  (114) 96
+      OP?                  (65) 86
+      ... (15 more op types)
+    weights: 346 tensors, 86.45 MB
+    largest weight tensors (first 5 by size):
+      jit(wrapper)/ConformerEncoder/ConformerEncoder.encoder/ou... FLOAT32    shape=[] data=6291456 bytes
+      jit(wrapper)/ConformerEncoder/ConformerEncoder.encoder/Co... FLOAT32    shape=[] data=4194304 bytes
+      jit(wrapper)/ConformerEncoder/ConformerEncoder.encoder/la... INT2       shape=[] data=1048576 bytes quantized
+      jit(wrapper)/ConformerEncoder/ConformerEncoder.encoder/la... INT4       shape=[] data=1048576 bytes quantized
+      jit(wrapper)/ConformerEncoder/ConformerEncoder.encoder/la... INT2       shape=[] data=1048576 bytes quantized
+  tflite_model[3] (section 5, 9.00 MB): version=3, tensors=18, operators=11, op_codes=7
+    op histogram:
+      MUL                  (18) 4
+      RESHAPE              (22) 2
+      OP?                  (74) 1
+      ADD                  (0) 1
+      MIRROR_PAD           (76) 1
+      FULLY_CONNECTED      (9) 1
+      OP?                  (53) 1
+    weights: 5 tensors, 9.00 MB
+    largest weight tensors (first 5 by size):
+      jit(jax_fn)/AudioAdapter/audio_input_projection/btm,md->b... FLOAT32    shape=[] data=9437184 bytes
+      arith.constant                                               INT32      shape=[] data=12 bytes
+      jit(jax_fn)/AudioAdapter/audio_soft_embedding_norm/div;ji... FLOAT32    shape=[] data=4 bytes
+      jit(jax_fn)/AudioAdapter/audio_soft_embedding_norm/add;ji... FLOAT32    shape=[] data=4 bytes
+      jit(jax_fn)/AudioAdapter/audio_soft_embedding_norm/reduce... INT32      shape=[] data=4 bytes
+  tflite_model[4] (section 6, 0.01 MB): version=3, tensors=1, operators=0, op_codes=0
+    op histogram:
+    weights: 1 tensors, 0.01 MB
+    largest weight tensors (first 5 by size):
+      StatefulPartitionedCall:0                                    FLOAT32    shape=[] data=6144 bytes
+  tflite_model[5] (section 7, 213.75 MB): version=3, tensors=1729, operators=1477, op_codes=34
+    op histogram:
+      MUL                  (18) 277
+      OP?                  (65) 196
+      RESHAPE              (22) 170
+      FULLY_CONNECTED      (9) 115
+      DEQUANTIZE           (6) 112
+      OP?                  (206) 112
+      ADD                  (0) 99
+      CONCATENATION        (2) 97
+      SUB                  (41) 66
+      TRANSPOSE            (39) 64
+      ... (24 more op types)
+    weights: 250 tensors, 206.45 MB
+    largest weight tensors (first 5 by size):
+      VisionEncoder/entry/bls,sd->bld/dot_general                  FLOAT32    shape=[] data=31457280 bytes
+      VisionEncoder/entry/bls,sd->bld/dot_general1                 FLOAT32    shape=[] data=31457280 bytes
+      VisionEncoder/transformer/layer_7/layer_7.post_qkv/mlp/ga... INT8       shape=[] data=2359296 bytes quantized
+      VisionEncoder/transformer/layer_15/layer_15.post_qkv/mlp/... INT8       shape=[] data=2359296 bytes quantized
+      VisionEncoder/transformer/layer_0/layer_0.post_qkv/mlp/ga... INT8       shape=[] data=2359296 bytes quantized
+  tflite_model[6] (section 8, 4.52 MB): version=3, tensors=21, operators=15, op_codes=6
+    op histogram:
+      MUL                  (18) 6
+      OP?                  (74) 2
+      ADD                  (0) 2
+      RESHAPE              (22) 2
+      MIRROR_PAD           (76) 2
+      FULLY_CONNECTED      (9) 1
+    weights: 5 tensors, 4.50 MB
+    largest weight tensors (first 5 by size):
+      GeminiModel.adapt_vision/mm_adapter/mm_adapter.project_so... FLOAT32    shape=[] data=4718592 bytes
+      arith.constant2                                              INT32      shape=[] data=12 bytes
+      arith.constant                                               FLOAT32    shape=[] data=4 bytes
+      arith.constant1                                              FLOAT32    shape=[] data=4 bytes
+      arith.constant3                                              INT32      shape=[] data=4 bytes
+  tflite_model[7] (section 9, 0.01 MB): version=3, tensors=1, operators=0, op_codes=0
+    op histogram:
+    weights: 1 tensors, 0.01 MB
+    largest weight tensors (first 5 by size):
+      StatefulPartitionedCall:0                                    FLOAT32    shape=[] data=6144 bytes
+  tflite_model[8] (section 10, 780.37 MB): version=3, tensors=2703, operators=2068, op_codes=31
+    op histogram:
+      OP?                  (206) 327
+      MUL                  (18) 311
+      FULLY_CONNECTED      (9) 277
+      DEQUANTIZE           (6) 276
+      OP?                  (114) 211
+      ADD                  (0) 156
+      RESHAPE              (22) 110
+      OP?                  (65) 100
+      OP?                  (123) 70
+      OP?                  (150) 70
+      ... (21 more op types)
+    weights: 551 tensors, 741.94 MB
+    largest weight tensors (first 5 by size):
+      LanguageModel.decode_graph/LanguageModel.decode_softmax/t... INT2       shape=[] data=100663296 bytes quantized
+      LanguageModel.decode_graph/LanguageModel.transformer_stac... INT8       shape=[] data=13762560 bytes quantized
+      LanguageModel.decode_graph/LanguageModel.transformer_stac... INT2       shape=[] data=4718592 bytes quantized
+      LanguageModel.decode_graph/LanguageModel.transformer_stac... INT2       shape=[] data=4718592 bytes quantized
+      LanguageModel.decode_graph/LanguageModel.transformer_stac... INT2       shape=[] data=4718592 bytes quantized
+  tflite_model[9] (section 11, 42.27 MB): version=3, tensors=275, operators=198, op_codes=25
+    op histogram:
+      OP?                  (206) 29
+      MUL                  (18) 28
+      FULLY_CONNECTED      (9) 23
+      DEQUANTIZE           (6) 22
+      OP?                  (114) 18
+      RESHAPE              (22) 15
+      ADD                  (0) 12
+      OP?                  (65) 8
+      OP?                  (123) 8
+      CONCATENATION        (2) 6
+      ... (15 more op types)
+    weights: 69 tensors, 38.89 MB
+    largest weight tensors (first 5 by size):
+      MtpDrafterModel.decode_softmax/transformer.decode_softmax... INT4       shape=[] data=33554432 bytes quantized
+      MtpDrafterModel.mtp_pre_project/mtp_pre_proj/btm,md->btd/... INT8       shape=[] data=786432 bytes quantized
+      layer_3/layer_3.post_qkv/attn.post_qkv/attn_vec_einsum/bt... INT8       shape=[] data=524288 bytes quantized
+      layer_3/layer_3.pre_q/attn.pre_q/attn._pre_attention_quer... INT8       shape=[] data=524288 bytes quantized
+      MtpDrafterModel.mtp_post_project/mtp_post_proj/btd,dm->bt... INT8       shape=[] data=393216 bytes quantized
+  inference: TFLite tensor → vantablack model mapping pending (Phase B/C/D — see README roadmap items 19b–d)
