@@ -416,6 +416,49 @@ pub const Gemma4Model = struct {
         }
     }
 
+    /// LM head via embedder weight-tying. Computes vocab-size logits
+    /// from the post-stack hidden state by multiplying through the
+    /// (transposed) INT2 embedder table. Many Gemma variants tie LM
+    /// head to embedding weights; if Gemma 4 uses a distinct LM head,
+    /// substitute that tensor here.
+    ///
+    /// `hidden.len == config.hidden`; `logits.len == config.vocab_size`.
+    pub fn lmHead(self: *const Gemma4Model, hidden: []const f32, logits: []f32) !void {
+        const t = self.embedder orelse return error.NoEmbedder;
+        if (hidden.len != self.config.hidden) return error.ShapeMismatch;
+        if (logits.len != self.config.vocab_size) return error.ShapeMismatch;
+        const m: usize = @intCast(t.shape[0]); // vocab
+        const k: usize = @intCast(t.shape[1]); // hidden
+        const scales = tflite.scalesAsF32(t.scales);
+        const zps = tflite.zeroPointsAsI64(t.zero_points);
+        if (scales.len < m or zps.len < m) return error.ShapeMismatch;
+        const tflite_int4 = @import("../kernels/tflite_int4.zig");
+        try tflite_int4.gemvInt2PerRow(t.data, scales, zps, hidden, logits, m, k);
+    }
+
+    /// End-to-end: token_id → next-token argmax. Runs forwardSingleToken,
+    /// LM head via embedder weight-tying, then argmax.
+    pub fn predictNext(self: *const Gemma4Model, allocator: std.mem.Allocator, token_id: u32) !u32 {
+        const hidden = try allocator.alloc(f32, self.config.hidden);
+        defer allocator.free(hidden);
+        try self.forwardSingleToken(allocator, token_id, hidden);
+
+        const logits = try allocator.alloc(f32, self.config.vocab_size);
+        defer allocator.free(logits);
+        try self.lmHead(hidden, logits);
+
+        var best: u32 = 0;
+        var best_v: f32 = logits[0];
+        var i: usize = 1;
+        while (i < logits.len) : (i += 1) {
+            if (logits[i] > best_v) {
+                best_v = logits[i];
+                best = @intCast(i);
+            }
+        }
+        return best;
+    }
+
     fn projectInt8Generic(t: *const tflite.Tensor, x: []const f32, y: []f32) !void {
         if (t.shape.len < 2) return error.ShapeMismatch;
         const m: usize = @intCast(t.shape[0]);

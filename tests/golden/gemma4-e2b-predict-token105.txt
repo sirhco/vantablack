@@ -1,0 +1,2 @@
+predictNext (input token 105, vocab 262144)
+  next token = 130324
