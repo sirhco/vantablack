@@ -57,6 +57,143 @@ pub inline fn packInt4Pair(low: i8, high: i8) u8 {
 }
 
 // ---------------------------------------------------------------------------
+// INT8 — used in Gemma 4 E2B's Per-Layer Embedding projections. Simplest
+// quant in this file: signed 8-bit, no bit-packing.
+// ---------------------------------------------------------------------------
+
+pub fn dequantizeInt8PerRow(
+    weights: []const i8,
+    scales: []const f32,
+    zero_points: []const i64,
+    m: usize,
+    k: usize,
+    out: []f32,
+) Error!void {
+    if (out.len != m * k) return error.ShapeMismatch;
+    if (scales.len < m or zero_points.len < m) return error.ShapeMismatch;
+    if (weights.len < m * k) return error.ShapeMismatch;
+
+    var row: usize = 0;
+    while (row < m) : (row += 1) {
+        const scale = scales[row];
+        const zp = zero_points[row];
+        const row_off = row * k;
+        var col: usize = 0;
+        while (col < k) : (col += 1) {
+            const v: i32 = weights[row_off + col];
+            const centered: i32 = v - @as(i32, @intCast(zp));
+            out[row_off + col] = @as(f32, @floatFromInt(centered)) * scale;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fused GEMV — `y = W @ x` with W stored as per-axis quantized weights.
+//
+// Math (per-row quantization):
+//   y[i] = sum_j ((int_val(W[i,j]) - zp[i]) * scale[i]) * x[j]
+//        = scale[i] * (sum_j int_val(W[i,j]) * x[j]   -   zp[i] * sum_j x[j])
+//        = scale[i] * (dot_int_x[i]                   -   zp[i] * sum_x)
+//
+// `sum_x` is precomputed once over the input vector. `dot_int_x` is a
+// straight integer-times-float accumulate per row. ~2x faster than
+// dequant→workspace→matmul for typical Gemma shapes.
+// ---------------------------------------------------------------------------
+
+/// y[m] += W_int8 @ x[k]  (per-row scale + zero_point).
+pub fn gemvInt8PerRow(
+    weights: []const i8,
+    scales: []const f32,
+    zero_points: []const i64,
+    x: []const f32,
+    y: []f32,
+    m: usize,
+    k: usize,
+) Error!void {
+    if (y.len < m or x.len < k) return error.ShapeMismatch;
+    if (scales.len < m or zero_points.len < m) return error.ShapeMismatch;
+    if (weights.len < m * k) return error.ShapeMismatch;
+
+    var sum_x: f32 = 0;
+    for (x[0..k]) |v| sum_x += v;
+
+    var row: usize = 0;
+    while (row < m) : (row += 1) {
+        const row_off = row * k;
+        var dot: f32 = 0;
+        var col: usize = 0;
+        while (col < k) : (col += 1) {
+            const w: f32 = @floatFromInt(weights[row_off + col]);
+            dot += w * x[col];
+        }
+        const zp: f32 = @floatFromInt(zero_points[row]);
+        y[row] = scales[row] * (dot - zp * sum_x);
+    }
+}
+
+/// y[m] += W_int4 @ x[k]  (per-row scale + zero_point, packed 2/byte).
+pub fn gemvInt4PerRow(
+    packed_bytes: []const u8,
+    scales: []const f32,
+    zero_points: []const i64,
+    x: []const f32,
+    y: []f32,
+    m: usize,
+    k: usize,
+) Error!void {
+    if (y.len < m or x.len < k) return error.ShapeMismatch;
+    if (scales.len < m or zero_points.len < m) return error.ShapeMismatch;
+    if (packed_bytes.len * 2 < m * k) return error.ShapeMismatch;
+
+    var sum_x: f32 = 0;
+    for (x[0..k]) |v| sum_x += v;
+
+    var row: usize = 0;
+    while (row < m) : (row += 1) {
+        const row_off = row * k;
+        var dot: f32 = 0;
+        var col: usize = 0;
+        while (col < k) : (col += 1) {
+            const w: f32 = @floatFromInt(unpackInt4(packed_bytes, row_off + col));
+            dot += w * x[col];
+        }
+        const zp: f32 = @floatFromInt(zero_points[row]);
+        y[row] = scales[row] * (dot - zp * sum_x);
+    }
+}
+
+/// y[m] += W_int2 @ x[k]  (per-row scale + zero_point, packed 4/byte).
+pub fn gemvInt2PerRow(
+    packed_bytes: []const u8,
+    scales: []const f32,
+    zero_points: []const i64,
+    x: []const f32,
+    y: []f32,
+    m: usize,
+    k: usize,
+) Error!void {
+    if (y.len < m or x.len < k) return error.ShapeMismatch;
+    if (scales.len < m or zero_points.len < m) return error.ShapeMismatch;
+    if (packed_bytes.len * 4 < m * k) return error.ShapeMismatch;
+
+    var sum_x: f32 = 0;
+    for (x[0..k]) |v| sum_x += v;
+
+    var row: usize = 0;
+    while (row < m) : (row += 1) {
+        const row_off = row * k;
+        var dot: f32 = 0;
+        var col: usize = 0;
+        while (col < k) : (col += 1) {
+            const w: f32 = @floatFromInt(unpackInt2(packed_bytes, row_off + col));
+            dot += w * x[col];
+        }
+        const zp: f32 = @floatFromInt(zero_points[row]);
+        y[row] = scales[row] * (dot - zp * sum_x);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // INT2 — extreme quant used by Gemma 4 E2B's text embedder + many MLP layers.
 // Signed 2-bit values, range [-2, 1], packed 4 per byte.
 // ---------------------------------------------------------------------------
@@ -267,6 +404,96 @@ test "dequantizeInt2PerRow basic 1x8 tensor" {
     try dequantizeInt2PerRow(&packed_bytes, &scales, &zps, 1, 8, &out);
     const expect = [_]f32{ -4, -2, 0, 2, -4, -2, 0, 2 };
     for (expect, out) |e, a| try std.testing.expectApproxEqAbs(e, a, 1e-6);
+}
+
+test "dequantizeInt8PerRow basic 2x4" {
+    const weights = [_]i8{
+        1, -1, 2, -2,
+        3, 3, 3, 3,
+    };
+    const scales = [_]f32{ 1.0, 0.5 };
+    const zps = [_]i64{ 0, 1 };
+    var out: [8]f32 = undefined;
+    try dequantizeInt8PerRow(&weights, &scales, &zps, 2, 4, &out);
+    const expect = [_]f32{ 1, -1, 2, -2, 1, 1, 1, 1 };
+    for (expect, out) |e, a| try std.testing.expectApproxEqAbs(e, a, 1e-6);
+}
+
+test "gemvInt8PerRow matches dequant-then-matmul" {
+    // 3x4 weight matrix, signed int8.
+    const weights = [_]i8{
+        1, -2, 3,  -4,
+        5,  6, -7, 8,
+        -1, -1, -1, -1,
+    };
+    const scales = [_]f32{ 0.1, 0.5, 1.0 };
+    const zps = [_]i64{ 0, 2, -1 };
+    const x = [_]f32{ 1.0, 0.5, -0.25, 2.0 };
+
+    // Reference: dequant to workspace, scalar matmul.
+    var dequant: [12]f32 = undefined;
+    try dequantizeInt8PerRow(&weights, &scales, &zps, 3, 4, &dequant);
+    var y_ref: [3]f32 = .{ 0, 0, 0 };
+    for (0..3) |i| {
+        var s: f32 = 0;
+        for (0..4) |j| s += dequant[i * 4 + j] * x[j];
+        y_ref[i] = s;
+    }
+
+    var y_fused: [3]f32 = .{ 0, 0, 0 };
+    try gemvInt8PerRow(&weights, &scales, &zps, &x, &y_fused, 3, 4);
+
+    for (y_ref, y_fused) |r, f| try std.testing.expectApproxEqAbs(r, f, 1e-4);
+}
+
+test "gemvInt4PerRow matches dequant-then-matmul" {
+    var packed_bytes: [4]u8 = .{
+        packInt4Pair(1, -1),
+        packInt4Pair(2, -2),
+        packInt4Pair(3, 3),
+        packInt4Pair(3, 3),
+    };
+    const scales = [_]f32{ 0.5, 1.0 };
+    const zps = [_]i64{ 1, -2 };
+    const x = [_]f32{ 1.0, 0.5, -0.25, 2.0 };
+
+    var dequant: [8]f32 = undefined;
+    try dequantizeInt4PerRow(&packed_bytes, &scales, &zps, 2, 4, &dequant);
+    var y_ref: [2]f32 = .{ 0, 0 };
+    for (0..2) |i| {
+        var s: f32 = 0;
+        for (0..4) |j| s += dequant[i * 4 + j] * x[j];
+        y_ref[i] = s;
+    }
+
+    var y_fused: [2]f32 = .{ 0, 0 };
+    try gemvInt4PerRow(&packed_bytes, &scales, &zps, &x, &y_fused, 2, 4);
+
+    for (y_ref, y_fused) |r, f| try std.testing.expectApproxEqAbs(r, f, 1e-4);
+}
+
+test "gemvInt2PerRow matches dequant-then-matmul" {
+    var packed_bytes: [2]u8 = .{
+        packInt2Quad(-2, -1, 0, 1),
+        packInt2Quad(1, 0, -1, -2),
+    };
+    const scales = [_]f32{ 0.25, 1.0 };
+    const zps = [_]i64{ 0, 1 };
+    const x = [_]f32{ 1.0, 2.0, 3.0, -1.0 };
+
+    var dequant: [8]f32 = undefined;
+    try dequantizeInt2PerRow(&packed_bytes, &scales, &zps, 2, 4, &dequant);
+    var y_ref: [2]f32 = .{ 0, 0 };
+    for (0..2) |i| {
+        var s: f32 = 0;
+        for (0..4) |j| s += dequant[i * 4 + j] * x[j];
+        y_ref[i] = s;
+    }
+
+    var y_fused: [2]f32 = .{ 0, 0 };
+    try gemvInt2PerRow(&packed_bytes, &scales, &zps, &x, &y_fused, 2, 4);
+
+    for (y_ref, y_fused) |r, f| try std.testing.expectApproxEqAbs(r, f, 1e-4);
 }
 
 test "dequantizeInt4PerRow handles negative zero_point + full int4 range" {
