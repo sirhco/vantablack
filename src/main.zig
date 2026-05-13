@@ -11,6 +11,7 @@ const usage =
     \\  vantablack <model.gguf> chat <n> <user-message>      wrap in TinyLlama-Chat (zephyr) template
     \\  vantablack <model.gguf> serve [--host H] [--port P]  Ollama-compatible HTTP server (default 127.0.0.1:11434)
     \\  vantablack inspect <model.litertlm>                 print sections + metadata of a LiteRT-LM bundle
+    \\  vantablack tokenize-litertlm <m.litertlm> <text>    encode text using HF tokenizer embedded in a .litertlm
     \\
     \\generate / prompt / chat accept sampler flags BEFORE the n value:
     \\  --temp <f>     temperature (0.0 = greedy)
@@ -41,6 +42,21 @@ pub fn main(init: std.process.Init) !void {
         try err.writeAll(usage);
         try err.flush();
         return error.MissingPath;
+    }
+
+    // tokenize-litertlm <model.litertlm> <text>: extract the HF tokenizer
+    // from a .litertlm bundle (zlib-decompressed HF_Tokenizer_Zlib
+    // section), encode `text`, print token IDs. Lets a host validate
+    // tokenization from a litertlm bundle without needing the full
+    // forward path.
+    if (std.mem.eql(u8, args[1], "tokenize-litertlm")) {
+        if (args.len < 4) {
+            try err.writeAll("usage: vantablack tokenize-litertlm <model.litertlm> <text>\n");
+            try err.flush();
+            return error.MissingArgs;
+        }
+        try runTokenizeLitertlm(gpa, arena, io, args[2], args[3], out, err);
+        return;
     }
 
     // inspect <model.litertlm>: parse Google's LiteRT-LM container header,
@@ -396,6 +412,48 @@ fn ggmlTypeName(t: vantablack.GgmlType) []const u8 {
     };
 }
 
+fn runTokenizeLitertlm(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: Io,
+    input_path: []const u8,
+    text: []const u8,
+    out: *Io.Writer,
+    err: *Io.Writer,
+) !void {
+    _ = err;
+    const abs_path = if (std.fs.path.isAbsolute(input_path))
+        try arena.dupe(u8, input_path)
+    else blk: {
+        const cwd = try std.process.currentPathAlloc(io, arena);
+        break :blk try std.fs.path.resolve(arena, &.{ cwd, input_path });
+    };
+    const file = try Io.Dir.openFileAbsolute(io, abs_path, .{ .allow_directory = false });
+    defer file.close(io);
+    const len = try file.length(io);
+    const len_us: usize = std.math.cast(usize, len) orelse return error.FileTooLarge;
+    const mapped = try std.posix.mmap(null, len_us, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    defer std.posix.munmap(mapped);
+
+    var bundle = try vantablack.litertlm.Bundle.init(gpa, mapped);
+    defer bundle.deinit();
+
+    const tok_json = try bundle.extractHfTokenizerJson(gpa);
+    defer gpa.free(tok_json);
+
+    var tok = try vantablack.Tokenizer.initFromHfJson(gpa, tok_json);
+    defer tok.deinitOwnedPieces(gpa);
+
+    try out.print("flavor={s} byte_split={s} vocab={d}\n", .{ @tagName(tok.flavor), @tagName(tok.byte_split), tok.pieces.len });
+    const ids = try tok.encode(arena, text, false);
+    for (ids, 0..) |id, i| {
+        if (i > 0) try out.writeByte(' ');
+        try out.print("{d}", .{id});
+    }
+    try out.writeByte('\n');
+    try out.flush();
+}
+
 // ----- LiteRT-LM (.litertlm) container inspection -------------------------
 
 fn runInspect(
@@ -478,9 +536,28 @@ fn runInspect(
         try out.print("    stop_tokens:    {d}\n", .{meta.stop_tokens_bytes.len});
     }
 
-    // Tokenizer fingerprint (without decompressing — Phase A scope).
+    // Tokenizer — decompress HF_Tokenizer_Zlib and surface vocab size +
+    // flavor. SentencePiece sections are still left as raw byte count
+    // (decode lives in `Tokenizer.init` which expects a GGUF catalog —
+    // standalone SP decode is a follow-up).
     if (bundle.findSection(.hf_tokenizer_zlib)) |s| {
-        try out.print("  tokenizer (HF, zlib): {d} compressed bytes — decode pending\n", .{s.size()});
+        try out.print("  tokenizer (HF, zlib): {d} compressed bytes\n", .{s.size()});
+        if (bundle.extractHfTokenizerJson(gpa)) |json| {
+            defer gpa.free(json);
+            try out.print("    decompressed: {d} bytes\n", .{json.len});
+            if (vantablack.Tokenizer.initFromHfJson(gpa, json)) |tok_owned| {
+                var tok = tok_owned;
+                defer tok.deinitOwnedPieces(gpa);
+                try out.print(
+                    "    flavor={s} byte_split={s} vocab={d}\n",
+                    .{ @tagName(tok.flavor), @tagName(tok.byte_split), tok.pieces.len },
+                );
+            } else |e| {
+                try out.print("    parse failed: {s}\n", .{@errorName(e)});
+            }
+        } else |e| {
+            try out.print("    decompress failed: {s}\n", .{@errorName(e)});
+        }
     } else if (bundle.findSection(.sp_tokenizer)) |s| {
         try out.print("  tokenizer (SentencePiece): {d} bytes\n", .{s.size()});
     }
@@ -494,7 +571,29 @@ fn runInspect(
             return;
         };
         defer tfl_model.deinit();
-        try out.print("  tflite_model: version={d}, tensors={d}\n", .{ tfl_model.version, tfl_model.tensors.len });
+        try out.print(
+            "  tflite_model: version={d}, tensors={d}, operators={d}, op_codes={d}\n",
+            .{ tfl_model.version, tfl_model.tensors.len, tfl_model.operators.len, tfl_model.operator_codes.len },
+        );
+
+        // Op histogram — surfaces which BuiltinOperators the forward
+        // graph uses. Critical for Phase 19c (mapping ops to vantablack's
+        // Llama forward path).
+        const hist = tfl_model.opHistogram(gpa) catch null;
+        defer if (hist) |h| gpa.free(h);
+        if (hist) |h| {
+            try out.writeAll("    op histogram:\n");
+            var printed: usize = 0;
+            for (h) |row| {
+                if (row.count == 0) continue;
+                if (printed >= 10) {
+                    try out.print("      ... ({d} more op types)\n", .{h.len - printed});
+                    break;
+                }
+                try out.print("      {s:<20} ({d}) {d}\n", .{ vantablack.tflite.nameOfOp(row.builtin_code), row.builtin_code, row.count });
+                printed += 1;
+            }
+        }
 
         // Print up to the first 20 tensors with a populated buffer (i.e.
         // weights, not transient activations). Full dump available via

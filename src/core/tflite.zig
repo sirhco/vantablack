@@ -144,11 +144,68 @@ pub const Tensor = struct {
     data: []const u8,
 };
 
+/// Subset of `BuiltinOperator` likely seen in an LLM forward graph.
+/// Stored as a regular i32 — TFLite has 200+ ops and we only cluster the
+/// LLM-relevant ones for `nameOfOp`. Full enum is in
+/// `tensorflow/compiler/mlir/lite/schema/schema.fbs`.
+pub fn nameOfOp(builtin_code: i32) []const u8 {
+    return switch (builtin_code) {
+        0 => "ADD",
+        2 => "CONCATENATION",
+        3 => "CONV_2D",
+        6 => "DEQUANTIZE",
+        9 => "FULLY_CONNECTED",
+        18 => "MUL",
+        22 => "RESHAPE",
+        25 => "SOFTMAX",
+        28 => "TANH",
+        32 => "CUSTOM",
+        36 => "GATHER",
+        39 => "TRANSPOSE",
+        40 => "MEAN",
+        41 => "SUB",
+        42 => "DIV",
+        45 => "STRIDED_SLICE",
+        51 => "SQRT",
+        70 => "BATCH_MATMUL",
+        76 => "MIRROR_PAD",
+        77 => "ABS",
+        80 => "SQUARE",
+        81 => "RSQRT",
+        88 => "RESHAPE",
+        94 => "PACK",
+        96 => "UNPACK",
+        103 => "QUANTIZE",
+        117 => "SHAPE",
+        118 => "POW",
+        130 => "GELU",
+        131 => "DYNAMIC_UPDATE_SLICE",
+        146 => "BROADCAST_TO",
+        152 => "STABLEHLO_LOGISTIC",
+        158 => "STABLEHLO_REDUCE",
+        else => "OP?",
+    };
+}
+
+pub const OperatorCode = struct {
+    builtin_code: i32,
+    custom_code: ?[]const u8,
+    version: i32,
+};
+
+pub const Operator = struct {
+    opcode_index: u32,
+};
+
 pub const Model = struct {
     /// TFLite schema version (typically 3).
     version: u32,
     /// Tensors from subgraph 0 (the "main" subgraph).
     tensors: []Tensor,
+    /// Operator codes referenced by `operators[].opcode_index`.
+    operator_codes: []OperatorCode,
+    /// Operators from subgraph 0, in execution order.
+    operators: []Operator,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, bytes: []const u8) Error!Model {
@@ -156,10 +213,38 @@ pub const Model = struct {
         const model = try buf.root();
 
         const version = try model.readU32(0, 0);
+        const op_codes_v = try model.readVector(1);
         const subgraphs = try model.readVector(2);
         const buffers = try model.readVector(4);
         const sg_vec = subgraphs orelse return error.NoSubgraphs;
         if (sg_vec.len == 0) return error.NoSubgraphs;
+
+        // operator_codes from the Model root.
+        const op_codes_len = if (op_codes_v) |v| v.len else 0;
+        const op_codes = try allocator.alloc(OperatorCode, op_codes_len);
+        errdefer allocator.free(op_codes);
+        if (op_codes_v) |ov| {
+            var oi: u32 = 0;
+            while (oi < ov.len) : (oi += 1) {
+                const oc = ov.tableAt(oi) catch return error.TensorOutOfRange;
+                // builtin_code (field 3, int32) is the modern slot;
+                // deprecated_builtin_code (field 0, byte) is the legacy one.
+                const builtin_code_modern = oc.readU32(3, 0) catch 0;
+                const builtin_code = if (builtin_code_modern != 0)
+                    @as(i32, @bitCast(builtin_code_modern))
+                else blk: {
+                    const legacy = oc.readU8(0, 0) catch 0;
+                    break :blk @as(i32, @as(i8, @bitCast(legacy)));
+                };
+                const custom_code = oc.readString(1) catch null;
+                const version_i = @as(i32, @bitCast(oc.readU32(2, 1) catch 1));
+                op_codes[oi] = .{
+                    .builtin_code = builtin_code,
+                    .custom_code = custom_code,
+                    .version = version_i,
+                };
+            }
+        }
 
         // Pre-resolve buffer slices once so each tensor can index in O(1).
         const buf_count = if (buffers) |bv| bv.len else 0;
@@ -181,6 +266,19 @@ pub const Model = struct {
         const sg0 = sg_vec.tableAt(0) catch return error.NoSubgraphs;
         const tensors_v_opt = sg0.readVector(0) catch null;
         const tensors_v = tensors_v_opt orelse return error.NoSubgraphs;
+
+        // Operators in subgraph 0.
+        const operators_v_opt = sg0.readVector(3) catch null;
+        const operators_v_len = if (operators_v_opt) |v| v.len else 0;
+        const operators = try allocator.alloc(Operator, operators_v_len);
+        errdefer allocator.free(operators);
+        if (operators_v_opt) |ov| {
+            var oi: u32 = 0;
+            while (oi < ov.len) : (oi += 1) {
+                const op_t = ov.tableAt(oi) catch return error.TensorOutOfRange;
+                operators[oi] = .{ .opcode_index = op_t.readU32(0, 0) catch 0 };
+            }
+        }
 
         const tensors = try allocator.alloc(Tensor, tensors_v.len);
         errdefer allocator.free(tensors);
@@ -221,12 +319,40 @@ pub const Model = struct {
             };
         }
 
-        return .{ .version = version, .tensors = tensors, .allocator = allocator };
+        return .{
+            .version = version,
+            .tensors = tensors,
+            .operator_codes = op_codes,
+            .operators = operators,
+            .allocator = allocator,
+        };
     }
 
     pub fn deinit(self: *Model) void {
         self.allocator.free(self.tensors);
+        self.allocator.free(self.operator_codes);
+        self.allocator.free(self.operators);
         self.* = undefined;
+    }
+
+    /// Histogram: count of operators by their (deduplicated) builtin code.
+    /// Caller frees the returned slice. Sorted by descending count.
+    pub fn opHistogram(self: *const Model, allocator: std.mem.Allocator) ![]OpCount {
+        // Count per opcode_index, then collapse to builtin_code.
+        var per_code = try allocator.alloc(u32, self.operator_codes.len);
+        defer allocator.free(per_code);
+        @memset(per_code, 0);
+        for (self.operators) |op| {
+            if (op.opcode_index < per_code.len) per_code[op.opcode_index] += 1;
+        }
+
+        var list = try allocator.alloc(OpCount, self.operator_codes.len);
+        errdefer allocator.free(list);
+        for (self.operator_codes, 0..) |oc, i| {
+            list[i] = .{ .builtin_code = oc.builtin_code, .count = per_code[i] };
+        }
+        std.sort.pdq(OpCount, list, {}, OpCount.gtByCount);
+        return list;
     }
 
     /// Locate a tensor by exact name match. Returns null if absent.
@@ -235,6 +361,15 @@ pub const Model = struct {
             if (std.mem.eql(u8, t.name, name)) return t;
         }
         return null;
+    }
+};
+
+pub const OpCount = struct {
+    builtin_code: i32,
+    count: u32,
+
+    fn gtByCount(_: void, a: OpCount, b: OpCount) bool {
+        return a.count > b.count;
     }
 };
 

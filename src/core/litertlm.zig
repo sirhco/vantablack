@@ -172,6 +172,30 @@ pub const Bundle = struct {
         if (section.begin > section.end) return error.InvalidOffset;
         return self.bytes[section.begin..section.end];
     }
+
+    /// Decompress the `HF_Tokenizer_Zlib` section into a freshly-allocated
+    /// byte slice. Caller frees with `allocator.free`. Returns
+    /// `error.MissingSection` if absent.
+    ///
+    /// Section payload layout (from `python/litert_lm_builder/litertlm_builder.py`):
+    ///   [0..8]   uncompressed_size: u64 LE
+    ///   [8..]    zlib-compressed tokenizer.json bytes
+    pub fn extractHfTokenizerJson(self: *const Bundle, allocator: std.mem.Allocator) ![]u8 {
+        const section = self.findSection(.hf_tokenizer_zlib) orelse return error.MissingSection;
+        const raw = try self.sectionBytes(section);
+        if (raw.len < 8) return error.InvalidHeader;
+        const uncompressed_size = std.mem.readInt(u64, raw[0..8], .little);
+        const compressed = raw[8..];
+
+        var input_reader: std.Io.Reader = .fixed(compressed);
+        var out: std.Io.Writer.Allocating = try .initCapacity(allocator, @intCast(uncompressed_size));
+        errdefer out.deinit();
+
+        var decompress: std.compress.flate.Decompress = .init(&input_reader, .zlib, &.{});
+        _ = try decompress.reader.streamRemaining(&out.writer);
+
+        return out.toOwnedSlice();
+    }
 };
 
 // -- tests ----------------------------------------------------------------
