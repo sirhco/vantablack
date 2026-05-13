@@ -1,0 +1,2 @@
+forwardSingleToken (token 105, pos 0, 35 layers)
+  hidden_final[1536]  min=340282350000000000000000000000000000000.00000  max=-340282350000000000000000000000000000000.00000  mean=nan  L2=nan  first3=[nan,nan,nan]

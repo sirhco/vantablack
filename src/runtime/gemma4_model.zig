@@ -105,9 +105,11 @@ pub const Gemma4Model = struct {
         self.* = undefined;
     }
 
-    /// Generic INT4-per-row GEMV against a borrowed weight tensor.
-    /// Used by all the per-layer projection helpers below.
-    fn projectInt4(t: *const tflite.Tensor, x: []const f32, y: []f32) !void {
+    /// Generic per-row GEMV against a borrowed weight tensor. Dispatches
+    /// on tensor dtype: INT4 (2/byte), INT2 (4/byte) — the two packings
+    /// Gemma 4 E2B uses for matmul weights. INT8 has its own helper
+    /// (`projectInt8Generic`) because the storage isn't bit-packed.
+    fn projectQuant(t: *const tflite.Tensor, x: []const f32, y: []f32) !void {
         if (t.shape.len < 2) return error.ShapeMismatch;
         const m: usize = @intCast(t.shape[0]);
         const k: usize = @intCast(t.shape[1]);
@@ -116,13 +118,17 @@ pub const Gemma4Model = struct {
         const zps = tflite.zeroPointsAsI64(t.zero_points);
         if (scales.len < m or zps.len < m) return error.ShapeMismatch;
         const tflite_int4 = @import("../kernels/tflite_int4.zig");
-        try tflite_int4.gemvInt4PerRow(t.data, scales, zps, x, y, m, k);
+        switch (t.dtype) {
+            .int4 => try tflite_int4.gemvInt4PerRow(t.data, scales, zps, x, y, m, k),
+            .int2 => try tflite_int4.gemvInt2PerRow(t.data, scales, zps, x, y, m, k),
+            else => return error.UnsupportedQuant,
+        }
     }
 
     /// Q projection. `q_out.len == n_q_heads * head_dim`.
     pub fn projectQ(self: *const Gemma4Model, hidden_in: []const f32, layer_idx: usize, q_out: []f32) !void {
         if (layer_idx >= self.layers.len) return error.LayerOutOfRange;
-        try projectInt4(self.layers[layer_idx].q, hidden_in, q_out);
+        try projectQuant(self.layers[layer_idx].q, hidden_in, q_out);
     }
 
     /// K projection. Returns error.NoOwnK on layers that share K from
@@ -131,38 +137,38 @@ pub const Gemma4Model = struct {
     pub fn projectK(self: *const Gemma4Model, hidden_in: []const f32, layer_idx: usize, k_out: []f32) !void {
         if (layer_idx >= self.layers.len) return error.LayerOutOfRange;
         const t = self.layers[layer_idx].k orelse return error.NoOwnK;
-        try projectInt4(t, hidden_in, k_out);
+        try projectQuant(t, hidden_in, k_out);
     }
 
     pub fn projectV(self: *const Gemma4Model, hidden_in: []const f32, layer_idx: usize, v_out: []f32) !void {
         if (layer_idx >= self.layers.len) return error.LayerOutOfRange;
         const t = self.layers[layer_idx].v orelse return error.NoOwnV;
-        try projectInt4(t, hidden_in, v_out);
+        try projectQuant(t, hidden_in, v_out);
     }
 
     /// Output projection. `attn_in.len == n_q_heads * head_dim`,
     /// `hidden_out.len == config.hidden`.
     pub fn projectAttnO(self: *const Gemma4Model, attn_in: []const f32, layer_idx: usize, hidden_out: []f32) !void {
         if (layer_idx >= self.layers.len) return error.LayerOutOfRange;
-        try projectInt4(self.layers[layer_idx].attn_o, attn_in, hidden_out);
+        try projectQuant(self.layers[layer_idx].attn_o, attn_in, hidden_out);
     }
 
     /// MLP gate projection. `hidden_in.len == hidden`,
     /// `gate_out.len == ffn_dim_per_layer[layer_idx]`.
     pub fn projectMlpGate(self: *const Gemma4Model, hidden_in: []const f32, layer_idx: usize, gate_out: []f32) !void {
         if (layer_idx >= self.layers.len) return error.LayerOutOfRange;
-        try projectInt4(self.layers[layer_idx].mlp_gate, hidden_in, gate_out);
+        try projectQuant(self.layers[layer_idx].mlp_gate, hidden_in, gate_out);
     }
 
     pub fn projectMlpUp(self: *const Gemma4Model, hidden_in: []const f32, layer_idx: usize, up_out: []f32) !void {
         if (layer_idx >= self.layers.len) return error.LayerOutOfRange;
-        try projectInt4(self.layers[layer_idx].mlp_up, hidden_in, up_out);
+        try projectQuant(self.layers[layer_idx].mlp_up, hidden_in, up_out);
     }
 
     /// MLP down projection. `gated_in.len == ffn`, `hidden_out.len == hidden`.
     pub fn projectMlpDown(self: *const Gemma4Model, gated_in: []const f32, layer_idx: usize, hidden_out: []f32) !void {
         if (layer_idx >= self.layers.len) return error.LayerOutOfRange;
-        try projectInt4(self.layers[layer_idx].mlp_down, gated_in, hidden_out);
+        try projectQuant(self.layers[layer_idx].mlp_down, gated_in, hidden_out);
     }
 
     /// Per-Layer Embedding gate projection. INT8 (not INT4) per-row.
@@ -274,6 +280,129 @@ pub const Gemma4Model = struct {
         defer allocator.free(ffn_out);
         try self.projectMlpDown(gate, 0, ffn_out);
         math.addInto(hidden_out, ffn_out);
+    }
+
+    /// Run a single forward pass through every layer at position 0
+    /// with no KV history. K/V are projected on full-attention layers
+    /// (0..14 for Gemma 4 E2B) and reused on KV-shared layers
+    /// (15..34). Returns the post-stack hidden state.
+    ///
+    /// Still missing for bit-equal reference: per-layer RMSNorm
+    /// scales, Q/K-norm, PLE residual mix, neox-style RoPE convention,
+    /// final post-stack norm. This is the minimum-viable multi-layer
+    /// path — kernels exist and chain correctly; the gaps are glue
+    /// + missing weight discovery.
+    pub fn forwardSingleToken(
+        self: *const Gemma4Model,
+        allocator: std.mem.Allocator,
+        token_id: u32,
+        hidden_out: []f32,
+    ) !void {
+        const math = @import("../kernels/math.zig");
+        if (hidden_out.len != self.config.hidden) return error.ShapeMismatch;
+
+        const head_dim: usize = self.config.head_dim;
+        const rope_base: f32 = 10000.0;
+
+        try self.lookupEmbedding(token_id, hidden_out);
+
+        // Per-layer scratch buffers. Q-output / KV-output / FFN dims
+        // all vary per layer (MatFormer style); alloc once at the
+        // largest seen across the stack.
+        var max_q: usize = 0;
+        var max_kv: usize = 0;
+        var max_ffn: usize = 0;
+        for (self.layers, 0..) |layer, i| {
+            const q_sz: usize = @intCast(layer.q.shape[0]);
+            if (q_sz > max_q) max_q = q_sz;
+            if (layer.k) |k_t| {
+                const kv_sz: usize = @intCast(k_t.shape[0]);
+                if (kv_sz > max_kv) max_kv = kv_sz;
+            }
+            if (self.config.ffn_dim_per_layer[i] > max_ffn) max_ffn = self.config.ffn_dim_per_layer[i];
+        }
+        if (max_kv == 0) max_kv = max_q; // safety: no full-attn layer found
+
+        const q = try allocator.alloc(f32, max_q);
+        defer allocator.free(q);
+        const cached_k = try allocator.alloc(f32, max_kv);
+        defer allocator.free(cached_k);
+        const cached_v = try allocator.alloc(f32, max_kv);
+        defer allocator.free(cached_v);
+        const attn_in = try allocator.alloc(f32, max_q);
+        defer allocator.free(attn_in);
+        const attn_out = try allocator.alloc(f32, self.config.hidden);
+        defer allocator.free(attn_out);
+        const gate = try allocator.alloc(f32, max_ffn);
+        defer allocator.free(gate);
+        const up = try allocator.alloc(f32, max_ffn);
+        defer allocator.free(up);
+        const ffn_out = try allocator.alloc(f32, self.config.hidden);
+        defer allocator.free(ffn_out);
+
+        // Initialise cached_k / cached_v as zero so a hypothetical
+        // KV-shared layer at index 0 wouldn't read garbage. In Gemma
+        // 4 E2B layer 0 owns its K/V so this never matters; future
+        // models might differ.
+        @memset(cached_k, 0);
+        @memset(cached_v, 0);
+
+        var layer_idx: usize = 0;
+        while (layer_idx < self.layers.len) : (layer_idx += 1) {
+            const layer = self.layers[layer_idx];
+            // Per-layer attention shapes.
+            const q_dim_l: usize = @intCast(layer.q.shape[0]);
+            const n_q_l: usize = q_dim_l / head_dim;
+            // KV dim: if this layer owns K/V, use its own shape; else
+            // keep the previously cached buffer's size implicit via
+            // `n_kv_l` derived from config (KV-shared layers reuse a
+            // table written by an upstream layer with the same shape).
+            const n_kv_l: usize = if (layer.k) |k_t|
+                @as(usize, @intCast(k_t.shape[0])) / head_dim
+            else
+                self.config.n_kv_heads;
+
+            const q_slice = q[0..q_dim_l];
+            try self.projectQ(hidden_out, layer_idx, q_slice);
+            if (layer.k != null) {
+                const k_slice = cached_k[0 .. n_kv_l * head_dim];
+                const v_slice = cached_v[0 .. n_kv_l * head_dim];
+                try self.projectK(hidden_out, layer_idx, k_slice);
+                try self.projectV(hidden_out, layer_idx, v_slice);
+            }
+            // RoPE on Q + K (K only when freshly projected — once
+            // cached, it's already rotated for pos 0).
+            var hh: usize = 0;
+            while (hh < n_q_l) : (hh += 1) {
+                math.rope(q_slice[hh * head_dim ..][0..head_dim], 0, rope_base);
+            }
+            if (layer.k != null) {
+                hh = 0;
+                while (hh < n_kv_l) : (hh += 1) {
+                    math.rope(cached_k[hh * head_dim ..][0..head_dim], 0, rope_base);
+                }
+            }
+            // Seq=1 attention: each Q head's output equals its mapped V head.
+            const attn_in_slice = attn_in[0..q_dim_l];
+            var qh: usize = 0;
+            while (qh < n_q_l) : (qh += 1) {
+                const kv_h = (qh * n_kv_l) / n_q_l;
+                const v_src = cached_v[kv_h * head_dim ..][0..head_dim];
+                @memcpy(attn_in_slice[qh * head_dim ..][0..head_dim], v_src);
+            }
+            try self.projectAttnO(attn_in_slice, layer_idx, attn_out);
+            math.addInto(hidden_out, attn_out);
+
+            // MLP block (uses per-layer FFN dim).
+            const ffn = self.config.ffn_dim_per_layer[layer_idx];
+            const gate_slice = gate[0..ffn];
+            const up_slice = up[0..ffn];
+            try self.projectMlpGate(hidden_out, layer_idx, gate_slice);
+            try self.projectMlpUp(hidden_out, layer_idx, up_slice);
+            math.swiglu(gate_slice, up_slice);
+            try self.projectMlpDown(gate_slice, layer_idx, ffn_out);
+            math.addInto(hidden_out, ffn_out);
+        }
     }
 
     fn projectInt8Generic(t: *const tflite.Tensor, x: []const f32, y: []f32) !void {
