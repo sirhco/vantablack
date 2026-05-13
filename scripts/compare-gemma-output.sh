@@ -15,6 +15,9 @@ MODEL="${MODEL:-$HOME/.cache/huggingface/hub/litertlm-models/gemma-4-E2B-it.lite
 PROMPT="${PROMPT:-Once upon a time}"
 MAX_TOKENS="${MAX_TOKENS:-256}"
 SEED="${SEED:-42}"
+# Reference command used to generate the golden:
+#   uvx litert-lm run <model> --backend cpu --seed 42 --prompt "Once upon a time"
+# Sampler is handled INSIDE the TFLite graph (model has no sampler_params).
 
 REFERENCE="tests/golden/gemma4-e2b-reference.txt"
 ACTUAL="/tmp/vantablack-gemma4-e2b-actual.txt"

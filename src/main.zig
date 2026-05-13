@@ -534,6 +534,17 @@ fn runInspect(
             );
         }
         try out.print("    stop_tokens:    {d}\n", .{meta.stop_tokens_bytes.len});
+        // Sampler defaults baked into the model. These are what
+        // litert-lm CLI uses when --top-k / --temperature etc. are not
+        // explicitly passed. Required for matching Phase 19e bit-equal.
+        if (meta.sampler_params_bytes) |sb| {
+            if (vantablack.llm_metadata.parseSamplerParameters(sb)) |sp| {
+                try out.print(
+                    "    sampler:        type={s} k={d} p={d:.4} temperature={d:.4} seed={?}\n",
+                    .{ sp.type.name(), sp.k, sp.p, sp.temperature, sp.seed },
+                );
+            } else |_| {}
+        }
     }
 
     // Tokenizer — decompress HF_Tokenizer_Zlib and surface vocab size +

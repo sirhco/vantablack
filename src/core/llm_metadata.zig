@@ -122,6 +122,8 @@ pub const LlmMetadata = struct {
     stop_tokens_bytes: [][]const u8 = &.{},
     /// Raw `PromptTemplates` bytes (or null if absent).
     prompt_templates_bytes: ?[]const u8 = null,
+    /// Raw `SamplerParameters` bytes (or null if absent). proto field 4.
+    sampler_params_bytes: ?[]const u8 = null,
     /// Maximum number of tokens (proto field `max_num_tokens`).
     max_num_tokens: i32 = 0,
     /// Raw `LlmModelType` bytes (or null if absent).
@@ -158,6 +160,9 @@ pub const LlmMetadata = struct {
                 3 => if (f.data == .bytes) {
                     self.prompt_templates_bytes = f.data.bytes;
                 },
+                4 => if (f.data == .bytes) {
+                    self.sampler_params_bytes = f.data.bytes;
+                },
                 5 => if (f.data == .varint) {
                     // proto3 int32 is encoded as varint, but the in-memory
                     // value is signed. ZigZag is only for sint32/sint64;
@@ -181,6 +186,61 @@ pub const LlmMetadata = struct {
         self.* = undefined;
     }
 };
+
+/// Sampler-strategy enum from `SamplerParameters.Type`. Mirrors
+/// `proto/sampler_params.proto`.
+pub const SamplerType = enum(i32) {
+    type_unspecified = 0,
+    top_k = 1,
+    top_p = 2,
+    greedy = 3,
+    _,
+
+    pub fn name(self: SamplerType) []const u8 {
+        return switch (self) {
+            .type_unspecified => "UNSPECIFIED",
+            .top_k => "TOP_K",
+            .top_p => "TOP_P",
+            .greedy => "GREEDY",
+            _ => "?",
+        };
+    }
+};
+
+pub const SamplerParameters = struct {
+    type: SamplerType = .type_unspecified,
+    k: i32 = 0,
+    p: f32 = 0,
+    temperature: f32 = 0,
+    seed: ?i32 = null,
+};
+
+/// Decode a `SamplerParameters` proto message from raw bytes.
+pub fn parseSamplerParameters(bytes: []const u8) Error!SamplerParameters {
+    var out: SamplerParameters = .{};
+    var iter = Iterator.init(bytes);
+    while (try iter.next()) |f| {
+        switch (f.number) {
+            1 => if (f.data == .varint) {
+                out.type = @enumFromInt(@as(i32, @bitCast(@as(u32, @truncate(f.data.varint)))));
+            },
+            2 => if (f.data == .varint) {
+                out.k = @bitCast(@as(u32, @truncate(f.data.varint)));
+            },
+            3 => if (f.data == .fixed32) {
+                out.p = @bitCast(f.data.fixed32);
+            },
+            4 => if (f.data == .fixed32) {
+                out.temperature = @bitCast(f.data.fixed32);
+            },
+            5 => if (f.data == .varint) {
+                out.seed = @bitCast(@as(u32, @truncate(f.data.varint)));
+            },
+            else => {},
+        }
+    }
+    return out;
+}
 
 /// Resolved model-type tag. The `LlmModelType` proto is a `oneof` over
 /// concrete model messages — we return which one was selected so the

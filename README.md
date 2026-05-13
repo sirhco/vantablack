@@ -692,9 +692,20 @@ root cause: pure CPU matmul saturates every core. The fixes:
      affine. New kernels: CPU first, then Metal MSL. Needs Phase 19c
      wiring before the kernel choice can be tested end-to-end.
 19e. **Forward-path parity vs `litert-lm` reference** — *planned*.
-     Bit-equal generation on `litert-community/gemma-4-E4B-it-litert-lm`
-     against Google's official runtime, same prompt + seed. Final gate
-     for declaring `.litertlm` support production-ready.
+     Bit-equal generation on `litert-community/gemma-4-E2B-it-litert-lm`
+     against Google's official runtime, same prompt + seed. Golden
+     capture lives in `tests/golden/gemma4-e2b-reference.txt`; harness
+     scaffold in `scripts/compare-gemma-output.sh`. Final gate for
+     declaring `.litertlm` support production-ready.
+19f. **In-graph sampling replication** — *planned* (discovered while
+     working 19e). Gemma 4 E2B ships *no* `sampler_params` in its
+     `LlmMetadataProto`; the litert-lm runtime then takes the
+     "executor handles sampling" branch
+     (`runtime/components/sampler_factory.cc:583-586` upstream), so
+     the TFLite model graph itself emits the token (likely
+     `STABLEHLO_RNG_BIT_GENERATOR` + `SOFTMAX` inside the decode
+     loop). Matching this needs us to recognize + execute those ops,
+     not just mirror a temperature/top-k knob.
 
 Items 8 + 9 + 10 are the next perf pushes; items 18 + a C-ABI shim
 unlock real iOS app integration. Item 7's negative result shifted the
