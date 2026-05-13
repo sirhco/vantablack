@@ -16,6 +16,7 @@ const usage =
     \\  vantablack trace-tensor <m.litertlm> <sec> <t_idx>  find ops that produce/consume a given TFLite tensor
     \\  vantablack gemma4-config <m.litertlm>               load a Gemma 4 .litertlm into Gemma4Model + print inferred config
     \\  vantablack gemma4-embed <m.litertlm> <token_id>     lookup embedding for token_id (INT2 dequant smoke test)
+    \\  vantablack gemma4-step  <m.litertlm> <token_id>     embed + layer-0 Q projection forward smoke test
     \\  vantablack tokenize-litertlm <m.litertlm> <text>    encode text using HF tokenizer embedded in a .litertlm
     \\
     \\generate / prompt / chat accept sampler flags BEFORE the n value:
@@ -61,6 +62,21 @@ pub fn main(init: std.process.Init) !void {
             return error.MissingArgs;
         }
         try runTokenizeLitertlm(gpa, arena, io, args[2], args[3], out, err);
+        return;
+    }
+
+    // gemma4-step <model.litertlm> <token_id>: smoke test forward
+    // progression — embed lookup + layer-0 Q projection. Prints
+    // summary of each stage. Useful sanity check before wiring the
+    // full per-token pipeline.
+    if (std.mem.eql(u8, args[1], "gemma4-step")) {
+        if (args.len < 4) {
+            try err.writeAll("usage: vantablack gemma4-step <model.litertlm> <token_id>\n");
+            try err.flush();
+            return error.MissingArgs;
+        }
+        const tid = try std.fmt.parseInt(u32, args[3], 10);
+        try runGemma4Step(gpa, arena, io, args[2], tid, out, err);
         return;
     }
 
@@ -532,6 +548,69 @@ fn runTokenizeLitertlm(
     }
     try out.writeByte('\n');
     try out.flush();
+}
+
+fn runGemma4Step(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: Io,
+    input_path: []const u8,
+    token_id: u32,
+    out: *Io.Writer,
+    err: *Io.Writer,
+) !void {
+    _ = err;
+    const abs_path = if (std.fs.path.isAbsolute(input_path))
+        try arena.dupe(u8, input_path)
+    else blk: {
+        const cwd = try std.process.currentPathAlloc(io, arena);
+        break :blk try std.fs.path.resolve(arena, &.{ cwd, input_path });
+    };
+    const file = try Io.Dir.openFileAbsolute(io, abs_path, .{ .allow_directory = false });
+    defer file.close(io);
+    const len = try file.length(io);
+    const len_us: usize = std.math.cast(usize, len) orelse return error.FileTooLarge;
+    const mapped = try std.posix.mmap(null, len_us, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    defer std.posix.munmap(mapped);
+
+    var bundle = try vantablack.litertlm.Bundle.init(gpa, mapped);
+    defer bundle.deinit();
+    var model = try vantablack.gemma4_model.initFromLitertlm(gpa, &bundle);
+    defer model.deinit();
+
+    const hidden = model.config.hidden;
+    const q_out_dim: usize = @as(usize, model.config.n_q_heads) * model.config.head_dim;
+
+    const h = try gpa.alloc(f32, hidden);
+    defer gpa.free(h);
+    const q = try gpa.alloc(f32, q_out_dim);
+    defer gpa.free(q);
+
+    try out.print("stage 1: embed lookup (token {d})\n", .{token_id});
+    try model.lookupEmbedding(token_id, h);
+    try summarize(out, "  hidden", h);
+
+    try out.writeAll("stage 2: layer_0 Q projection\n");
+    try model.projectQ(h, 0, q);
+    try summarize(out, "  q_out", q);
+    try out.flush();
+}
+
+fn summarize(out: *Io.Writer, label: []const u8, v: []const f32) !void {
+    var sum: f64 = 0;
+    var sum_sq: f64 = 0;
+    var mn: f32 = std.math.floatMax(f32);
+    var mx: f32 = -std.math.floatMax(f32);
+    for (v) |x| {
+        sum += x;
+        sum_sq += @as(f64, x) * @as(f64, x);
+        if (x < mn) mn = x;
+        if (x > mx) mx = x;
+    }
+    const n: f64 = @floatFromInt(v.len);
+    try out.print("{s}[{d}]  min={d:.5}  max={d:.5}  mean={d:.6}  L2={d:.4}  first3=[{d:.5},{d:.5},{d:.5}]\n", .{
+        label, v.len, mn, mx, sum / n, @sqrt(sum_sq), v[0], v[1], v[2],
+    });
 }
 
 fn runGemma4Embed(

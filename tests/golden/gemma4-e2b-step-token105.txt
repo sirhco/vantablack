@@ -1,0 +1,4 @@
+stage 1: embed lookup (token 105)
+  hidden[1536]  min=-0.05577  max=0.02789  mean=-0.001761  L2=0.9712  first3=[0.02789,-0.02789,-0.02789]
+stage 2: layer_0 Q projection
+  q_out[2048]  min=-0.49252  max=0.60675  mean=0.000895  L2=1.9709  first3=[0.01518,0.02749,0.02039]

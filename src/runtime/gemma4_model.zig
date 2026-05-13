@@ -105,6 +105,29 @@ pub const Gemma4Model = struct {
         self.* = undefined;
     }
 
+    /// Project hidden state through layer `layer_idx`'s Q matrix.
+    /// `hidden_in.len == config.hidden`; `q_out.len == n_q_heads * head_dim`.
+    /// Uses the per-row INT4 fused GEMV kernel against the borrowed Q
+    /// tensor. Per-axis quantization scales include any pre-projection
+    /// RMSNorm fold (TFLite optimization).
+    pub fn projectQ(self: *const Gemma4Model, hidden_in: []const f32, layer_idx: usize, q_out: []f32) !void {
+        if (layer_idx >= self.layers.len) return error.LayerOutOfRange;
+        if (hidden_in.len != self.config.hidden) return error.ShapeMismatch;
+        const layer = self.layers[layer_idx];
+        const t = layer.q;
+        const m: usize = @intCast(t.shape[0]); // n_q_heads * head_dim
+        const k: usize = @intCast(t.shape[1]); // hidden
+        if (q_out.len != m) return error.ShapeMismatch;
+        if (k != hidden_in.len) return error.ShapeMismatch;
+
+        const scales = tflite.scalesAsF32(t.scales);
+        const zps = tflite.zeroPointsAsI64(t.zero_points);
+        if (scales.len < m or zps.len < m) return error.ShapeMismatch;
+
+        const tflite_int4 = @import("../kernels/tflite_int4.zig");
+        try tflite_int4.gemvInt4PerRow(t.data, scales, zps, hidden_in, q_out, m, k);
+    }
+
     /// Decode one row of the INT2 text embedder into FP32. `token_id`
     /// must be < `config.vocab_size`; `out.len` must equal
     /// `config.hidden`.
