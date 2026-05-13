@@ -924,11 +924,13 @@ pub fn initFromLitertlm(
                 .none;
             if (role == .none) continue;
 
-            // Expected scale shape per role:
-            //   [hidden] for the 5 transformer-block norms
-            //   [n_kv_heads * head_dim] (256 in E2B) for Q/K-norm
-            const expected_dim: u32 = switch (role) {
-                .query, .key => @as(u32, @intCast(n_kv_heads)) * @as(u32, @intCast(head_dim)),
+            // Block norms have shape [hidden]; Q/K norms vary across
+            // layers (256 in standard layers, 512 in wider-attention
+            // layer 4, ...). For block norms enforce the exact dim
+            // check; for Q/K accept any FP32 1D tensor with non-empty
+            // data (the op-output name already disambiguates the role).
+            const expected_dim_opt: ?u32 = switch (role) {
+                .query, .key => null,
                 else => @as(u32, @intCast(hidden)),
             };
             var scale_tensor: ?*const tflite.Tensor = null;
@@ -940,7 +942,7 @@ pub fn initFromLitertlm(
                 if (in_t.dtype != .float32) continue;
                 if (in_t.data.len == 0) continue;
                 if (in_t.shape.len != 1) continue;
-                if (in_t.shape[0] != @as(i32, @intCast(expected_dim))) continue;
+                if (expected_dim_opt) |d| if (in_t.shape[0] != @as(i32, @intCast(d))) continue;
                 scale_tensor = in_t;
                 break;
             }
