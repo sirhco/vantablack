@@ -451,6 +451,7 @@ math.gegluApprox(gate, up);
         if (hidden_out.len != self.config.hidden) return error.ShapeMismatch;
 
         try self.lookupEmbedding(token_id, hidden_out);
+        scaleEmbedding(self, hidden_out);
 
         // Per-layer scratch buffers. Q-output / KV-output / FFN dims
         // all vary per layer (MatFormer style); alloc once at the
@@ -699,6 +700,13 @@ math.gegluApprox(gate, up);
         const seq_len: usize = position + 1;
 
         try self.lookupEmbedding(token_id, hidden_out);
+        // Gemma scales the input embedding by sqrt(d_model) so the
+        // residual stream starts near the magnitude expected by the
+        // attention + RMSNorm path. INT2-quantised embedder rows have
+        // unit-ish L2 norm; without this scale the stream stays in the
+        // [-0.05, +0.05] range and the LM head can't recover sensible
+        // logits.
+        scaleEmbedding(self, hidden_out);
 
         // Determine scratch buffer sizes (max across all layers).
         var max_q: usize = 0;
@@ -988,6 +996,13 @@ math.gegluApprox(gate, up);
         } else {
             math.rmsNormUnit(hidden, 1.0e-6);
         }
+    }
+
+    /// In-place multiply the post-lookup embedding by sqrt(hidden_size),
+    /// the standard Gemma input-embedding scaling factor.
+    fn scaleEmbedding(self: *const Gemma4Model, hidden: []f32) void {
+        const s: f32 = @sqrt(@as(f32, @floatFromInt(self.config.hidden)));
+        for (hidden) |*v| v.* *= s;
     }
 
     /// Apply Gemma soft-capping to the final logits:
