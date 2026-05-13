@@ -988,6 +988,17 @@ fn runGemma4Config(
     } else {
         try out.writeAll("  lm_head:     (weight-tied to embedder)\n");
     }
+    if (model.final_norm) |fn_t| {
+        try out.print("  final_norm:  {s} shape=[", .{fn_t.dtype.name()});
+        for (fn_t.shape, 0..) |d, i| {
+            if (i > 0) try out.writeByte(',');
+            try out.print("{d}", .{d});
+        }
+        try out.print("] data={d} bytes name=\"{s}\"\n", .{ fn_t.data.len, fn_t.name });
+    } else {
+        try out.writeAll("  final_norm:  (NOT discovered — unit RMSNorm used)\n");
+    }
+    try out.print("  soft_cap:    {d:.2}\n", .{model.final_logit_soft_cap});
     try out.writeAll("  ffn_dim per layer:\n    ");
     for (model.config.ffn_dim_per_layer, 0..) |d, i| {
         if (i > 0) try out.writeByte(' ');

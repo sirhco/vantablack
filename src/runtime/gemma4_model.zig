@@ -110,6 +110,18 @@ pub const Gemma4Model = struct {
     /// quantization scales tuned for hidden → vocab projection.
     /// Falls back to `embedder` (weight tying) when absent.
     lm_head: ?*const tflite.Tensor = null,
+    /// Final RMSNorm scale applied to the post-stack hidden state
+    /// before the LM head. FP32 [hidden]. Discovered by walking the
+    /// op-graph backwards from `lm_head`: the FULLY_CONNECTED that
+    /// consumes lm_head reads a hidden tensor whose producer is a
+    /// STABLEHLO_COMPOSITE (RMSNorm) — its second input is this scale.
+    /// Generic JAX-translation name (`jax2tf_arg_*`) so name-based
+    /// discovery misses it; we trace the op-graph instead.
+    final_norm: ?*const tflite.Tensor = null,
+    /// Soft-cap value for the final logits: `final = cap * tanh(raw / cap)`.
+    /// Defaults to 30.0 for Gemma 4 E2B (verified by scanning the
+    /// `_post_process_decoding/div` constant in section 10).
+    final_logit_soft_cap: f32 = 30.0,
     /// Per-layer embedder lookup tables (Gemma's PLE mechanism).
     /// 35 INT4 tensors shape [vocab, ple_dim], indexed by layer.
     /// Slot is null if a layer's per-layer embed couldn't be located.
@@ -394,7 +406,12 @@ pub const Gemma4Model = struct {
         defer allocator.free(up);
         try self.projectMlpGate(hidden_out, 0, gate);
         try self.projectMlpUp(hidden_out, 0, up);
-        math.swiglu(gate, up); // gate = silu(gate) * up
+        // Gemma 4 MLP uses GeGLU (gate proj → gelu → multiply by up
+// proj), not SwiGLU. Verified via TFLite builtin 150 = GELU
+// in the per-layer MLP path. SiLU here would produce
+// roughly-uniform logits dominated by a few multilingual
+// outlier tokens.
+math.gegluApprox(gate, up);
 
         // Stage 7: MLP down + residual.
         const ffn_out = try allocator.alloc(f32, self.config.hidden);
@@ -572,7 +589,7 @@ pub const Gemma4Model = struct {
             const up_slice = up[0..ffn];
             try self.projectMlpGate(h_norm, layer_idx, gate_slice);
             try self.projectMlpUp(h_norm, layer_idx, up_slice);
-            math.swiglu(gate_slice, up_slice);
+            math.gegluApprox(gate_slice, up_slice);
             try self.projectMlpDown(gate_slice, layer_idx, ffn_out);
             // Post-FFW norm damps the MLP output before residual add.
             if (layer.norm_post_ffw) |w_t| {
@@ -813,7 +830,7 @@ pub const Gemma4Model = struct {
             const up_slice = up[0..ffn];
             try self.projectMlpGate(h_norm, layer_idx, gate_slice);
             try self.projectMlpUp(h_norm, layer_idx, up_slice);
-            math.swiglu(gate_slice, up_slice);
+            math.gegluApprox(gate_slice, up_slice);
             try self.projectMlpDown(gate_slice, layer_idx, ffn_out);
             if (layer.norm_post_ffw) |w_t| {
                 const w_f32: []const f32 = @as([*]const f32, @ptrCast(@alignCast(w_t.data.ptr)))[0..self.config.hidden];
@@ -867,7 +884,6 @@ pub const Gemma4Model = struct {
         max_seq: usize,
         out_tokens: []u32,
     ) !usize {
-        const math = @import("../kernels/math.zig");
         var cache = try self.initKvCache(allocator, max_seq);
         defer cache.deinit();
 
@@ -892,8 +908,9 @@ pub const Gemma4Model = struct {
             const h_copy = try allocator.alloc(f32, self.config.hidden);
             defer allocator.free(h_copy);
             @memcpy(h_copy, hidden);
-            math.rmsNormUnit(h_copy, 1.0e-6);
+            self.applyFinalNorm(h_copy);
             try self.lmHead(h_copy, logits);
+            self.applyFinalSoftCap(logits);
             var best: u32 = 0;
             var best_v: f32 = logits[0];
             var i: usize = 1;
@@ -915,16 +932,16 @@ pub const Gemma4Model = struct {
     /// final RMSNorm on the residual stream, LM head via embedder
     /// weight-tying, then argmax.
     pub fn predictNext(self: *const Gemma4Model, allocator: std.mem.Allocator, token_id: u32) !u32 {
-        const math = @import("../kernels/math.zig");
         const hidden = try allocator.alloc(f32, self.config.hidden);
         defer allocator.free(hidden);
         try self.forwardSingleToken(allocator, token_id, hidden);
         // Final RMSNorm before LM head — every transformer applies one.
-        math.rmsNormUnit(hidden, 1.0e-6);
+        self.applyFinalNorm(hidden);
 
         const logits = try allocator.alloc(f32, self.config.vocab_size);
         defer allocator.free(logits);
         try self.lmHead(hidden, logits);
+        self.applyFinalSoftCap(logits);
 
         var best: u32 = 0;
         var best_v: f32 = logits[0];
@@ -936,6 +953,33 @@ pub const Gemma4Model = struct {
             }
         }
         return best;
+    }
+
+    /// Apply the final RMSNorm to the post-stack hidden state. Uses
+    /// the learned `final_norm` scale (1+w convention) when present;
+    /// falls back to unit RMSNorm.
+    fn applyFinalNorm(self: *const Gemma4Model, hidden: []f32) void {
+        const math = @import("../kernels/math.zig");
+        if (self.final_norm) |w_t| {
+            const w_f32: []const f32 = @as([*]const f32, @ptrCast(@alignCast(w_t.data.ptr)))[0..self.config.hidden];
+            math.rmsNormGemma(hidden, w_f32, 1.0e-6);
+        } else {
+            math.rmsNormUnit(hidden, 1.0e-6);
+        }
+    }
+
+    /// Apply Gemma soft-capping to the final logits:
+    ///   logits[i] = cap * tanh(logits[i] / cap)
+    /// Monotonic in logits[i] (tanh is monotonic, cap > 0) so this
+    /// does not change argmax, but it matters for temperature/top-k
+    /// sampling and for matching the reference runtime numerically.
+    fn applyFinalSoftCap(self: *const Gemma4Model, logits: []f32) void {
+        const cap = self.final_logit_soft_cap;
+        if (cap <= 0.0) return;
+        const inv = 1.0 / cap;
+        for (logits) |*z| {
+            z.* = cap * std.math.tanh(z.* * inv);
+        }
     }
 
     fn projectInt8Generic(t: *const tflite.Tensor, x: []const f32, y: []f32) !void {
@@ -1139,14 +1183,77 @@ pub fn initFromLitertlm(
     // section-2 `lookup_embedding_table`. Both are [vocab, hidden]
     // INT2 but may carry different per-row scales.
     var lm_head_tensor: ?*const tflite.Tensor = null;
+    var lm_head_idx: ?usize = null;
     {
         var best_size: usize = 0;
-        for (decoder_tfl.tensors) |*t| {
+        for (decoder_tfl.tensors, 0..) |*t, idx| {
             if (t.data.len == 0) continue;
             if (std.mem.indexOf(u8, t.name, "embedder.decode") == null) continue;
             if (t.data.len > best_size) {
                 best_size = t.data.len;
                 lm_head_tensor = t;
+                lm_head_idx = idx;
+            }
+        }
+    }
+
+    // Discover the final RMSNorm scale by walking the op-graph
+    // backwards from `lm_head`. Path:
+    //   lm_head ─consumed by→ FULLY_CONNECTED(hidden, lm_head, bias)
+    //   hidden  ─produced by→ STABLEHLO_COMPOSITE(prev_hidden, NORM_SCALE)
+    //   NORM_SCALE = the learned final RMSNorm weight (FP32 [hidden]).
+    // The norm tensor has a generic `jax2tf_arg_*` name so name-based
+    // discovery would miss it.
+    var final_norm_tensor: ?*const tflite.Tensor = null;
+    if (lm_head_idx) |lm_idx| {
+        // Step 1: find the FULLY_CONNECTED op that consumes lm_head.
+        var fc_op: ?*const tflite.Operator = null;
+        for (decoder_tfl.operators) |*op| {
+            // Confirm it's FULLY_CONNECTED (builtin 9) by checking the
+            // op-code entry.
+            const oc = decoder_tfl.operator_codes[op.opcode_index];
+            if (oc.builtin_code != 9) continue; // FULLY_CONNECTED
+            // lm_head must appear in inputs.
+            for (op.inputs) |t_in| {
+                if (t_in == @as(i32, @intCast(lm_idx))) {
+                    fc_op = op;
+                    break;
+                }
+            }
+            if (fc_op != null) break;
+        }
+        if (fc_op) |fc| {
+            // Step 2: input[0] is the hidden state tensor index.
+            if (fc.inputs.len >= 1 and fc.inputs[0] >= 0) {
+                const hidden_tensor_idx: usize = @intCast(fc.inputs[0]);
+                // Step 3: find the op that produces this hidden tensor.
+                for (decoder_tfl.operators) |*op| {
+                    var produces = false;
+                    for (op.outputs) |t_out| {
+                        if (t_out == @as(i32, @intCast(hidden_tensor_idx))) {
+                            produces = true;
+                            break;
+                        }
+                    }
+                    if (!produces) continue;
+                    // Step 4: this should be a STABLEHLO_COMPOSITE
+                    // (builtin 206) with 2 inputs: [prev_hidden, scale].
+                    const oc = decoder_tfl.operator_codes[op.opcode_index];
+                    if (oc.builtin_code != 206) break; // not the norm shape
+                    if (op.inputs.len < 2) break;
+                    const scale_idx_i: i32 = op.inputs[1];
+                    if (scale_idx_i < 0) break;
+                    const scale_idx: usize = @intCast(scale_idx_i);
+                    if (scale_idx >= decoder_tfl.tensors.len) break;
+                    const scale_t = &decoder_tfl.tensors[scale_idx];
+                    // Sanity: FP32 1D [hidden_size] with backing bytes.
+                    if (scale_t.dtype != .float32) break;
+                    if (scale_t.shape.len != 1) break;
+                    if (@as(usize, @intCast(scale_t.shape[0])) != hidden) break;
+                    if (scale_t.data.len != hidden * @sizeOf(f32)) break;
+                    final_norm_tensor = scale_t;
+                    break;
+                }
             }
         }
     }
@@ -1354,6 +1461,7 @@ pub fn initFromLitertlm(
         .layers = final_layers,
         .embedder = embedder_tensor,
         .lm_head = lm_head_tensor,
+        .final_norm = final_norm_tensor,
         .per_layer_embedder = ple_table,
         .decoder_tfl = decoder_tfl,
         .embedder_tfl = embedder_tfl_opt,
