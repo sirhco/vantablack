@@ -58,10 +58,45 @@ by einsum signature or trailing `gating_einsum1|2|linear`.
 - Confirms 19f hypothesis — sampling happens inside this section's TFLite
   graph, not via a host-side sampler.
 
+## Per-layer scan (added after running `scan-layers`)
+
+`vantablack scan-layers <model.litertlm>` (output saved to
+`gemma4-e2b-scan-layers.txt`) classifies all 35 decoder layers with
+complete coverage on 5 roles:
+
+| Role | Coverage | Layer-0 example shape | Layer-0 dtype |
+|------|----------|-----------------------|---------------|
+| mlp.gate (gating_einsum1) | 35/35 | [6144, 1536] | INT4 |
+| mlp.up   (gating_einsum2) | 35/35 | [6144, 1536] | INT4 |
+| mlp.down (linear)         | 35/35 | [1536, 6144] | INT4 |
+| attn.o (post_qkv/attn)    | 35/35 | [1536, 2048] | INT4 |
+| qkv (pre_qkv/attn)        | 35/35 | [2048, 1536] | INT4 |
+| ple.gate                  | 35/35 | [256, 1536]  | INT8 |
+| ple.proj                  | 35/35 | [1536, 256]  | INT8 |
+
+Observations:
+
+- **FFN dim varies by layer**: layer 0 has F=6144 (4× hidden); deeper
+  layers have F=12288 (8× hidden). MatFormer-style variable width.
+- **Quant varies by layer**: layer 0 is INT4; many deeper layers are
+  INT2. Per-layer quantization decision baked into the build.
+- **QKV shape [2048, 1536] is suspicious**: 2048 doesn't fit a single
+  combined Q+K+V projection (would be n_q_heads*head_dim +
+  2*n_kv_heads*head_dim, typically larger). May only be the Q
+  projection — K/V might live elsewhere (separate tensors). Needs
+  op-graph trace to confirm.
+- **Norms classified as "unknown"**: 5 norms per layer (pre/post
+  attention/ffw + per-layer-input) — `scan-layers` patterns don't yet
+  match all of them. Refinement task.
+
 ## What this unlocks
 
 - **19c**: write a tensor-name pattern matcher. Output: a vantablack
   `LayerWeights` populated from section 10's `layer_{N}` tensors.
+  **Foundation shipped** as `core/gemma_layer_scan.zig` + `scan-layers`
+  CLI. Remaining: refine norm patterns, confirm qkv shape via op
+  graph, then wire to a new `Model` variant (Gemma 4 isn't Llama-
+  compatible — has PLE + 5 norms).
 - **19d**: INT2 + INT4 + INT8 dequant kernels. INT2 is novel — needs a
   bit-packed scale/zero-point layout described in TFLite's
   `QuantizationParameters.scale[] + zero_point[]` per-axis.

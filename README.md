@@ -677,14 +677,18 @@ root cause: pure CPU matmul saturates every core. The fixes:
      (scale / zero_point / quantized_dimension). `vantablack inspect`
      extends to list weight tensors. Verified on upstream
      `schema/testdata/test_tok_tfl_llm.litertlm` (15 MB, 78 tensors).
-19c. **TFLite tensor → vantablack model mapping** — *planned*. The
-     enumerated tensors carry MLIR-style names (`arith.constant`,
-     `arith.constant5`, ...) rather than semantic Llama names. Building
-     the `Model.initFromTflite()` path requires either: (a) operator
-     graph analysis to back-derive Q/K/V/FFN role from how each
-     constant is consumed, or (b) relying on `LlmMetadataProto` /
-     vendor-specific name conventions in `litert-community/*` Gemma
-     bundles. Both need a real Gemma 4 `.litertlm` to validate against.
+19c. **TFLite tensor → vantablack model mapping** — *partial*. After
+     getting a real Gemma 4 E2B `.litertlm` (2.6 GB, multimodal), we
+     discovered the decoder section uses *semantic* tensor names like
+     `transformer.transformer/layer_24/post_qkv/mlp/gating_einsum1/...`.
+     Shipped `core/gemma_layer_scan.zig` + `vantablack scan-layers`
+     CLI which achieves 35/35 layer coverage on 7 roles (mlp.gate/up/
+     down, attn.o, qkv, ple.gate, ple.proj). Remaining: refine norm
+     patterns (5 norms/layer currently classified as unknown), confirm
+     qkv shape via op-graph trace, then build a new `Model` variant
+     (Gemma 4 isn't Llama-compatible — has Per-Layer Embedding gate +
+     5 norms instead of 2). Notes in
+     `tests/golden/gemma4-e2b-architecture-notes.md`.
 19d. **TFLite int4 / int8 / fp16 dequant + matmul kernels** — *planned*.
      TFLite quantizes weights with its own per-axis int8/int4 layout
      (separate scale/zero_point arrays, `quantized_dimension` selects

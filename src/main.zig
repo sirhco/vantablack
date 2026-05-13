@@ -12,6 +12,7 @@ const usage =
     \\  vantablack <model.gguf> serve [--host H] [--port P]  Ollama-compatible HTTP server (default 127.0.0.1:11434)
     \\  vantablack inspect <model.litertlm>                 print sections + metadata of a LiteRT-LM bundle
     \\  vantablack inspect-section <m.litertlm> <idx>       deep-dump tensors + operator graph of one TFLite section
+    \\  vantablack scan-layers <model.litertlm>             classify decoder weights by layer + role (Phase 19c foundation)
     \\  vantablack tokenize-litertlm <m.litertlm> <text>    encode text using HF tokenizer embedded in a .litertlm
     \\
     \\generate / prompt / chat accept sampler flags BEFORE the n value:
@@ -57,6 +58,21 @@ pub fn main(init: std.process.Init) !void {
             return error.MissingArgs;
         }
         try runTokenizeLitertlm(gpa, arena, io, args[2], args[3], out, err);
+        return;
+    }
+
+    // scan-layers <model.litertlm>: name-pattern map of decoder weights.
+    // Auto-selects the largest TFLiteModel section that contains a
+    // `layer_N/` tensor prefix, groups weights by layer, classifies
+    // each by role (mlp.gate/up/down, attn.o, qkv, ple.gate, ple.proj,
+    // norms). Foundation for Phase 19c.
+    if (std.mem.eql(u8, args[1], "scan-layers")) {
+        if (args.len < 3) {
+            try err.writeAll("usage: vantablack scan-layers <model.litertlm>\n");
+            try err.flush();
+            return error.MissingArgs;
+        }
+        try runScanLayers(gpa, arena, io, args[2], out, err);
         return;
     }
 
@@ -468,6 +484,139 @@ fn runTokenizeLitertlm(
     }
     try out.writeByte('\n');
     try out.flush();
+}
+
+fn runScanLayers(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: Io,
+    input_path: []const u8,
+    out: *Io.Writer,
+    err: *Io.Writer,
+) !void {
+    _ = err;
+    const abs_path = if (std.fs.path.isAbsolute(input_path))
+        try arena.dupe(u8, input_path)
+    else blk: {
+        const cwd = try std.process.currentPathAlloc(io, arena);
+        break :blk try std.fs.path.resolve(arena, &.{ cwd, input_path });
+    };
+    const file = try Io.Dir.openFileAbsolute(io, abs_path, .{ .allow_directory = false });
+    defer file.close(io);
+    const len = try file.length(io);
+    const len_us: usize = std.math.cast(usize, len) orelse return error.FileTooLarge;
+    const mapped = try std.posix.mmap(null, len_us, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    defer std.posix.munmap(mapped);
+
+    var bundle = try vantablack.litertlm.Bundle.init(gpa, mapped);
+    defer bundle.deinit();
+
+    // First pass: pick the TFLite section with the highest layer count.
+    // Buckets store `*const Tensor` pointers into the section's tflite
+    // Model — once we pick a winner we keep that Model alive for the
+    // rest of this function (the loop's per-iteration deinit would
+    // free the backing store and leave dangling pointers).
+    var best_section: ?usize = null;
+    var best_layer_count: usize = 0;
+    for (bundle.sections, 0..) |s, sec_idx| {
+        if (s.data_type != .tflite_model) continue;
+        const bytes = try bundle.sectionBytes(s);
+        var tfl = vantablack.tflite.Model.init(gpa, bytes) catch continue;
+        defer tfl.deinit();
+        // Probe-only: build buckets, count, throw away. Cheap because
+        // we don't keep tensor pointers (the model is freed at end of
+        // this iteration).
+        const probe = vantablack.gemma_layer_scan.scanLayers(gpa, tfl.tensors) catch continue;
+        defer gpa.free(probe);
+        if (probe.len > best_layer_count) {
+            best_layer_count = probe.len;
+            best_section = sec_idx;
+        }
+    }
+
+    if (best_section == null) {
+        try out.writeAll("no decoder section with layer_N/ tensors found\n");
+        try out.flush();
+        return;
+    }
+
+    // Second pass: re-open the winning section and keep it alive.
+    const decoder_section = bundle.sections[best_section.?];
+    const decoder_bytes = try bundle.sectionBytes(decoder_section);
+    var decoder_tfl = try vantablack.tflite.Model.init(gpa, decoder_bytes);
+    defer decoder_tfl.deinit();
+    const saved_buckets = try vantablack.gemma_layer_scan.scanLayers(gpa, decoder_tfl.tensors);
+    defer gpa.free(saved_buckets);
+
+    try out.print("decoder: section[{d}], {d} layers\n\n", .{ best_section.?, best_layer_count });
+
+    // Coverage summary across all layers.
+    var have_gate: usize = 0;
+    var have_up: usize = 0;
+    var have_down: usize = 0;
+    var have_attn_o: usize = 0;
+    var have_qkv: usize = 0;
+    var have_ple_gate: usize = 0;
+    var have_ple_proj: usize = 0;
+    var total_norms: usize = 0;
+    var total_unknown: usize = 0;
+    for (saved_buckets) |b| {
+        if (b.mlp_gate != null) have_gate += 1;
+        if (b.mlp_up != null) have_up += 1;
+        if (b.mlp_down != null) have_down += 1;
+        if (b.attn_o != null) have_attn_o += 1;
+        if (b.qkv_proj != null) have_qkv += 1;
+        if (b.ple_gate != null) have_ple_gate += 1;
+        if (b.ple_proj != null) have_ple_proj += 1;
+        total_norms += b.norm_count;
+        total_unknown += b.unknown_count;
+    }
+    try out.print(
+        "coverage (layers with role found / total):\n" ++
+            "  mlp.gate    {d}/{d}\n" ++
+            "  mlp.up      {d}/{d}\n" ++
+            "  mlp.down    {d}/{d}\n" ++
+            "  attn.o      {d}/{d}\n" ++
+            "  qkv         {d}/{d}\n" ++
+            "  ple.gate    {d}/{d}\n" ++
+            "  ple.proj    {d}/{d}\n" ++
+            "  norms total {d} across all layers\n" ++
+            "  unknown     {d} across all layers\n\n",
+        .{
+            have_gate, best_layer_count, have_up, best_layer_count,
+            have_down, best_layer_count, have_attn_o, best_layer_count,
+            have_qkv, best_layer_count, have_ple_gate, best_layer_count,
+            have_ple_proj, best_layer_count, total_norms, total_unknown,
+        },
+    );
+
+    // Per-layer breakdown with shapes.
+    for (saved_buckets) |b| {
+        try out.print("layer_{d:>2}:\n", .{b.layer_idx});
+        try printSlot(out, "  mlp.gate   ", b.mlp_gate);
+        try printSlot(out, "  mlp.up     ", b.mlp_up);
+        try printSlot(out, "  mlp.down   ", b.mlp_down);
+        try printSlot(out, "  attn.o     ", b.attn_o);
+        try printSlot(out, "  qkv        ", b.qkv_proj);
+        try printSlot(out, "  ple.gate   ", b.ple_gate);
+        try printSlot(out, "  ple.proj   ", b.ple_proj);
+        try out.print("  norms={d} unknown={d}\n", .{ b.norm_count, b.unknown_count });
+    }
+    try out.flush();
+}
+
+fn printSlot(out: *Io.Writer, label: []const u8, t: ?*const vantablack.tflite.Tensor) !void {
+    try out.writeAll(label);
+    if (t) |tt| {
+        try out.print("{s:<8} shape=[", .{tt.dtype.name()});
+        for (tt.shape, 0..) |d, i| {
+            if (i > 0) try out.writeByte(',');
+            try out.print("{d}", .{d});
+        }
+        try out.print("] {d} bytes\n", .{tt.data.len});
+    } else {
+        try out.writeAll("(absent)\n");
+    }
 }
 
 fn runInspectSection(

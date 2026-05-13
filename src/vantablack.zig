@@ -9,6 +9,7 @@ pub const flatbuffer = @import("core/flatbuffer.zig");
 pub const litertlm = @import("core/litertlm.zig");
 pub const llm_metadata = @import("core/llm_metadata.zig");
 pub const tflite = @import("core/tflite.zig");
+pub const gemma_layer_scan = @import("core/gemma_layer_scan.zig");
 pub const kernels = @import("kernels/comptime_gen.zig");
 pub const simd = @import("kernels/simd.zig");
 pub const math = @import("kernels/math.zig");
