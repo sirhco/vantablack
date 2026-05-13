@@ -238,11 +238,11 @@ pub const Gemma4Model = struct {
         const rope_base: f32 = 10000.0; // standard Llama default; Gemma 4 may differ
         var h: usize = 0;
         while (h < self.config.n_q_heads) : (h += 1) {
-            math.rope(q[h * head_dim ..][0..head_dim], 0, rope_base);
+            math.ropeHalf(q[h * head_dim ..][0..head_dim], 0, rope_base);
         }
         h = 0;
         while (h < self.config.n_kv_heads) : (h += 1) {
-            math.rope(k[h * head_dim ..][0..head_dim], 0, rope_base);
+            math.ropeHalf(k[h * head_dim ..][0..head_dim], 0, rope_base);
         }
 
         // Stage 4: self-attention against this token only (seq=1).
@@ -381,12 +381,12 @@ pub const Gemma4Model = struct {
             // cached, it's already rotated for pos 0).
             var hh: usize = 0;
             while (hh < n_q_l) : (hh += 1) {
-                math.rope(q_slice[hh * head_dim ..][0..head_dim], 0, rope_base);
+                math.ropeHalf(q_slice[hh * head_dim ..][0..head_dim], 0, rope_base);
             }
             if (layer.k != null) {
                 hh = 0;
                 while (hh < n_kv_l) : (hh += 1) {
-                    math.rope(cached_k[hh * head_dim ..][0..head_dim], 0, rope_base);
+                    math.ropeHalf(cached_k[hh * head_dim ..][0..head_dim], 0, rope_base);
                 }
             }
             // Seq=1 attention: each Q head's output equals its mapped V head.
@@ -437,11 +437,15 @@ pub const Gemma4Model = struct {
     }
 
     /// End-to-end: token_id → next-token argmax. Runs forwardSingleToken,
-    /// LM head via embedder weight-tying, then argmax.
+    /// final RMSNorm on the residual stream, LM head via embedder
+    /// weight-tying, then argmax.
     pub fn predictNext(self: *const Gemma4Model, allocator: std.mem.Allocator, token_id: u32) !u32 {
+        const math = @import("../kernels/math.zig");
         const hidden = try allocator.alloc(f32, self.config.hidden);
         defer allocator.free(hidden);
         try self.forwardSingleToken(allocator, token_id, hidden);
+        // Final RMSNorm before LM head — every transformer applies one.
+        math.rmsNormUnit(hidden, 1.0e-6);
 
         const logits = try allocator.alloc(f32, self.config.vocab_size);
         defer allocator.free(logits);
