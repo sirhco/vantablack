@@ -58,36 +58,58 @@ by einsum signature or trailing `gating_einsum1|2|linear`.
 - Confirms 19f hypothesis — sampling happens inside this section's TFLite
   graph, not via a host-side sampler.
 
-## Per-layer scan (added after running `scan-layers`)
+## Per-layer scan (after running `scan-layers`)
 
 `vantablack scan-layers <model.litertlm>` (output saved to
-`gemma4-e2b-scan-layers.txt`) classifies all 35 decoder layers with
-complete coverage on 5 roles:
+`gemma4-e2b-scan-layers.txt`) classifies all 35 decoder layers:
 
-| Role | Coverage | Layer-0 example shape | Layer-0 dtype |
-|------|----------|-----------------------|---------------|
-| mlp.gate (gating_einsum1) | 35/35 | [6144, 1536] | INT4 |
-| mlp.up   (gating_einsum2) | 35/35 | [6144, 1536] | INT4 |
-| mlp.down (linear)         | 35/35 | [1536, 6144] | INT4 |
-| attn.o (post_qkv/attn)    | 35/35 | [1536, 2048] | INT4 |
-| qkv (pre_qkv/attn)        | 35/35 | [2048, 1536] | INT4 |
-| ple.gate                  | 35/35 | [256, 1536]  | INT8 |
-| ple.proj                  | 35/35 | [1536, 256]  | INT8 |
+| Role | Coverage | Layer-0 shape | Layer-0 dtype |
+|------|----------|---------------|---------------|
+| q (q_einsum)               | 35/35 | [2048, 1536] | INT4 |
+| k (k_einsum)               | **15/35** | [256, 1536]  | INT4 |
+| v (v_einsum)               | **15/35** | [256, 1536]  | INT4 |
+| attn.o (attn_vec_einsum)   | 35/35 | [1536, 2048] | INT4 |
+| mlp.gate (gating_einsum1)  | 35/35 | [6144, 1536] | INT4 |
+| mlp.up   (gating_einsum2)  | 35/35 | [6144, 1536] | INT4 |
+| mlp.down (linear)          | 35/35 | [1536, 6144] | INT4 |
+| ple.gate                   | 35/35 | [256, 1536]  | INT8 |
+| ple.proj                   | 35/35 | [1536, 256]  | INT8 |
+| rope.freqs                 | 2/35  | [1, 1, 128]  | FLOAT32 |
 
-Observations:
+### Derived architecture
 
-- **FFN dim varies by layer**: layer 0 has F=6144 (4× hidden); deeper
-  layers have F=12288 (8× hidden). MatFormer-style variable width.
-- **Quant varies by layer**: layer 0 is INT4; many deeper layers are
-  INT2. Per-layer quantization decision baked into the build.
-- **QKV shape [2048, 1536] is suspicious**: 2048 doesn't fit a single
-  combined Q+K+V projection (would be n_q_heads*head_dim +
-  2*n_kv_heads*head_dim, typically larger). May only be the Q
-  projection — K/V might live elsewhere (separate tensors). Needs
-  op-graph trace to confirm.
-- **Norms classified as "unknown"**: 5 norms per layer (pre/post
-  attention/ffw + per-layer-input) — `scan-layers` patterns don't yet
-  match all of them. Refinement task.
+- **n_q_heads = 16, n_kv_heads = 2, head_dim = 128** (Q output 2048
+  = 16*128, KV output 256 = 2*128 → GQA 8:1)
+- **Hidden 1536, FFN-0 = 6144 (4×)**, deeper layers ramp to 12288 (8×)
+- **35 layers**, vocab 262144
+- **Per-Layer Embedding (PLE)** projection 1536↔256 INT8 per layer
+- **RoPE freqs precomputed**, head_dim=128, only 2 layers ship their
+  own copy (the rest likely share globally)
+
+### KV sharing (Gemma 3n/4 local-global attention)
+
+K and V weights exist only in **layers 0–14**. Layers 15–34 carry only
+Q + attn.o, reusing K/V cached by a neighbouring global-attention
+layer. This matches the local↔global attention pattern Google
+documented for Gemma 3n. Forward-path implementation in vantablack
+needs a per-layer flag: full-attn vs share-from-layer-N.
+
+### Norms (no per-layer weight)
+
+All 5 norm tensors per layer have `data=0`. RMSNorm scales are either
+shared globally (single tensor at decoder entry) or baked into the
+adjacent matmul's per-axis quantization scale. Confirming this needs
+op-graph trace. For now `scan-layers` reports `0 norms` honestly.
+
+### Quantization mix
+
+- Layer 0: pure INT4 (largest perplexity-sensitive layer)
+- Deeper layers: mix of INT2 (most MLP) + INT4 (some)
+- Per-Layer Embedding projections: INT8 (smaller tensor, doesn't need
+  aggressive quant)
+
+INT2 weights are stored bit-packed; dequantization is novel work
+(no public reference impl in vantablack today). Phase 19d.
 
 ## What this unlocks
 

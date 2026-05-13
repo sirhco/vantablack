@@ -555,20 +555,24 @@ fn runScanLayers(
     var have_up: usize = 0;
     var have_down: usize = 0;
     var have_attn_o: usize = 0;
-    var have_qkv: usize = 0;
+    var have_q: usize = 0;
+    var have_k: usize = 0;
+    var have_v: usize = 0;
     var have_ple_gate: usize = 0;
     var have_ple_proj: usize = 0;
-    var total_norms: usize = 0;
+    var have_rope: usize = 0;
     var total_unknown: usize = 0;
     for (saved_buckets) |b| {
         if (b.mlp_gate != null) have_gate += 1;
         if (b.mlp_up != null) have_up += 1;
         if (b.mlp_down != null) have_down += 1;
         if (b.attn_o != null) have_attn_o += 1;
-        if (b.qkv_proj != null) have_qkv += 1;
+        if (b.q_proj != null) have_q += 1;
+        if (b.k_proj != null) have_k += 1;
+        if (b.v_proj != null) have_v += 1;
         if (b.ple_gate != null) have_ple_gate += 1;
         if (b.ple_proj != null) have_ple_proj += 1;
-        total_norms += b.norm_count;
+        if (b.rope_inv_freq != null) have_rope += 1;
         total_unknown += b.unknown_count;
     }
     try out.print(
@@ -577,30 +581,36 @@ fn runScanLayers(
             "  mlp.up      {d}/{d}\n" ++
             "  mlp.down    {d}/{d}\n" ++
             "  attn.o      {d}/{d}\n" ++
-            "  qkv         {d}/{d}\n" ++
+            "  q           {d}/{d}\n" ++
+            "  k           {d}/{d}\n" ++
+            "  v           {d}/{d}\n" ++
             "  ple.gate    {d}/{d}\n" ++
             "  ple.proj    {d}/{d}\n" ++
-            "  norms total {d} across all layers\n" ++
+            "  rope.freqs  {d}/{d}\n" ++
             "  unknown     {d} across all layers\n\n",
         .{
             have_gate, best_layer_count, have_up, best_layer_count,
             have_down, best_layer_count, have_attn_o, best_layer_count,
-            have_qkv, best_layer_count, have_ple_gate, best_layer_count,
-            have_ple_proj, best_layer_count, total_norms, total_unknown,
+            have_q, best_layer_count, have_k, best_layer_count, have_v, best_layer_count,
+            have_ple_gate, best_layer_count, have_ple_proj, best_layer_count,
+            have_rope, best_layer_count, total_unknown,
         },
     );
 
     // Per-layer breakdown with shapes.
     for (saved_buckets) |b| {
         try out.print("layer_{d:>2}:\n", .{b.layer_idx});
+        try printSlot(out, "  q          ", b.q_proj);
+        try printSlot(out, "  k          ", b.k_proj);
+        try printSlot(out, "  v          ", b.v_proj);
+        try printSlot(out, "  attn.o     ", b.attn_o);
         try printSlot(out, "  mlp.gate   ", b.mlp_gate);
         try printSlot(out, "  mlp.up     ", b.mlp_up);
         try printSlot(out, "  mlp.down   ", b.mlp_down);
-        try printSlot(out, "  attn.o     ", b.attn_o);
-        try printSlot(out, "  qkv        ", b.qkv_proj);
         try printSlot(out, "  ple.gate   ", b.ple_gate);
         try printSlot(out, "  ple.proj   ", b.ple_proj);
-        try out.print("  norms={d} unknown={d}\n", .{ b.norm_count, b.unknown_count });
+        try printSlot(out, "  rope.freqs ", b.rope_inv_freq);
+        try out.print("  unknown={d}\n", .{b.unknown_count});
     }
     try out.flush();
 }

@@ -5,324 +5,431 @@ coverage (layers with role found / total):
   mlp.up      35/35
   mlp.down    35/35
   attn.o      35/35
-  qkv         35/35
+  q           35/35
+  k           15/35
+  v           15/35
   ple.gate    35/35
   ple.proj    35/35
-  norms total 0 across all layers
+  rope.freqs  2/35
   unknown     37 across all layers
 
 layer_ 0:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          INT4     shape=[256,1536] 196608 bytes
+  v          INT4     shape=[256,1536] 196608 bytes
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT4     shape=[6144,1536] 4718592 bytes
   mlp.up     INT4     shape=[6144,1536] 4718592 bytes
   mlp.down   INT4     shape=[1536,6144] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=3
+  rope.freqs FLOAT32  shape=[1,1,128] 512 bytes
+  unknown=3
 layer_ 1:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          INT4     shape=[256,1536] 196608 bytes
+  v          INT4     shape=[256,1536] 196608 bytes
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT4     shape=[6144,1536] 4718592 bytes
   mlp.up     INT4     shape=[6144,1536] 4718592 bytes
   mlp.down   INT4     shape=[1536,6144] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_ 2:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          INT4     shape=[256,1536] 196608 bytes
+  v          INT4     shape=[256,1536] 196608 bytes
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT4     shape=[6144,1536] 4718592 bytes
   mlp.up     INT4     shape=[6144,1536] 4718592 bytes
   mlp.down   INT4     shape=[1536,6144] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_ 3:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          INT4     shape=[256,1536] 196608 bytes
+  v          INT4     shape=[256,1536] 196608 bytes
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT4     shape=[6144,1536] 4718592 bytes
   mlp.up     INT4     shape=[6144,1536] 4718592 bytes
   mlp.down   INT4     shape=[1536,6144] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_ 4:
+  q          INT4     shape=[4096,1536] 3145728 bytes
+  k          INT4     shape=[512,1536] 393216 bytes
+  v          INT4     shape=[512,1536] 393216 bytes
+  attn.o     INT4     shape=[1536,4096] 3145728 bytes
   mlp.gate   INT4     shape=[6144,1536] 4718592 bytes
   mlp.up     INT4     shape=[6144,1536] 4718592 bytes
   mlp.down   INT4     shape=[1536,6144] 4718592 bytes
-  attn.o     INT4     shape=[1536,4096] 3145728 bytes
-  qkv        INT4     shape=[4096,1536] 3145728 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs FLOAT32  shape=[1,1,256] 1024 bytes
+  unknown=1
 layer_ 5:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          INT4     shape=[256,1536] 196608 bytes
+  v          INT4     shape=[256,1536] 196608 bytes
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT4     shape=[6144,1536] 4718592 bytes
   mlp.up     INT4     shape=[6144,1536] 4718592 bytes
   mlp.down   INT4     shape=[1536,6144] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_ 6:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          INT4     shape=[256,1536] 196608 bytes
+  v          INT4     shape=[256,1536] 196608 bytes
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT4     shape=[6144,1536] 4718592 bytes
   mlp.up     INT4     shape=[6144,1536] 4718592 bytes
   mlp.down   INT4     shape=[1536,6144] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_ 7:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          INT4     shape=[256,1536] 196608 bytes
+  v          INT4     shape=[256,1536] 196608 bytes
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT4     shape=[6144,1536] 4718592 bytes
   mlp.up     INT4     shape=[6144,1536] 4718592 bytes
   mlp.down   INT4     shape=[1536,6144] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_ 8:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          INT4     shape=[256,1536] 196608 bytes
+  v          INT4     shape=[256,1536] 196608 bytes
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT4     shape=[6144,1536] 4718592 bytes
   mlp.up     INT4     shape=[6144,1536] 4718592 bytes
   mlp.down   INT4     shape=[1536,6144] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_ 9:
+  q          INT4     shape=[4096,1536] 3145728 bytes
+  k          INT4     shape=[512,1536] 393216 bytes
+  v          INT4     shape=[512,1536] 393216 bytes
+  attn.o     INT4     shape=[1536,4096] 3145728 bytes
   mlp.gate   INT4     shape=[6144,1536] 4718592 bytes
   mlp.up     INT4     shape=[6144,1536] 4718592 bytes
   mlp.down   INT4     shape=[1536,6144] 4718592 bytes
-  attn.o     INT4     shape=[1536,4096] 3145728 bytes
-  qkv        INT4     shape=[4096,1536] 3145728 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_10:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          INT4     shape=[256,1536] 196608 bytes
+  v          INT4     shape=[256,1536] 196608 bytes
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT4     shape=[6144,1536] 4718592 bytes
   mlp.up     INT4     shape=[6144,1536] 4718592 bytes
   mlp.down   INT4     shape=[1536,6144] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_11:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          INT4     shape=[256,1536] 196608 bytes
+  v          INT4     shape=[256,1536] 196608 bytes
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT4     shape=[6144,1536] 4718592 bytes
   mlp.up     INT4     shape=[6144,1536] 4718592 bytes
   mlp.down   INT4     shape=[1536,6144] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_12:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          INT4     shape=[256,1536] 196608 bytes
+  v          INT4     shape=[256,1536] 196608 bytes
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT4     shape=[6144,1536] 4718592 bytes
   mlp.up     INT4     shape=[6144,1536] 4718592 bytes
   mlp.down   INT4     shape=[1536,6144] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_13:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          INT4     shape=[256,1536] 196608 bytes
+  v          INT4     shape=[256,1536] 196608 bytes
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT4     shape=[6144,1536] 4718592 bytes
   mlp.up     INT4     shape=[6144,1536] 4718592 bytes
   mlp.down   INT4     shape=[1536,6144] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_14:
+  q          INT4     shape=[4096,1536] 3145728 bytes
+  k          INT4     shape=[512,1536] 393216 bytes
+  v          INT4     shape=[512,1536] 393216 bytes
+  attn.o     INT4     shape=[1536,4096] 3145728 bytes
   mlp.gate   INT4     shape=[6144,1536] 4718592 bytes
   mlp.up     INT4     shape=[6144,1536] 4718592 bytes
   mlp.down   INT4     shape=[1536,6144] 4718592 bytes
-  attn.o     INT4     shape=[1536,4096] 3145728 bytes
-  qkv        INT4     shape=[4096,1536] 3145728 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_15:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          (absent)
+  v          (absent)
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT2     shape=[12288,1536] 4718592 bytes
   mlp.up     INT2     shape=[12288,1536] 4718592 bytes
   mlp.down   INT2     shape=[1536,12288] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_16:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          (absent)
+  v          (absent)
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT2     shape=[12288,1536] 4718592 bytes
   mlp.up     INT2     shape=[12288,1536] 4718592 bytes
   mlp.down   INT2     shape=[1536,12288] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_17:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          (absent)
+  v          (absent)
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT2     shape=[12288,1536] 4718592 bytes
   mlp.up     INT2     shape=[12288,1536] 4718592 bytes
   mlp.down   INT2     shape=[1536,12288] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_18:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          (absent)
+  v          (absent)
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT2     shape=[12288,1536] 4718592 bytes
   mlp.up     INT2     shape=[12288,1536] 4718592 bytes
   mlp.down   INT2     shape=[1536,12288] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_19:
+  q          INT4     shape=[4096,1536] 3145728 bytes
+  k          (absent)
+  v          (absent)
+  attn.o     INT4     shape=[1536,4096] 3145728 bytes
   mlp.gate   INT2     shape=[12288,1536] 4718592 bytes
   mlp.up     INT2     shape=[12288,1536] 4718592 bytes
   mlp.down   INT2     shape=[1536,12288] 4718592 bytes
-  attn.o     INT4     shape=[1536,4096] 3145728 bytes
-  qkv        INT4     shape=[4096,1536] 3145728 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_20:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          (absent)
+  v          (absent)
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT2     shape=[12288,1536] 4718592 bytes
   mlp.up     INT2     shape=[12288,1536] 4718592 bytes
   mlp.down   INT2     shape=[1536,12288] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_21:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          (absent)
+  v          (absent)
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT2     shape=[12288,1536] 4718592 bytes
   mlp.up     INT2     shape=[12288,1536] 4718592 bytes
   mlp.down   INT2     shape=[1536,12288] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_22:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          (absent)
+  v          (absent)
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT2     shape=[12288,1536] 4718592 bytes
   mlp.up     INT2     shape=[12288,1536] 4718592 bytes
   mlp.down   INT2     shape=[1536,12288] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_23:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          (absent)
+  v          (absent)
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT2     shape=[12288,1536] 4718592 bytes
   mlp.up     INT2     shape=[12288,1536] 4718592 bytes
   mlp.down   INT2     shape=[1536,12288] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_24:
+  q          INT4     shape=[4096,1536] 3145728 bytes
+  k          (absent)
+  v          (absent)
+  attn.o     INT4     shape=[1536,4096] 3145728 bytes
   mlp.gate   INT2     shape=[12288,1536] 4718592 bytes
   mlp.up     INT2     shape=[12288,1536] 4718592 bytes
   mlp.down   INT2     shape=[1536,12288] 4718592 bytes
-  attn.o     INT4     shape=[1536,4096] 3145728 bytes
-  qkv        INT4     shape=[4096,1536] 3145728 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_25:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          (absent)
+  v          (absent)
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT2     shape=[12288,1536] 4718592 bytes
   mlp.up     INT2     shape=[12288,1536] 4718592 bytes
   mlp.down   INT2     shape=[1536,12288] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_26:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          (absent)
+  v          (absent)
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT2     shape=[12288,1536] 4718592 bytes
   mlp.up     INT2     shape=[12288,1536] 4718592 bytes
   mlp.down   INT2     shape=[1536,12288] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_27:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          (absent)
+  v          (absent)
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT2     shape=[12288,1536] 4718592 bytes
   mlp.up     INT2     shape=[12288,1536] 4718592 bytes
   mlp.down   INT2     shape=[1536,12288] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_28:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          (absent)
+  v          (absent)
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT2     shape=[12288,1536] 4718592 bytes
   mlp.up     INT2     shape=[12288,1536] 4718592 bytes
   mlp.down   INT2     shape=[1536,12288] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_29:
+  q          INT4     shape=[4096,1536] 3145728 bytes
+  k          (absent)
+  v          (absent)
+  attn.o     INT4     shape=[1536,4096] 3145728 bytes
   mlp.gate   INT2     shape=[12288,1536] 4718592 bytes
   mlp.up     INT2     shape=[12288,1536] 4718592 bytes
   mlp.down   INT2     shape=[1536,12288] 4718592 bytes
-  attn.o     INT4     shape=[1536,4096] 3145728 bytes
-  qkv        INT4     shape=[4096,1536] 3145728 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_30:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          (absent)
+  v          (absent)
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT2     shape=[12288,1536] 4718592 bytes
   mlp.up     INT2     shape=[12288,1536] 4718592 bytes
   mlp.down   INT2     shape=[1536,12288] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_31:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          (absent)
+  v          (absent)
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT2     shape=[12288,1536] 4718592 bytes
   mlp.up     INT2     shape=[12288,1536] 4718592 bytes
   mlp.down   INT2     shape=[1536,12288] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_32:
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          (absent)
+  v          (absent)
+  attn.o     INT4     shape=[1536,2048] 1572864 bytes
   mlp.gate   INT2     shape=[12288,1536] 4718592 bytes
   mlp.up     INT2     shape=[12288,1536] 4718592 bytes
   mlp.down   INT2     shape=[1536,12288] 4718592 bytes
-  attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
 layer_33:
-  mlp.gate   INT2     shape=[12288,1536] 4718592 bytes
-  mlp.up     INT2     shape=[12288,1536] 4718592 bytes
-  mlp.down   INT2     shape=[1536,12288] 4718592 bytes
+  q          INT4     shape=[2048,1536] 1572864 bytes
+  k          (absent)
+  v          (absent)
   attn.o     INT4     shape=[1536,2048] 1572864 bytes
-  qkv        INT4     shape=[2048,1536] 1572864 bytes
-  ple.gate   INT8     shape=[256,1536] 393216 bytes
-  ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
-layer_34:
   mlp.gate   INT2     shape=[12288,1536] 4718592 bytes
   mlp.up     INT2     shape=[12288,1536] 4718592 bytes
   mlp.down   INT2     shape=[1536,12288] 4718592 bytes
-  attn.o     INT4     shape=[1536,4096] 3145728 bytes
-  qkv        INT4     shape=[4096,1536] 3145728 bytes
   ple.gate   INT8     shape=[256,1536] 393216 bytes
   ple.proj   INT8     shape=[1536,256] 393216 bytes
-  norms=0 unknown=1
+  rope.freqs (absent)
+  unknown=1
+layer_34:
+  q          INT4     shape=[4096,1536] 3145728 bytes
+  k          (absent)
+  v          (absent)
+  attn.o     INT4     shape=[1536,4096] 3145728 bytes
+  mlp.gate   INT2     shape=[12288,1536] 4718592 bytes
+  mlp.up     INT2     shape=[12288,1536] 4718592 bytes
+  mlp.down   INT2     shape=[1536,12288] 4718592 bytes
+  ple.gate   INT8     shape=[256,1536] 393216 bytes
+  ple.proj   INT8     shape=[1536,256] 393216 bytes
+  rope.freqs (absent)
+  unknown=1
