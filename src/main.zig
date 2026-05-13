@@ -1082,7 +1082,7 @@ fn runTraceTensor(
     }
     try out.print("] data={d} bytes\n  name: {s}\n", .{ t.data.len, t.name });
 
-    // Dump FP32 values: full when small (≤32), first 16 otherwise.
+    // Dump values for small numeric tensors.
     if (t.dtype == .float32 and t.data.len >= @sizeOf(f32)) {
         const n_f: usize = t.data.len / @sizeOf(f32);
         const f: []const f32 = @as([*]const f32, @ptrCast(@alignCast(t.data.ptr)))[0..n_f];
@@ -1093,6 +1093,17 @@ fn runTraceTensor(
             try out.print("{d}", .{v});
         }
         if (n_show < n_f) try out.print(" … ({d} more)", .{n_f - n_show});
+        try out.writeByte('\n');
+    } else if (t.dtype == .int32 and t.data.len >= @sizeOf(i32)) {
+        const n_i: usize = t.data.len / @sizeOf(i32);
+        const v: []const i32 = @as([*]const i32, @ptrCast(@alignCast(t.data.ptr)))[0..n_i];
+        const n_show: usize = if (n_i <= 32) n_i else 16;
+        try out.writeAll("  values: ");
+        for (v[0..n_show], 0..) |x, i| {
+            if (i > 0) try out.writeByte(' ');
+            try out.print("{d}", .{x});
+        }
+        if (n_show < n_i) try out.print(" … ({d} more)", .{n_i - n_show});
         try out.writeByte('\n');
     }
     try out.writeByte('\n');
