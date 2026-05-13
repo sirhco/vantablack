@@ -179,6 +179,16 @@ pub const Gemma4Model = struct {
         errdefer allocator.free(parents);
 
         const head_dim: usize = self.config.head_dim;
+        _ = head_dim;
+        // Gemma 4 E2B KV-share routing (verified via TFLite op-graph
+        // trace of section 10): shared layers 15..34 alias EITHER layer
+        // 13 (sliding-window-local parent) or layer 14 (global-attention
+        // parent). The cycle is 4 local + 1 global, where the global
+        // slot is every 5 layers starting at 14, i.e. layers {14, 19,
+        // 24, 29, 34}. Shared layer L picks layer 14 when
+        // (L - 14) % 5 == 0 else layer 13.
+        const LOCAL_PARENT: usize = 13;
+        const GLOBAL_PARENT: usize = 14;
         var last_owner: usize = 0;
         for (self.layers, 0..) |layer, i| {
             parents[i] = i;
@@ -188,13 +198,19 @@ pub const Gemma4Model = struct {
                 v_slots[i] = try allocator.alloc(f32, max_seq * kv_dim_l);
                 owned[i] = true;
                 last_owner = i;
-                _ = head_dim;
             } else {
-                // KV-shared: alias the most-recent owner's slot.
-                k_slots[i] = k_slots[last_owner];
-                v_slots[i] = v_slots[last_owner];
+                const cycle_parent: usize = if (i >= GLOBAL_PARENT and ((i - GLOBAL_PARENT) % 5) == 0)
+                    GLOBAL_PARENT
+                else
+                    LOCAL_PARENT;
+                const parent: usize = if (cycle_parent < self.layers.len and owned[cycle_parent])
+                    cycle_parent
+                else
+                    last_owner;
+                k_slots[i] = k_slots[parent];
+                v_slots[i] = v_slots[parent];
                 owned[i] = false;
-                parents[i] = last_owner;
+                parents[i] = parent;
             }
         }
         return .{
@@ -607,14 +623,16 @@ pub const Gemma4Model = struct {
         try self.lookupPerLayerEmbedding(token_id, layer_idx, ple_in);
         try self.projectPleGate(hidden_out, layer_idx, gate_out);
 
-        // SiLU activation: x * sigmoid(x). Swapped from gelu_approx —
-        // empirically more stable on this architecture. Exact op kind
-        // (builtin 150 in TFLite) not yet verified against upstream.
+        // GELU activation (tanh approximation):
+        //   gelu(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+        // TFLite builtin 150 = GELU (verified against upstream schema
+        // `tensorflow/compiler/mlir/lite/schema/schema.fbs`).
         var i: usize = 0;
         while (i < ple_dim) : (i += 1) {
             const x = gate_out[i];
-            const sig = 1.0 / (1.0 + @exp(-x));
-            const g = x * sig;
+            const t = 0.7978845608 * (x + 0.044715 * x * x * x);
+            const tanh_t = std.math.tanh(t);
+            const g = 0.5 * x * (1.0 + tanh_t);
             ple_in[i] *= g;
         }
         try self.projectPleProj(ple_in, layer_idx, residual);
