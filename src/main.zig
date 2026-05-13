@@ -1197,7 +1197,7 @@ fn runTraceTensor(
         if (i > 0) try out.writeByte(',');
         try out.print("{d}", .{d});
     }
-    try out.print("] data={d} bytes\n  name: {s}\n", .{ t.data.len, t.name });
+    try out.print("] data={d} bytes\n  name: {s}\n  quant_axis: {d} scales_bytes: {d} zps_bytes: {d}\n", .{ t.data.len, t.name, t.quantized_dimension, t.scales.len, t.zero_points.len });
 
     // Dump values for small numeric tensors.
     if (t.dtype == .float32 and t.data.len >= @sizeOf(f32)) {
