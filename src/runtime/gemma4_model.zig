@@ -392,7 +392,7 @@ pub const Gemma4Model = struct {
             @memcpy(h_norm, hidden_out);
             if (layer.norm_pre_attn) |w_t| {
                 const w_f32: []const f32 = @as([*]const f32, @ptrCast(@alignCast(w_t.data.ptr)))[0..self.config.hidden];
-                math.rmsNorm(h_norm, w_f32, rms_eps);
+                math.rmsNormGemma(h_norm, w_f32, rms_eps);
             } else {
                 math.rmsNormUnit(h_norm, rms_eps);
             }
@@ -426,13 +426,19 @@ pub const Gemma4Model = struct {
                 @memcpy(attn_in_slice[qh * head_dim ..][0..head_dim], v_src);
             }
             try self.projectAttnO(attn_in_slice, layer_idx, attn_out);
+            // Post-attention norm damps the attention output before
+            // the residual add — Gemma 2/3/4 sandwich norm pattern.
+            if (layer.norm_post_attn) |w_t| {
+                const w_f32: []const f32 = @as([*]const f32, @ptrCast(@alignCast(w_t.data.ptr)))[0..self.config.hidden];
+                math.rmsNormGemma(attn_out, w_f32, rms_eps);
+            }
             math.addInto(hidden_out, attn_out);
 
             // Pre-MLP norm (learned scale if available — pre_ffw_norm).
             @memcpy(h_norm, hidden_out);
             if (layer.norm_pre_ffw) |w_t| {
                 const w_f32: []const f32 = @as([*]const f32, @ptrCast(@alignCast(w_t.data.ptr)))[0..self.config.hidden];
-                math.rmsNorm(h_norm, w_f32, rms_eps);
+                math.rmsNormGemma(h_norm, w_f32, rms_eps);
             } else {
                 math.rmsNormUnit(h_norm, rms_eps);
             }
@@ -445,6 +451,11 @@ pub const Gemma4Model = struct {
             try self.projectMlpUp(h_norm, layer_idx, up_slice);
             math.swiglu(gate_slice, up_slice);
             try self.projectMlpDown(gate_slice, layer_idx, ffn_out);
+            // Post-FFW norm damps the MLP output before residual add.
+            if (layer.norm_post_ffw) |w_t| {
+                const w_f32: []const f32 = @as([*]const f32, @ptrCast(@alignCast(w_t.data.ptr)))[0..self.config.hidden];
+                math.rmsNormGemma(ffn_out, w_f32, rms_eps);
+            }
             math.addInto(hidden_out, ffn_out);
 
             // PLE residual mix (Gemma's per-layer-embedding contribution).
