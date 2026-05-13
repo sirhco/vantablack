@@ -1,0 +1,41 @@
+Gemma 4 E2B — layer 0 K projection data-flow
+=============================================
+
+Manual chain trace via `vantablack trace-tensor` on section 10.
+Each row is one op in the forward graph. Tensor indices are
+section-10 native (not the sort-order indices from inspect-section).
+
+Chain:
+  [tensor 355] hidden_state input (FLOAT32 [1,1,1536])
+       ↓ op 14: OP?  (likely "pre_attention_norm" — RMSNorm on hidden)
+  [tensor 360] K weight (INT4 [256, 1536], buffer 361, 196608 bytes)
+       ↓ op 15: FULLY_CONNECTED (K projection: hidden @ K_weight^T)
+  [tensor 361] K projection raw (INT8 [1,1,256])
+       ↓ op 16: RESHAPE  (add head dimension)
+  [tensor 362] K reshaped (INT8 [1,1,1,256])
+       ↓ op 17: DEQUANTIZE  (per-axis int8 → fp32)
+  [tensor 363] K dequantized (FLOAT32 [1,1,1,256])
+       ↓ op 22: OP? — "key_norm" — Gemma 4 style Q/K layer norm
+  [tensor 369] K normalized (FLOAT32 [1,1,1,256], name ends in key_norm/composite)
+       ↓ op 39 + op 40: RoPE rotation (two OP? variants, each takes
+         the key + an inv_freq table + a position index)
+  → consumed by `attn.dot_product_attention` operators downstream
+
+Key takeaways for Phase 19c + 19d:
+
+1. DEQUANTIZE is an explicit op. The model graph itself inserts a
+   dequant step between INT8 storage and FP32 consumers. vantablack
+   forward path must either replicate that pattern or fuse dequant
+   into matmul (current GGUF / MLX kernels do the latter).
+
+2. Q/K layer norm is present (`key_norm` + presumably `query_norm`).
+   Gemma 4 normalizes Q and K *after* projection but *before* RoPE.
+   vantablack's existing Llama-style forward doesn't do this — needs
+   to be added for Gemma 4.
+
+3. RoPE has a 3-input op signature: (vector, inv_freq, position)
+   → rotated_vector. Likely matches a STABLEHLO op variant.
+
+4. K projection weight stride [256, 1536] confirms n_kv_heads=2,
+   head_dim=128 (head dim deduced from RoPE inv_freq table shape
+   [1, 1, 128]).

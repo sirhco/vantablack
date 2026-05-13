@@ -13,6 +13,7 @@ const usage =
     \\  vantablack inspect <model.litertlm>                 print sections + metadata of a LiteRT-LM bundle
     \\  vantablack inspect-section <m.litertlm> <idx>       deep-dump tensors + operator graph of one TFLite section
     \\  vantablack scan-layers <model.litertlm>             classify decoder weights by layer + role (Phase 19c foundation)
+    \\  vantablack trace-tensor <m.litertlm> <sec> <t_idx>  find ops that produce/consume a given TFLite tensor
     \\  vantablack tokenize-litertlm <m.litertlm> <text>    encode text using HF tokenizer embedded in a .litertlm
     \\
     \\generate / prompt / chat accept sampler flags BEFORE the n value:
@@ -58,6 +59,23 @@ pub fn main(init: std.process.Init) !void {
             return error.MissingArgs;
         }
         try runTokenizeLitertlm(gpa, arena, io, args[2], args[3], out, err);
+        return;
+    }
+
+    // trace-tensor <model.litertlm> <section_idx> <selector>: walks
+    // the operator graph and prints every op that produces or consumes
+    // the given tensor. Selector is either a numeric tensor index OR
+    // a name substring (first match wins). Surfaces data-flow
+    // neighbors so we can hand-verify e.g. KV-sharing wiring (which
+    // layer's K cache does layer_20's attention read from?).
+    if (std.mem.eql(u8, args[1], "trace-tensor")) {
+        if (args.len < 5) {
+            try err.writeAll("usage: vantablack trace-tensor <model.litertlm> <section_idx> <tensor_idx|name_substring>\n");
+            try err.flush();
+            return error.MissingArgs;
+        }
+        const sec_idx = try std.fmt.parseInt(usize, args[3], 10);
+        try runTraceTensor(gpa, arena, io, args[2], sec_idx, args[4], out, err);
         return;
     }
 
@@ -484,6 +502,118 @@ fn runTokenizeLitertlm(
     }
     try out.writeByte('\n');
     try out.flush();
+}
+
+fn runTraceTensor(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: Io,
+    input_path: []const u8,
+    section_idx: usize,
+    selector: []const u8,
+    out: *Io.Writer,
+    err: *Io.Writer,
+) !void {
+    const abs_path = if (std.fs.path.isAbsolute(input_path))
+        try arena.dupe(u8, input_path)
+    else blk: {
+        const cwd = try std.process.currentPathAlloc(io, arena);
+        break :blk try std.fs.path.resolve(arena, &.{ cwd, input_path });
+    };
+    const file = try Io.Dir.openFileAbsolute(io, abs_path, .{ .allow_directory = false });
+    defer file.close(io);
+    const len = try file.length(io);
+    const len_us: usize = std.math.cast(usize, len) orelse return error.FileTooLarge;
+    const mapped = try std.posix.mmap(null, len_us, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    defer std.posix.munmap(mapped);
+
+    var bundle = try vantablack.litertlm.Bundle.init(gpa, mapped);
+    defer bundle.deinit();
+    if (section_idx >= bundle.sections.len) return error.IndexOutOfRange;
+    const s = bundle.sections[section_idx];
+    if (s.data_type != .tflite_model) {
+        try err.print("section {d} is {s}, not TFLiteModel\n", .{ section_idx, s.data_type.name() });
+        try err.flush();
+        return error.WrongSectionType;
+    }
+    const bytes = try bundle.sectionBytes(s);
+    var tfl = try vantablack.tflite.Model.init(gpa, bytes);
+    defer tfl.deinit();
+
+    // Selector: numeric index OR name substring.
+    var target: i32 = -1;
+    if (std.fmt.parseInt(i32, selector, 10)) |idx| {
+        target = idx;
+    } else |_| {
+        // Substring search — first match wins.
+        for (tfl.tensors, 0..) |tt, i| {
+            if (std.mem.indexOf(u8, tt.name, selector) != null) {
+                target = @intCast(i);
+                break;
+            }
+        }
+        if (target < 0) {
+            try err.print("no tensor name contains '{s}'\n", .{selector});
+            try err.flush();
+            return error.NoMatchingTensor;
+        }
+    }
+    if (target < 0 or @as(usize, @intCast(target)) >= tfl.tensors.len) return error.IndexOutOfRange;
+    const t = &tfl.tensors[@intCast(target)];
+
+    try out.print("tensor [{d}] {s}\n  shape=[", .{ target, t.dtype.name() });
+    for (t.shape, 0..) |d, i| {
+        if (i > 0) try out.writeByte(',');
+        try out.print("{d}", .{d});
+    }
+    try out.print("] data={d} bytes\n  name: {s}\n\n", .{ t.data.len, t.name });
+
+    // Walk operators. For each, look in inputs[] and outputs[].
+    var n_producers: usize = 0;
+    var n_consumers: usize = 0;
+    try out.writeAll("producers (ops writing this tensor):\n");
+    for (tfl.operators, 0..) |op, oi| {
+        for (op.outputs) |out_t| {
+            if (out_t == target) {
+                n_producers += 1;
+                try printOpRow(out, &tfl, oi, op);
+            }
+        }
+    }
+    if (n_producers == 0) try out.writeAll("  (none — likely a constant / input tensor)\n");
+
+    try out.writeAll("\nconsumers (ops reading this tensor):\n");
+    for (tfl.operators, 0..) |op, oi| {
+        for (op.inputs) |in_t| {
+            if (in_t == target) {
+                n_consumers += 1;
+                try printOpRow(out, &tfl, oi, op);
+                break; // already shown; don't repeat if it appears twice in inputs
+            }
+        }
+    }
+    if (n_consumers == 0) try out.writeAll("  (none — likely a final output)\n");
+
+    try out.print("\nsummary: {d} producer(s), {d} consumer(s)\n", .{ n_producers, n_consumers });
+    try out.flush();
+}
+
+fn printOpRow(out: *Io.Writer, tfl: *const vantablack.tflite.Model, op_idx: usize, op: vantablack.tflite.Operator) !void {
+    const op_name = if (op.opcode_index < tfl.operator_codes.len)
+        vantablack.tflite.nameOfOp(tfl.operator_codes[op.opcode_index].builtin_code)
+    else
+        "?";
+    try out.print("  [op {d:>4}] {s:<20} inputs=[", .{ op_idx, op_name });
+    for (op.inputs, 0..) |t, j| {
+        if (j > 0) try out.writeByte(',');
+        try out.print("{d}", .{t});
+    }
+    try out.writeAll("] outputs=[");
+    for (op.outputs, 0..) |t, j| {
+        if (j > 0) try out.writeByte(',');
+        try out.print("{d}", .{t});
+    }
+    try out.writeAll("]\n");
 }
 
 fn runScanLayers(
