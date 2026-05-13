@@ -75,6 +75,15 @@ pub const Gemma4Layer = struct {
     /// Pre-computed RoPE inv-freq table (FLOAT32, shape [1, 1, head_dim]).
     /// Null on layers that share a global RoPE table.
     rope_inv_freq: ?*const tflite.Tensor,
+    /// Learned RMSNorm scales. Five per layer in Gemma 4:
+    /// pre_attention_norm, post_attention_norm, pre_ffw_norm,
+    /// post_ffw_norm, post_per_layer_input_norm. Each shape [hidden]
+    /// FLOAT32. Null when discovery couldn't pin a tensor.
+    norm_pre_attn: ?*const tflite.Tensor = null,
+    norm_post_attn: ?*const tflite.Tensor = null,
+    norm_pre_ffw: ?*const tflite.Tensor = null,
+    norm_post_ffw: ?*const tflite.Tensor = null,
+    norm_post_per_layer: ?*const tflite.Tensor = null,
 };
 
 pub const Gemma4Model = struct {
@@ -379,9 +388,14 @@ pub const Gemma4Model = struct {
             else
                 self.config.n_kv_heads;
 
-            // Pre-attention norm (unit RMSNorm — no learned scale yet).
+            // Pre-attention norm (learned scale if available).
             @memcpy(h_norm, hidden_out);
-            math.rmsNormUnit(h_norm, rms_eps);
+            if (layer.norm_pre_attn) |w_t| {
+                const w_f32: []const f32 = @as([*]const f32, @ptrCast(@alignCast(w_t.data.ptr)))[0..self.config.hidden];
+                math.rmsNorm(h_norm, w_f32, rms_eps);
+            } else {
+                math.rmsNormUnit(h_norm, rms_eps);
+            }
 
             const q_slice = q[0..q_dim_l];
             try self.projectQ(h_norm, layer_idx, q_slice);
@@ -414,9 +428,14 @@ pub const Gemma4Model = struct {
             try self.projectAttnO(attn_in_slice, layer_idx, attn_out);
             math.addInto(hidden_out, attn_out);
 
-            // Pre-MLP norm.
+            // Pre-MLP norm (learned scale if available — pre_ffw_norm).
             @memcpy(h_norm, hidden_out);
-            math.rmsNormUnit(h_norm, rms_eps);
+            if (layer.norm_pre_ffw) |w_t| {
+                const w_f32: []const f32 = @as([*]const f32, @ptrCast(@alignCast(w_t.data.ptr)))[0..self.config.hidden];
+                math.rmsNorm(h_norm, w_f32, rms_eps);
+            } else {
+                math.rmsNormUnit(h_norm, rms_eps);
+            }
 
             // MLP block (uses per-layer FFN dim).
             const ffn = self.config.ffn_dim_per_layer[layer_idx];
@@ -816,6 +835,82 @@ pub fn initFromLitertlm(
             break;
         }
         tfl.deinit();
+    }
+
+    // Discover learned RMSNorm scales. Pattern: each `*_norm/composite`
+    // tensor in section 10 is produced by an op consuming the residual
+    // stream + a FP32 [hidden] scale weight. Walk the ops, find norm
+    // outputs by name, and pin the scale input by elimination (the
+    // input that's a constant tensor with FP32 [hidden] data).
+    {
+        const NormRole = enum { pre_attn, post_attn, pre_ffw, post_ffw, post_per_layer, none };
+        for (decoder_tfl.operators) |op| {
+            if (op.outputs.len != 1 or op.inputs.len < 2) continue;
+            const out_idx_i: i32 = op.outputs[0];
+            if (out_idx_i < 0) continue;
+            const out_idx: usize = @intCast(out_idx_i);
+            if (out_idx >= decoder_tfl.tensors.len) continue;
+            const out_t = &decoder_tfl.tensors[out_idx];
+            // Identify (layer, role) from the output tensor's name.
+            const name = out_t.name;
+            const norm_marker = "_norm/composite";
+            if (std.mem.indexOf(u8, name, norm_marker) == null) continue;
+            const layer_n_opt = scan.parseLayerIndex(name);
+            if (layer_n_opt == null) continue;
+            const layer_n = layer_n_opt.?;
+            if (layer_n >= final_layers.len) continue;
+
+            const role: NormRole = if (std.mem.indexOf(u8, name, "pre_attention_norm") != null)
+                .pre_attn
+            else if (std.mem.indexOf(u8, name, "post_attention_norm") != null)
+                .post_attn
+            else if (std.mem.indexOf(u8, name, "pre_ffw_norm") != null)
+                .pre_ffw
+            else if (std.mem.indexOf(u8, name, "post_ffw_norm") != null)
+                .post_ffw
+            else if (std.mem.indexOf(u8, name, "post_per_layer_input_norm") != null)
+                .post_per_layer
+            else
+                .none;
+            if (role == .none) continue;
+
+            // Find the scale input: an input tensor that is FP32, has
+            // shape [hidden], and carries non-empty data.
+            var scale_tensor: ?*const tflite.Tensor = null;
+            for (op.inputs) |in_idx_i| {
+                if (in_idx_i < 0) continue;
+                const in_idx: usize = @intCast(in_idx_i);
+                if (in_idx >= decoder_tfl.tensors.len) continue;
+                const in_t = &decoder_tfl.tensors[in_idx];
+                if (in_t.dtype != .float32) continue;
+                if (in_t.data.len == 0) continue;
+                if (in_t.shape.len != 1) continue;
+                if (in_t.shape[0] != @as(i32, @intCast(hidden))) continue;
+                scale_tensor = in_t;
+                break;
+            }
+            if (scale_tensor) |st| {
+                const layer = &final_layers[layer_n];
+                switch (role) {
+                    .pre_attn => if (layer.norm_pre_attn == null) {
+                        layer.norm_pre_attn = st;
+                    },
+                    .post_attn => if (layer.norm_post_attn == null) {
+                        layer.norm_post_attn = st;
+                    },
+                    .pre_ffw => if (layer.norm_pre_ffw == null) {
+                        layer.norm_pre_ffw = st;
+                    },
+                    .post_ffw => if (layer.norm_post_ffw == null) {
+                        layer.norm_post_ffw = st;
+                    },
+                    .post_per_layer => if (layer.norm_post_per_layer == null) {
+                        layer.norm_post_per_layer = st;
+                    },
+                    .none => unreachable,
+                }
+            }
+        }
     }
 
     return .{
