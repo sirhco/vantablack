@@ -90,6 +90,11 @@ pub const Gemma4Layer = struct {
     /// the n_q_per_kv groups.
     norm_query: ?*const tflite.Tensor = null,
     norm_key: ?*const tflite.Tensor = null,
+    /// Per-layer scalar that multiplies the residual stream after
+    /// all sub-block residuals (attn + MLP + PLE) before passing to
+    /// the next layer. FP32 [1,1,1] = 4 bytes total. Gemma 4's
+    /// `_maybe_apply_skip_scale` mechanism.
+    skip_scale: ?*const tflite.Tensor = null,
 };
 
 pub const Gemma4Model = struct {
@@ -495,6 +500,14 @@ pub const Gemma4Model = struct {
             // Skipped when no per-layer-embedder shard for this layer.
             if (layer_idx < self.per_layer_embedder.len and self.per_layer_embedder[layer_idx] != null) {
                 ple_scratch_residual_add(self, allocator, token_id, layer_idx, hidden_out) catch {};
+            }
+
+            // Per-layer skip-scale scalar damps the residual stream
+            // before the next layer. Single FP32 scalar.
+            if (layer.skip_scale) |s_t| {
+                const s: f32 = @as([*]const f32, @ptrCast(@alignCast(s_t.data.ptr)))[0];
+                var ii: usize = 0;
+                while (ii < hidden_out.len) : (ii += 1) hidden_out[ii] *= s;
             }
         }
     }
@@ -974,6 +987,22 @@ pub fn initFromLitertlm(
                 }
             }
         }
+    }
+
+    // Discover per-layer `_maybe_apply_skip_scale` scalars. FP32
+    // shape [1,1,1] data=4 bytes. Name contains
+    // `layer_N._maybe_apply_skip_scale/broadcast_in_dim`.
+    for (decoder_tfl.tensors) |*t| {
+        if (t.dtype != .float32) continue;
+        if (t.data.len != 4) continue;
+        const marker = "_maybe_apply_skip_scale/broadcast_in_dim";
+        if (std.mem.indexOf(u8, t.name, marker) == null) continue;
+        const layer_n_opt = scan.parseLayerIndex(t.name);
+        if (layer_n_opt == null) continue;
+        const ln = layer_n_opt.?;
+        if (ln >= final_layers.len) continue;
+        if (final_layers[ln].skip_scale != null) continue;
+        final_layers[ln].skip_scale = t;
     }
 
     return .{
