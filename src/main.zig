@@ -15,6 +15,7 @@ const usage =
     \\  vantablack scan-layers <model.litertlm>             classify decoder weights by layer + role (Phase 19c foundation)
     \\  vantablack trace-tensor <m.litertlm> <sec> <t_idx>  find ops that produce/consume a given TFLite tensor
     \\  vantablack gemma4-config <m.litertlm>               load a Gemma 4 .litertlm into Gemma4Model + print inferred config
+    \\  vantablack gemma4-embed <m.litertlm> <token_id>     lookup embedding for token_id (INT2 dequant smoke test)
     \\  vantablack tokenize-litertlm <m.litertlm> <text>    encode text using HF tokenizer embedded in a .litertlm
     \\
     \\generate / prompt / chat accept sampler flags BEFORE the n value:
@@ -60,6 +61,20 @@ pub fn main(init: std.process.Init) !void {
             return error.MissingArgs;
         }
         try runTokenizeLitertlm(gpa, arena, io, args[2], args[3], out, err);
+        return;
+    }
+
+    // gemma4-embed <model.litertlm> <token_id>: lookup the embedding
+    // for `token_id`, print first 8 + last 4 components. Smoke-tests
+    // the INT2 dequant path end-to-end against the real model.
+    if (std.mem.eql(u8, args[1], "gemma4-embed")) {
+        if (args.len < 4) {
+            try err.writeAll("usage: vantablack gemma4-embed <model.litertlm> <token_id>\n");
+            try err.flush();
+            return error.MissingArgs;
+        }
+        const tid = try std.fmt.parseInt(u32, args[3], 10);
+        try runGemma4Embed(gpa, arena, io, args[2], tid, out, err);
         return;
     }
 
@@ -519,6 +534,73 @@ fn runTokenizeLitertlm(
     try out.flush();
 }
 
+fn runGemma4Embed(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: Io,
+    input_path: []const u8,
+    token_id: u32,
+    out: *Io.Writer,
+    err: *Io.Writer,
+) !void {
+    _ = err;
+    const abs_path = if (std.fs.path.isAbsolute(input_path))
+        try arena.dupe(u8, input_path)
+    else blk: {
+        const cwd = try std.process.currentPathAlloc(io, arena);
+        break :blk try std.fs.path.resolve(arena, &.{ cwd, input_path });
+    };
+    const file = try Io.Dir.openFileAbsolute(io, abs_path, .{ .allow_directory = false });
+    defer file.close(io);
+    const len = try file.length(io);
+    const len_us: usize = std.math.cast(usize, len) orelse return error.FileTooLarge;
+    const mapped = try std.posix.mmap(null, len_us, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    defer std.posix.munmap(mapped);
+
+    var bundle = try vantablack.litertlm.Bundle.init(gpa, mapped);
+    defer bundle.deinit();
+    var model = try vantablack.gemma4_model.initFromLitertlm(gpa, &bundle);
+    defer model.deinit();
+
+    if (token_id >= model.config.vocab_size) {
+        try out.print("token_id {d} >= vocab_size {d}\n", .{ token_id, model.config.vocab_size });
+        try out.flush();
+        return error.TokenOutOfRange;
+    }
+
+    const hidden = model.config.hidden;
+    const buf = try gpa.alloc(f32, hidden);
+    defer gpa.free(buf);
+    try model.lookupEmbedding(token_id, buf);
+
+    // Summary stats — embedding is huge (1536 floats), show edges + norm.
+    var sum: f64 = 0;
+    var sum_sq: f64 = 0;
+    var mn: f32 = std.math.floatMax(f32);
+    var mx: f32 = -std.math.floatMax(f32);
+    for (buf) |v| {
+        sum += v;
+        sum_sq += @as(f64, v) * @as(f64, v);
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+    }
+    const mean: f64 = sum / @as(f64, @floatFromInt(hidden));
+    const norm: f64 = @sqrt(sum_sq);
+
+    try out.print("token_id {d} embedding (hidden={d}):\n  first 8: [", .{ token_id, hidden });
+    for (buf[0..8], 0..) |v, i| {
+        if (i > 0) try out.writeAll(", ");
+        try out.print("{d:.5}", .{v});
+    }
+    try out.writeAll("]\n  last 4:  [");
+    for (buf[hidden - 4 .. hidden], 0..) |v, i| {
+        if (i > 0) try out.writeAll(", ");
+        try out.print("{d:.5}", .{v});
+    }
+    try out.print("]\n  stats:   min={d:.5} max={d:.5} mean={d:.6} L2norm={d:.4}\n", .{ mn, mx, mean, norm });
+    try out.flush();
+}
+
 fn runGemma4Config(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -554,7 +636,17 @@ fn runGemma4Config(
     try out.print("  n_kv_heads:  {d}\n", .{model.config.n_kv_heads});
     try out.print("  head_dim:    {d}\n", .{model.config.head_dim});
     try out.print("  ple_dim:     {d}\n", .{model.config.ple_dim});
-    try out.print("  vocab_size:  {d}  (0 = not yet derived from embedder section)\n", .{model.config.vocab_size});
+    try out.print("  vocab_size:  {d}\n", .{model.config.vocab_size});
+    if (model.embedder) |emb| {
+        try out.print("  embedder:    {s} shape=[", .{emb.dtype.name()});
+        for (emb.shape, 0..) |d, i| {
+            if (i > 0) try out.writeByte(',');
+            try out.print("{d}", .{d});
+        }
+        try out.print("] data={d} bytes\n", .{emb.data.len});
+    } else {
+        try out.writeAll("  embedder:    (not found)\n");
+    }
     try out.writeAll("  ffn_dim per layer:\n    ");
     for (model.config.ffn_dim_per_layer, 0..) |d, i| {
         if (i > 0) try out.writeByte(' ');

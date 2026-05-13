@@ -82,9 +82,16 @@ pub const Gemma4Model = struct {
     config: Gemma4Config,
     /// Per-layer weights. `layers.len == config.n_layers`.
     layers: []Gemma4Layer,
+    /// Text embedding lookup table (INT2 per-row, shape [vocab, hidden]).
+    /// Null if no embedder section was found.
+    embedder: ?*const tflite.Tensor = null,
     /// Underlying TFLite Model for the decoder section. Kept alive so
     /// the borrowed tensor pointers stay valid.
     decoder_tfl: tflite.Model,
+    /// Underlying TFLite Model for the embedder section (separate from
+    /// decoder_tfl — embedder lives in its own section). Kept alive
+    /// to anchor the `embedder` pointer.
+    embedder_tfl: ?tflite.Model = null,
     /// Index in `bundle.sections` of the decoder TFLite section.
     decoder_section_idx: usize,
     /// Allocator that owns this struct's growing arrays.
@@ -94,7 +101,39 @@ pub const Gemma4Model = struct {
         self.config.deinit(self.allocator);
         self.allocator.free(self.layers);
         self.decoder_tfl.deinit();
+        if (self.embedder_tfl) |*tfl| tfl.deinit();
         self.* = undefined;
+    }
+
+    /// Decode one row of the INT2 text embedder into FP32. `token_id`
+    /// must be < `config.vocab_size`; `out.len` must equal
+    /// `config.hidden`.
+    pub fn lookupEmbedding(self: *const Gemma4Model, token_id: u32, out: []f32) !void {
+        const t = self.embedder orelse return error.NoEmbedder;
+        if (token_id >= self.config.vocab_size) return error.TokenOutOfRange;
+        if (out.len != self.config.hidden) return error.ShapeMismatch;
+
+        const k = self.config.hidden;
+        const row_bytes_per_token = (k + 3) / 4; // INT2 = 4 values per byte
+        const row_off_bytes = @as(usize, token_id) * row_bytes_per_token;
+        const row_bytes = t.data[row_off_bytes .. row_off_bytes + row_bytes_per_token];
+
+        // Per-axis quantization: scales array is `vocab` entries when
+        // quantized_dimension == 0 (per-row). Each row has own scale + zp.
+        const scales = tflite.scalesAsF32(t.scales);
+        const zps = tflite.zeroPointsAsI64(t.zero_points);
+        if (scales.len <= token_id or zps.len <= token_id) return error.ShapeMismatch;
+
+        const scale = scales[token_id];
+        const zp = zps[token_id];
+
+        const tflite_int4 = @import("../kernels/tflite_int4.zig");
+        var col: usize = 0;
+        while (col < k) : (col += 1) {
+            const v: i32 = tflite_int4.unpackInt2(row_bytes, col);
+            const centered: i32 = v - @as(i32, @intCast(zp));
+            out[col] = @as(f32, @floatFromInt(centered)) * scale;
+        }
     }
 };
 
@@ -216,10 +255,40 @@ pub fn initFromLitertlm(
             0;
     }
 
-    // Vocab size has to come from outside the decoder section (text
-    // embedder lives in section 2 or 3). For now leave at 0 — caller
-    // can fill it in from LlmMetadata or the embedder section's shape.
-    const vocab_size: u32 = 0;
+    // Find the text embedder. Look for a tensor whose name contains
+    // "embedder.lookup_embedding_table" (Gemma 4 convention) with the
+    // largest data — the actual lookup table, not metadata. Lives in a
+    // different TFLite section than the decoder (section 2 in E2B).
+    var embedder_section_idx: ?usize = null;
+    var embedder_tfl_opt: ?tflite.Model = null;
+    var embedder_tensor: ?*const tflite.Tensor = null;
+    var vocab_size: u32 = 0;
+
+    for (bundle.sections, 0..) |s, sec_i| {
+        if (s.data_type != .tflite_model) continue;
+        if (sec_i == sec_idx) continue; // decoder section, not embedder
+        const bytes = bundle.sectionBytes(s) catch continue;
+        var tfl = tflite.Model.init(allocator, bytes) catch continue;
+        var best_tensor: ?*const tflite.Tensor = null;
+        var best_size: usize = 0;
+        for (tfl.tensors) |*t| {
+            if (t.data.len == 0) continue;
+            if (std.mem.indexOf(u8, t.name, "embedder.lookup_embedding_table") == null) continue;
+            if (std.mem.indexOf(u8, t.name, "per_layer") != null) continue; // skip the per-layer embedder
+            if (t.data.len > best_size) {
+                best_size = t.data.len;
+                best_tensor = t;
+            }
+        }
+        if (best_tensor) |t| {
+            embedder_section_idx = sec_i;
+            embedder_tensor = t;
+            if (t.shape.len >= 2) vocab_size = @intCast(t.shape[0]);
+            embedder_tfl_opt = tfl;
+            break;
+        }
+        tfl.deinit();
+    }
 
     return .{
         .config = .{
@@ -233,11 +302,14 @@ pub fn initFromLitertlm(
             .ple_dim = ple_dim,
         },
         .layers = final_layers,
+        .embedder = embedder_tensor,
         .decoder_tfl = decoder_tfl,
+        .embedder_tfl = embedder_tfl_opt,
         .decoder_section_idx = sec_idx,
         .allocator = allocator,
     };
 }
+
 
 // -- tests ----------------------------------------------------------------
 
