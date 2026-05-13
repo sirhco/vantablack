@@ -485,9 +485,53 @@ fn runInspect(
         try out.print("  tokenizer (SentencePiece): {d} bytes\n", .{s.size()});
     }
 
-    // Inference status.
-    try out.writeAll("  inference: TFLite tensor parsing pending — `prompt` not yet supported on .litertlm\n");
+    // TFLite Model section — Phase B partial: enumerate tensors.
+    if (bundle.findSection(.tflite_model)) |s| {
+        const tfl_bytes = try bundle.sectionBytes(s);
+        var tfl_model = vantablack.tflite.Model.init(gpa, tfl_bytes) catch |e| {
+            try out.print("  tflite_model: parse failed ({s})\n", .{@errorName(e)});
+            try out.flush();
+            return;
+        };
+        defer tfl_model.deinit();
+        try out.print("  tflite_model: version={d}, tensors={d}\n", .{ tfl_model.version, tfl_model.tensors.len });
+
+        // Print up to the first 20 tensors with a populated buffer (i.e.
+        // weights, not transient activations). Full dump available via
+        // `--tflite-tensors` later if needed.
+        var shown: usize = 0;
+        for (tfl_model.tensors) |t| {
+            if (t.data.len == 0) continue; // skip activations
+            if (shown == 0) try out.writeAll("    weight tensors (first 20):\n");
+            if (shown >= 20) {
+                try out.print("    ... ({d} more weight tensors)\n", .{tfl_model.tensors.len - shown});
+                break;
+            }
+            shown += 1;
+            try printTensorRow(out, t);
+        }
+    }
+
+    // Inference status — honest about what's missing.
+    try out.writeAll("  inference: TFLite tensor → vantablack model mapping pending (Phase B/C/D — see README roadmap items 19b–d)\n");
     try out.flush();
+}
+
+fn printTensorRow(out: *Io.Writer, t: vantablack.tflite.Tensor) !void {
+    const name_w: usize = 60;
+    var name_buf: [name_w]u8 = undefined;
+    const name = if (t.name.len <= name_w) t.name else blk: {
+        @memcpy(name_buf[0 .. name_w - 3], t.name[0 .. name_w - 3]);
+        @memcpy(name_buf[name_w - 3 ..][0..3], "...");
+        break :blk name_buf[0..name_w];
+    };
+    try out.print("      {s:<60} {s:<10} shape=[", .{ name, t.dtype.name() });
+    for (t.shape, 0..) |d, i| {
+        if (i > 0) try out.writeByte(',');
+        try out.print("{d}", .{d});
+    }
+    const quant_hint: []const u8 = if (t.scales.len > 0) " quantized" else "";
+    try out.print("] data={d} bytes{s}\n", .{ t.data.len, quant_hint });
 }
 
 // ----- HuggingFace / MLX directory mode -----------------------------------

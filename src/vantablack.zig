@@ -8,6 +8,7 @@ pub const hf_loader = @import("core/hf_loader.zig");
 pub const flatbuffer = @import("core/flatbuffer.zig");
 pub const litertlm = @import("core/litertlm.zig");
 pub const llm_metadata = @import("core/llm_metadata.zig");
+pub const tflite = @import("core/tflite.zig");
 pub const kernels = @import("kernels/comptime_gen.zig");
 pub const simd = @import("kernels/simd.zig");
 pub const math = @import("kernels/math.zig");

@@ -543,8 +543,9 @@ worker pool. Use this on shared boxes to reserve cores for other work.
 |--------------------|----------|--------------------------------------------------------------|
 | GGUF v2/v3         | shipped  | llama.cpp standard. Q8_0 + Q4_K + Q5_K + Q6_K + F32/F16/BF16 |
 | HF/MLX directories | shipped  | `mlx-community/*` Llama-family. 4/8-bit MLX kernels.         |
-| `.litertlm` Phase A| shipped  | Header parser + section index + `LlmMetadataProto`. `vantablack inspect` only — inference pending (items 19b–d). |
-| `.litertlm` full   | planned  | TFLite Model section parsing + int4/int8/fp16 kernels needed before forward path runs. |
+| `.litertlm` Phase A| shipped  | Header parser + section index + `LlmMetadataProto`. `vantablack inspect` only. |
+| `.litertlm` Phase B partial | shipped | TFLite tensor enumeration — `inspect` lists weight tensors with shape/dtype/quant. No forward path yet. |
+| `.litertlm` full   | planned  | Tensor → Model mapping (19c) + TFLite int4/int8/fp16 kernels (19d) + bit-equal validation (19e). |
 
 ## Supported models + quantizations
 
@@ -668,18 +669,32 @@ root cause: pure CPU matmul saturates every core. The fixes:
     (Gemma 3 / Gemma 4 / Qwen3 / etc.), Jinja prompt template. CLI:
     `vantablack inspect <model.litertlm>` prints the section table +
     metadata. **Inference path NOT yet wired** — see items 19b–d below.
-19b. **TFLite Model section parser** — *planned*. The `.litertlm`
-     bundle's `TFLiteModel` section is itself a flatbuffer following the
-     TFLite schema (`tflite/schema_generated.fbs`). Need to map TFLite
-     tensor names → vantablack's Llama tensor layout (attn_q, attn_k,
-     ...) and surface them through `TypedTensor`.
-19c. **TFLite int4 / int8 / fp16 dequant + matmul kernels** — *planned*.
-     TFLite quantizes weights with its own layout (per-channel
-     int4/int8 with separate scale/zero arrays). Different from
-     GGUF Q4_K or MLX 4-bit. New kernels: CPU first, then Metal MSL.
-19d. **Forward-path parity vs `litert-lm` reference** — *planned*.
+19b. **TFLite tensor enumeration** — *shipped*. `core/tflite.zig`
+     parses the `TFLiteModel` flatbuffer (`tensorflow/compiler/mlir/lite/schema/schema.fbs`
+     subset): `Model.subgraphs[0].tensors[]` with name, shape, dtype
+     (TensorType enum: FLOAT32/FLOAT16/BFLOAT16/INT4/INT8/UINT8/...),
+     buffer offset/size, and per-axis quantization params
+     (scale / zero_point / quantized_dimension). `vantablack inspect`
+     extends to list weight tensors. Verified on upstream
+     `schema/testdata/test_tok_tfl_llm.litertlm` (15 MB, 78 tensors).
+19c. **TFLite tensor → vantablack model mapping** — *planned*. The
+     enumerated tensors carry MLIR-style names (`arith.constant`,
+     `arith.constant5`, ...) rather than semantic Llama names. Building
+     the `Model.initFromTflite()` path requires either: (a) operator
+     graph analysis to back-derive Q/K/V/FFN role from how each
+     constant is consumed, or (b) relying on `LlmMetadataProto` /
+     vendor-specific name conventions in `litert-community/*` Gemma
+     bundles. Both need a real Gemma 4 `.litertlm` to validate against.
+19d. **TFLite int4 / int8 / fp16 dequant + matmul kernels** — *planned*.
+     TFLite quantizes weights with its own per-axis int8/int4 layout
+     (separate scale/zero_point arrays, `quantized_dimension` selects
+     the axis). Different from GGUF Q4_K block-quant and MLX 4-bit
+     affine. New kernels: CPU first, then Metal MSL. Needs Phase 19c
+     wiring before the kernel choice can be tested end-to-end.
+19e. **Forward-path parity vs `litert-lm` reference** — *planned*.
      Bit-equal generation on `litert-community/gemma-4-E4B-it-litert-lm`
-     against Google's official runtime, same prompt + seed.
+     against Google's official runtime, same prompt + seed. Final gate
+     for declaring `.litertlm` support production-ready.
 
 Items 8 + 9 + 10 are the next perf pushes; items 18 + a C-ABI shim
 unlock real iOS app integration. Item 7's negative result shifted the

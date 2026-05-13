@@ -220,6 +220,51 @@ pub const Vector = struct {
         if (i >= self.len) return error.OutOfBounds;
         return self.buf.readU8(self.data_off + i);
     }
+
+    /// Read element `i` as an inline i8.
+    pub fn i8At(self: Vector, i: u32) Error!i8 {
+        if (i >= self.len) return error.OutOfBounds;
+        return @bitCast(try self.buf.readU8(self.data_off + i));
+    }
+
+    /// Read element `i` as an inline i32 little-endian.
+    pub fn i32At(self: Vector, i: u32) Error!i32 {
+        if (i >= self.len) return error.OutOfBounds;
+        return self.buf.readI32(self.data_off + i * 4);
+    }
+
+    /// Read element `i` as an inline u32 little-endian.
+    pub fn u32At(self: Vector, i: u32) Error!u32 {
+        if (i >= self.len) return error.OutOfBounds;
+        return self.buf.readU32(self.data_off + i * 4);
+    }
+
+    /// Read element `i` as an inline f32 little-endian.
+    pub fn f32At(self: Vector, i: u32) Error!f32 {
+        if (i >= self.len) return error.OutOfBounds;
+        const bits = try self.buf.readU32(self.data_off + i * 4);
+        return @bitCast(bits);
+    }
+
+    /// Read element `i` as an inline u64 little-endian.
+    pub fn u64At(self: Vector, i: u32) Error!u64 {
+        if (i >= self.len) return error.OutOfBounds;
+        return self.buf.readU64(self.data_off + i * 8);
+    }
+
+    /// Read element `i` as an inline i64 little-endian.
+    pub fn i64At(self: Vector, i: u32) Error!i64 {
+        if (i >= self.len) return error.OutOfBounds;
+        return @bitCast(try self.buf.readU64(self.data_off + i * 8));
+    }
+
+    /// Raw byte slice covering all elements. Convenience for `[ubyte]` /
+    /// `[byte]` vectors where the caller wants the whole payload at once.
+    pub fn bytes(self: Vector) Error![]const u8 {
+        const end: usize = @as(usize, self.data_off) + @as(usize, self.len);
+        if (end > self.buf.bytes.len) return error.OutOfBounds;
+        return self.buf.bytes[self.data_off..end];
+    }
 };
 
 // -- tests ----------------------------------------------------------------
