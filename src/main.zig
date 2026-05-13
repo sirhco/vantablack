@@ -1080,7 +1080,22 @@ fn runTraceTensor(
         if (i > 0) try out.writeByte(',');
         try out.print("{d}", .{d});
     }
-    try out.print("] data={d} bytes\n  name: {s}\n\n", .{ t.data.len, t.name });
+    try out.print("] data={d} bytes\n  name: {s}\n", .{ t.data.len, t.name });
+
+    // Dump FP32 values: full when small (≤32), first 16 otherwise.
+    if (t.dtype == .float32 and t.data.len >= @sizeOf(f32)) {
+        const n_f: usize = t.data.len / @sizeOf(f32);
+        const f: []const f32 = @as([*]const f32, @ptrCast(@alignCast(t.data.ptr)))[0..n_f];
+        const n_show: usize = if (n_f <= 32) n_f else 16;
+        try out.writeAll("  values: ");
+        for (f[0..n_show], 0..) |v, i| {
+            if (i > 0) try out.writeByte(' ');
+            try out.print("{d}", .{v});
+        }
+        if (n_show < n_f) try out.print(" … ({d} more)", .{n_f - n_show});
+        try out.writeByte('\n');
+    }
+    try out.writeByte('\n');
 
     // Walk operators. For each, look in inputs[] and outputs[].
     var n_producers: usize = 0;
