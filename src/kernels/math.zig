@@ -31,6 +31,30 @@ pub fn rmsNorm(x: []f32, weight: []const f32, eps: f32) void {
     while (i < x.len) : (i += 1) x[i] = x[i] * inv * weight[i];
 }
 
+/// In-place unit RMSNorm: x[i] = x[i] / rms(x). No learned per-feature
+/// weight; equivalent to `rmsNorm` with weight = [1, 1, ..., 1]. Useful
+/// when the model's RMSNorm scales aren't available as separate tensors
+/// (e.g. fused into adjacent matmul scales or shared globally).
+pub fn rmsNormUnit(x: []f32, eps: f32) void {
+    var ss_acc: Vec = @splat(0.0);
+    var i: usize = 0;
+    while (i + lane <= x.len) : (i += lane) {
+        const v: Vec = x[i..][0..lane].*;
+        ss_acc += v * v;
+    }
+    var ss: f32 = @reduce(.Add, ss_acc);
+    while (i < x.len) : (i += 1) ss += x[i] * x[i];
+
+    const inv = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(x.len)) + eps);
+
+    i = 0;
+    while (i + lane <= x.len) : (i += lane) {
+        const v: Vec = x[i..][0..lane].*;
+        x[i..][0..lane].* = v * @as(Vec, @splat(inv));
+    }
+    while (i < x.len) : (i += 1) x[i] *= inv;
+}
+
 /// In-place RoPE on `x` of length `head_dim`, for the given absolute position.
 /// Standard interleaved-pair rotation: (x[2i], x[2i+1]) ← rotate by theta_i*pos
 /// where theta_i = 1 / base^(2i/head_dim).

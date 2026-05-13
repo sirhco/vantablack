@@ -347,28 +347,35 @@ pub const Gemma4Model = struct {
         @memset(cached_k, 0);
         @memset(cached_v, 0);
 
+        const rms_eps: f32 = 1.0e-6;
+        // Scratch for the pre-projection normalised hidden state. Keeps
+        // the residual stream in `hidden_out` untouched while
+        // projecting Q/K/V/MLP off a normalised copy.
+        const h_norm = try allocator.alloc(f32, self.config.hidden);
+        defer allocator.free(h_norm);
+
         var layer_idx: usize = 0;
         while (layer_idx < self.layers.len) : (layer_idx += 1) {
             const layer = self.layers[layer_idx];
             // Per-layer attention shapes.
             const q_dim_l: usize = @intCast(layer.q.shape[0]);
             const n_q_l: usize = q_dim_l / head_dim;
-            // KV dim: if this layer owns K/V, use its own shape; else
-            // keep the previously cached buffer's size implicit via
-            // `n_kv_l` derived from config (KV-shared layers reuse a
-            // table written by an upstream layer with the same shape).
             const n_kv_l: usize = if (layer.k) |k_t|
                 @as(usize, @intCast(k_t.shape[0])) / head_dim
             else
                 self.config.n_kv_heads;
 
+            // Pre-attention norm (unit RMSNorm — no learned scale yet).
+            @memcpy(h_norm, hidden_out);
+            math.rmsNormUnit(h_norm, rms_eps);
+
             const q_slice = q[0..q_dim_l];
-            try self.projectQ(hidden_out, layer_idx, q_slice);
+            try self.projectQ(h_norm, layer_idx, q_slice);
             if (layer.k != null) {
                 const k_slice = cached_k[0 .. n_kv_l * head_dim];
                 const v_slice = cached_v[0 .. n_kv_l * head_dim];
-                try self.projectK(hidden_out, layer_idx, k_slice);
-                try self.projectV(hidden_out, layer_idx, v_slice);
+                try self.projectK(h_norm, layer_idx, k_slice);
+                try self.projectV(h_norm, layer_idx, v_slice);
             }
             // RoPE on Q + K (K only when freshly projected — once
             // cached, it's already rotated for pos 0).
@@ -393,12 +400,16 @@ pub const Gemma4Model = struct {
             try self.projectAttnO(attn_in_slice, layer_idx, attn_out);
             math.addInto(hidden_out, attn_out);
 
+            // Pre-MLP norm.
+            @memcpy(h_norm, hidden_out);
+            math.rmsNormUnit(h_norm, rms_eps);
+
             // MLP block (uses per-layer FFN dim).
             const ffn = self.config.ffn_dim_per_layer[layer_idx];
             const gate_slice = gate[0..ffn];
             const up_slice = up[0..ffn];
-            try self.projectMlpGate(hidden_out, layer_idx, gate_slice);
-            try self.projectMlpUp(hidden_out, layer_idx, up_slice);
+            try self.projectMlpGate(h_norm, layer_idx, gate_slice);
+            try self.projectMlpUp(h_norm, layer_idx, up_slice);
             math.swiglu(gate_slice, up_slice);
             try self.projectMlpDown(gate_slice, layer_idx, ffn_out);
             math.addInto(hidden_out, ffn_out);
