@@ -912,6 +912,16 @@ fn runGemma4Config(
     } else {
         try out.writeAll("  embedder:    (not found)\n");
     }
+    if (model.lm_head) |lh| {
+        try out.print("  lm_head:     {s} shape=[", .{lh.dtype.name()});
+        for (lh.shape, 0..) |d, i| {
+            if (i > 0) try out.writeByte(',');
+            try out.print("{d}", .{d});
+        }
+        try out.print("] data={d} bytes (dedicated decode embedder)\n", .{lh.data.len});
+    } else {
+        try out.writeAll("  lm_head:     (weight-tied to embedder)\n");
+    }
     try out.writeAll("  ffn_dim per layer:\n    ");
     for (model.config.ffn_dim_per_layer, 0..) |d, i| {
         if (i > 0) try out.writeByte(' ');

@@ -5,7 +5,9 @@ gemma4 config (decoder = section[10]):
   n_kv_heads:  2
   head_dim:    128
   ple_dim:     256
-  vocab_size:  0  (0 = not yet derived from embedder section)
+  vocab_size:  262144
+  embedder:    INT2 shape=[262144,1536] data=100663296 bytes
+  lm_head:     INT2 shape=[262144,1536] data=100663296 bytes (dedicated decode embedder)
   ffn_dim per layer:
     6144 6144 6144 6144 6144 6144 6144 6144 6144 6144 6144 6144 6144 6144 6144 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288
 

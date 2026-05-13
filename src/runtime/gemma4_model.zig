@@ -83,8 +83,13 @@ pub const Gemma4Model = struct {
     /// Per-layer weights. `layers.len == config.n_layers`.
     layers: []Gemma4Layer,
     /// Text embedding lookup table (INT2 per-row, shape [vocab, hidden]).
-    /// Null if no embedder section was found.
+    /// Null if no embedder section was found. Used for token → hidden.
     embedder: ?*const tflite.Tensor = null,
+    /// Decode-time embedder ("LM head"). Same shape as `embedder` but
+    /// lives in the decoder section and may carry distinct per-row
+    /// quantization scales tuned for hidden → vocab projection.
+    /// Falls back to `embedder` (weight tying) when absent.
+    lm_head: ?*const tflite.Tensor = null,
     /// Underlying TFLite Model for the decoder section. Kept alive so
     /// the borrowed tensor pointers stay valid.
     decoder_tfl: tflite.Model,
@@ -416,15 +421,14 @@ pub const Gemma4Model = struct {
         }
     }
 
-    /// LM head via embedder weight-tying. Computes vocab-size logits
-    /// from the post-stack hidden state by multiplying through the
-    /// (transposed) INT2 embedder table. Many Gemma variants tie LM
-    /// head to embedding weights; if Gemma 4 uses a distinct LM head,
-    /// substitute that tensor here.
+    /// LM head: computes vocab-size logits from the post-stack hidden
+    /// state. Uses `lm_head` (Gemma 4's dedicated decode-time embedder
+    /// living inside the decoder section) when present; falls back to
+    /// the section-2 `embedder` table (weight tying) otherwise.
     ///
     /// `hidden.len == config.hidden`; `logits.len == config.vocab_size`.
     pub fn lmHead(self: *const Gemma4Model, hidden: []const f32, logits: []f32) !void {
-        const t = self.embedder orelse return error.NoEmbedder;
+        const t = self.lm_head orelse self.embedder orelse return error.NoEmbedder;
         if (hidden.len != self.config.hidden) return error.ShapeMismatch;
         if (logits.len != self.config.vocab_size) return error.ShapeMismatch;
         const m: usize = @intCast(t.shape[0]); // vocab
@@ -627,6 +631,23 @@ pub fn initFromLitertlm(
             0;
     }
 
+    // Discover the LM head: `decode_softmax/.../embedder.decode/composite`
+    // lives inside the decoder section itself. Distinct from the
+    // section-2 `lookup_embedding_table`. Both are [vocab, hidden]
+    // INT2 but may carry different per-row scales.
+    var lm_head_tensor: ?*const tflite.Tensor = null;
+    {
+        var best_size: usize = 0;
+        for (decoder_tfl.tensors) |*t| {
+            if (t.data.len == 0) continue;
+            if (std.mem.indexOf(u8, t.name, "embedder.decode") == null) continue;
+            if (t.data.len > best_size) {
+                best_size = t.data.len;
+                lm_head_tensor = t;
+            }
+        }
+    }
+
     // Find the text embedder. Look for a tensor whose name contains
     // "embedder.lookup_embedding_table" (Gemma 4 convention) with the
     // largest data — the actual lookup table, not metadata. Lives in a
@@ -675,6 +696,7 @@ pub fn initFromLitertlm(
         },
         .layers = final_layers,
         .embedder = embedder_tensor,
+        .lm_head = lm_head_tensor,
         .decoder_tfl = decoder_tfl,
         .embedder_tfl = embedder_tfl_opt,
         .decoder_section_idx = sec_idx,
