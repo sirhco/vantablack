@@ -1,0 +1,13 @@
+gemma4 config (decoder = section[10]):
+  hidden:      1536
+  n_layers:    35
+  n_q_heads:   16
+  n_kv_heads:  2
+  head_dim:    128
+  ple_dim:     256
+  vocab_size:  0  (0 = not yet derived from embedder section)
+  ffn_dim per layer:
+    6144 6144 6144 6144 6144 6144 6144 6144 6144 6144 6144 6144 6144 6144 6144 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288 12288
+
+  KV layout: 15 layers carry own K/V, 20 layers share from a neighbour
+  RoPE: 2 layers ship own inv_freq table; remaining share globally

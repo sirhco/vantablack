@@ -14,6 +14,7 @@ const usage =
     \\  vantablack inspect-section <m.litertlm> <idx>       deep-dump tensors + operator graph of one TFLite section
     \\  vantablack scan-layers <model.litertlm>             classify decoder weights by layer + role (Phase 19c foundation)
     \\  vantablack trace-tensor <m.litertlm> <sec> <t_idx>  find ops that produce/consume a given TFLite tensor
+    \\  vantablack gemma4-config <m.litertlm>               load a Gemma 4 .litertlm into Gemma4Model + print inferred config
     \\  vantablack tokenize-litertlm <m.litertlm> <text>    encode text using HF tokenizer embedded in a .litertlm
     \\
     \\generate / prompt / chat accept sampler flags BEFORE the n value:
@@ -59,6 +60,20 @@ pub fn main(init: std.process.Init) !void {
             return error.MissingArgs;
         }
         try runTokenizeLitertlm(gpa, arena, io, args[2], args[3], out, err);
+        return;
+    }
+
+    // gemma4-config <model.litertlm>: load a Gemma 4 .litertlm into the
+    // Gemma4Model struct + print the inferred config. Proves the
+    // bundle → Model binding works end-to-end without running
+    // inference yet (Phase 19c integration test).
+    if (std.mem.eql(u8, args[1], "gemma4-config")) {
+        if (args.len < 3) {
+            try err.writeAll("usage: vantablack gemma4-config <model.litertlm>\n");
+            try err.flush();
+            return error.MissingArgs;
+        }
+        try runGemma4Config(gpa, arena, io, args[2], out, err);
         return;
     }
 
@@ -501,6 +516,61 @@ fn runTokenizeLitertlm(
         try out.print("{d}", .{id});
     }
     try out.writeByte('\n');
+    try out.flush();
+}
+
+fn runGemma4Config(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: Io,
+    input_path: []const u8,
+    out: *Io.Writer,
+    err: *Io.Writer,
+) !void {
+    _ = err;
+    const abs_path = if (std.fs.path.isAbsolute(input_path))
+        try arena.dupe(u8, input_path)
+    else blk: {
+        const cwd = try std.process.currentPathAlloc(io, arena);
+        break :blk try std.fs.path.resolve(arena, &.{ cwd, input_path });
+    };
+    const file = try Io.Dir.openFileAbsolute(io, abs_path, .{ .allow_directory = false });
+    defer file.close(io);
+    const len = try file.length(io);
+    const len_us: usize = std.math.cast(usize, len) orelse return error.FileTooLarge;
+    const mapped = try std.posix.mmap(null, len_us, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    defer std.posix.munmap(mapped);
+
+    var bundle = try vantablack.litertlm.Bundle.init(gpa, mapped);
+    defer bundle.deinit();
+
+    var model = try vantablack.gemma4_model.initFromLitertlm(gpa, &bundle);
+    defer model.deinit();
+
+    try out.print("gemma4 config (decoder = section[{d}]):\n", .{model.decoder_section_idx});
+    try out.print("  hidden:      {d}\n", .{model.config.hidden});
+    try out.print("  n_layers:    {d}\n", .{model.config.n_layers});
+    try out.print("  n_q_heads:   {d}\n", .{model.config.n_q_heads});
+    try out.print("  n_kv_heads:  {d}\n", .{model.config.n_kv_heads});
+    try out.print("  head_dim:    {d}\n", .{model.config.head_dim});
+    try out.print("  ple_dim:     {d}\n", .{model.config.ple_dim});
+    try out.print("  vocab_size:  {d}  (0 = not yet derived from embedder section)\n", .{model.config.vocab_size});
+    try out.writeAll("  ffn_dim per layer:\n    ");
+    for (model.config.ffn_dim_per_layer, 0..) |d, i| {
+        if (i > 0) try out.writeByte(' ');
+        try out.print("{d}", .{d});
+    }
+    try out.writeByte('\n');
+
+    var kv_owned: usize = 0;
+    var kv_shared: usize = 0;
+    var rope_owned: usize = 0;
+    for (model.layers) |layer| {
+        if (layer.k != null) kv_owned += 1 else kv_shared += 1;
+        if (layer.rope_inv_freq != null) rope_owned += 1;
+    }
+    try out.print("\n  KV layout: {d} layers carry own K/V, {d} layers share from a neighbour\n", .{ kv_owned, kv_shared });
+    try out.print("  RoPE: {d} layers ship own inv_freq table; remaining share globally\n", .{rope_owned});
     try out.flush();
 }
 
