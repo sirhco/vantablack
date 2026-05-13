@@ -105,27 +105,94 @@ pub const Gemma4Model = struct {
         self.* = undefined;
     }
 
-    /// Project hidden state through layer `layer_idx`'s Q matrix.
-    /// `hidden_in.len == config.hidden`; `q_out.len == n_q_heads * head_dim`.
-    /// Uses the per-row INT4 fused GEMV kernel against the borrowed Q
-    /// tensor. Per-axis quantization scales include any pre-projection
-    /// RMSNorm fold (TFLite optimization).
-    pub fn projectQ(self: *const Gemma4Model, hidden_in: []const f32, layer_idx: usize, q_out: []f32) !void {
-        if (layer_idx >= self.layers.len) return error.LayerOutOfRange;
-        if (hidden_in.len != self.config.hidden) return error.ShapeMismatch;
-        const layer = self.layers[layer_idx];
-        const t = layer.q;
-        const m: usize = @intCast(t.shape[0]); // n_q_heads * head_dim
-        const k: usize = @intCast(t.shape[1]); // hidden
-        if (q_out.len != m) return error.ShapeMismatch;
-        if (k != hidden_in.len) return error.ShapeMismatch;
-
+    /// Generic INT4-per-row GEMV against a borrowed weight tensor.
+    /// Used by all the per-layer projection helpers below.
+    fn projectInt4(t: *const tflite.Tensor, x: []const f32, y: []f32) !void {
+        if (t.shape.len < 2) return error.ShapeMismatch;
+        const m: usize = @intCast(t.shape[0]);
+        const k: usize = @intCast(t.shape[1]);
+        if (y.len != m or x.len != k) return error.ShapeMismatch;
         const scales = tflite.scalesAsF32(t.scales);
         const zps = tflite.zeroPointsAsI64(t.zero_points);
         if (scales.len < m or zps.len < m) return error.ShapeMismatch;
-
         const tflite_int4 = @import("../kernels/tflite_int4.zig");
-        try tflite_int4.gemvInt4PerRow(t.data, scales, zps, hidden_in, q_out, m, k);
+        try tflite_int4.gemvInt4PerRow(t.data, scales, zps, x, y, m, k);
+    }
+
+    /// Q projection. `q_out.len == n_q_heads * head_dim`.
+    pub fn projectQ(self: *const Gemma4Model, hidden_in: []const f32, layer_idx: usize, q_out: []f32) !void {
+        if (layer_idx >= self.layers.len) return error.LayerOutOfRange;
+        try projectInt4(self.layers[layer_idx].q, hidden_in, q_out);
+    }
+
+    /// K projection. Returns error.NoOwnK on layers that share K from
+    /// a neighbouring full-attention layer (15..34 in Gemma 4 E2B).
+    /// `k_out.len == n_kv_heads * head_dim`.
+    pub fn projectK(self: *const Gemma4Model, hidden_in: []const f32, layer_idx: usize, k_out: []f32) !void {
+        if (layer_idx >= self.layers.len) return error.LayerOutOfRange;
+        const t = self.layers[layer_idx].k orelse return error.NoOwnK;
+        try projectInt4(t, hidden_in, k_out);
+    }
+
+    pub fn projectV(self: *const Gemma4Model, hidden_in: []const f32, layer_idx: usize, v_out: []f32) !void {
+        if (layer_idx >= self.layers.len) return error.LayerOutOfRange;
+        const t = self.layers[layer_idx].v orelse return error.NoOwnV;
+        try projectInt4(t, hidden_in, v_out);
+    }
+
+    /// Output projection. `attn_in.len == n_q_heads * head_dim`,
+    /// `hidden_out.len == config.hidden`.
+    pub fn projectAttnO(self: *const Gemma4Model, attn_in: []const f32, layer_idx: usize, hidden_out: []f32) !void {
+        if (layer_idx >= self.layers.len) return error.LayerOutOfRange;
+        try projectInt4(self.layers[layer_idx].attn_o, attn_in, hidden_out);
+    }
+
+    /// MLP gate projection. `hidden_in.len == hidden`,
+    /// `gate_out.len == ffn_dim_per_layer[layer_idx]`.
+    pub fn projectMlpGate(self: *const Gemma4Model, hidden_in: []const f32, layer_idx: usize, gate_out: []f32) !void {
+        if (layer_idx >= self.layers.len) return error.LayerOutOfRange;
+        try projectInt4(self.layers[layer_idx].mlp_gate, hidden_in, gate_out);
+    }
+
+    pub fn projectMlpUp(self: *const Gemma4Model, hidden_in: []const f32, layer_idx: usize, up_out: []f32) !void {
+        if (layer_idx >= self.layers.len) return error.LayerOutOfRange;
+        try projectInt4(self.layers[layer_idx].mlp_up, hidden_in, up_out);
+    }
+
+    /// MLP down projection. `gated_in.len == ffn`, `hidden_out.len == hidden`.
+    pub fn projectMlpDown(self: *const Gemma4Model, gated_in: []const f32, layer_idx: usize, hidden_out: []f32) !void {
+        if (layer_idx >= self.layers.len) return error.LayerOutOfRange;
+        try projectInt4(self.layers[layer_idx].mlp_down, gated_in, hidden_out);
+    }
+
+    /// Per-Layer Embedding gate projection. INT8 (not INT4) per-row.
+    /// `hidden_in.len == hidden`, `gate_out.len == ple_dim`.
+    pub fn projectPleGate(self: *const Gemma4Model, hidden_in: []const f32, layer_idx: usize, gate_out: []f32) !void {
+        if (layer_idx >= self.layers.len) return error.LayerOutOfRange;
+        const t = self.layers[layer_idx].ple_gate;
+        try projectInt8Generic(t, hidden_in, gate_out);
+    }
+
+    /// Per-Layer Embedding projection back into hidden width.
+    /// `ple_in.len == ple_dim`, `hidden_out.len == hidden`.
+    pub fn projectPleProj(self: *const Gemma4Model, ple_in: []const f32, layer_idx: usize, hidden_out: []f32) !void {
+        if (layer_idx >= self.layers.len) return error.LayerOutOfRange;
+        const t = self.layers[layer_idx].ple_proj;
+        try projectInt8Generic(t, ple_in, hidden_out);
+    }
+
+    fn projectInt8Generic(t: *const tflite.Tensor, x: []const f32, y: []f32) !void {
+        if (t.shape.len < 2) return error.ShapeMismatch;
+        const m: usize = @intCast(t.shape[0]);
+        const k: usize = @intCast(t.shape[1]);
+        if (y.len != m or x.len != k) return error.ShapeMismatch;
+        const scales = tflite.scalesAsF32(t.scales);
+        const zps = tflite.zeroPointsAsI64(t.zero_points);
+        if (scales.len < m or zps.len < m) return error.ShapeMismatch;
+        // PLE tensors are INT8; reinterpret the raw bytes.
+        const weights: []const i8 = @as([*]const i8, @ptrCast(t.data.ptr))[0..t.data.len];
+        const tflite_int4 = @import("../kernels/tflite_int4.zig");
+        try tflite_int4.gemvInt8PerRow(weights, scales, zps, x, y, m, k);
     }
 
     /// Decode one row of the INT2 text embedder into FP32. `token_id`

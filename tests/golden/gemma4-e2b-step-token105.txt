@@ -1,4 +1,11 @@
 stage 1: embed lookup (token 105)
   hidden[1536]  min=-0.05577  max=0.02789  mean=-0.001761  L2=0.9712  first3=[0.02789,-0.02789,-0.02789]
-stage 2: layer_0 Q projection
+stage 2: layer_0 attention projections
   q_out[2048]  min=-0.49252  max=0.60675  mean=0.000895  L2=1.9709  first3=[0.01518,0.02749,0.02039]
+  k_out[256]  min=-0.12093  max=0.17296  mean=0.001321  L2=0.6282  first3=[0.12608,-0.08070,0.00346]
+  v_out[256]  min=-0.10449  max=0.10736  mean=0.002089  L2=0.6066  first3=[-0.03066,-0.06295,-0.01842]
+stage 3: layer_0 MLP gate + up
+  gate[6144]  min=-0.10454  max=0.16333  mean=-0.001772  L2=2.1197  first3=[-0.03266,0.05377,-0.01155]
+  up  [6144]  min=-0.15290  max=0.14909  mean=0.000452  L2=2.0965  first3=[0.02391,0.01934,-0.02147]
+stage 4: layer_0 PLE gate
+  ple_gate[256]  min=-0.00242  max=0.00292  mean=0.000005  L2=0.0106  first3=[-0.00023,0.00016,0.00045]

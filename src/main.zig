@@ -579,20 +579,48 @@ fn runGemma4Step(
     defer model.deinit();
 
     const hidden = model.config.hidden;
-    const q_out_dim: usize = @as(usize, model.config.n_q_heads) * model.config.head_dim;
+    const q_dim: usize = @as(usize, model.config.n_q_heads) * model.config.head_dim;
+    const kv_dim: usize = @as(usize, model.config.n_kv_heads) * model.config.head_dim;
+    const ffn_dim: usize = model.config.ffn_dim_per_layer[0];
+    const ple_dim: usize = model.config.ple_dim;
 
     const h = try gpa.alloc(f32, hidden);
     defer gpa.free(h);
-    const q = try gpa.alloc(f32, q_out_dim);
+    const q = try gpa.alloc(f32, q_dim);
     defer gpa.free(q);
+    const k = try gpa.alloc(f32, kv_dim);
+    defer gpa.free(k);
+    const v = try gpa.alloc(f32, kv_dim);
+    defer gpa.free(v);
+    const gate = try gpa.alloc(f32, ffn_dim);
+    defer gpa.free(gate);
+    const up = try gpa.alloc(f32, ffn_dim);
+    defer gpa.free(up);
+    const ple_gate_out = try gpa.alloc(f32, ple_dim);
+    defer gpa.free(ple_gate_out);
 
     try out.print("stage 1: embed lookup (token {d})\n", .{token_id});
     try model.lookupEmbedding(token_id, h);
     try summarize(out, "  hidden", h);
 
-    try out.writeAll("stage 2: layer_0 Q projection\n");
+    try out.writeAll("stage 2: layer_0 attention projections\n");
     try model.projectQ(h, 0, q);
     try summarize(out, "  q_out", q);
+    try model.projectK(h, 0, k);
+    try summarize(out, "  k_out", k);
+    try model.projectV(h, 0, v);
+    try summarize(out, "  v_out", v);
+
+    try out.writeAll("stage 3: layer_0 MLP gate + up\n");
+    try model.projectMlpGate(h, 0, gate);
+    try summarize(out, "  gate", gate);
+    try model.projectMlpUp(h, 0, up);
+    try summarize(out, "  up  ", up);
+
+    try out.writeAll("stage 4: layer_0 PLE gate\n");
+    try model.projectPleGate(h, 0, ple_gate_out);
+    try summarize(out, "  ple_gate", ple_gate_out);
+
     try out.flush();
 }
 
