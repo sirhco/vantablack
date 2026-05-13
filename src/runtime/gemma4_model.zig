@@ -988,7 +988,7 @@ math.gegluApprox(gate, up);
     /// Apply the final RMSNorm to the post-stack hidden state. Uses
     /// the learned `final_norm` scale (1+w convention) when present;
     /// falls back to unit RMSNorm.
-    fn applyFinalNorm(self: *const Gemma4Model, hidden: []f32) void {
+    pub fn applyFinalNorm(self: *const Gemma4Model, hidden: []f32) void {
         const math = @import("../kernels/math.zig");
         if (self.final_norm) |w_t| {
             const w_f32: []const f32 = @as([*]const f32, @ptrCast(@alignCast(w_t.data.ptr)))[0..self.config.hidden];
@@ -1010,7 +1010,7 @@ math.gegluApprox(gate, up);
     /// Monotonic in logits[i] (tanh is monotonic, cap > 0) so this
     /// does not change argmax, but it matters for temperature/top-k
     /// sampling and for matching the reference runtime numerically.
-    fn applyFinalSoftCap(self: *const Gemma4Model, logits: []f32) void {
+    pub fn applyFinalSoftCap(self: *const Gemma4Model, logits: []f32) void {
         const cap = self.final_logit_soft_cap;
         if (cap <= 0.0) return;
         const inv = 1.0 / cap;

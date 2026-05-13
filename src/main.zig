@@ -21,6 +21,7 @@ const usage =
     \\  vantablack gemma4-forward <m.litertlm> <token_id>   full single-token forward through ALL 35 layers
     \\  vantablack gemma4-predict <m.litertlm> <token_id>   forward + LM head + argmax → next-token id
     \\  vantablack gemma4-generate <m.litertlm> <N> <ids…>  multi-token greedy generation (KV cache)
+    \\  vantablack gemma4-trace-decode <m.litertlm> <N> <ids…>  per-position diagnostic: hidden L2 + top-5 logits
     \\  vantablack tokenize-litertlm <m.litertlm> <text>    encode text using HF tokenizer embedded in a .litertlm
     \\
     \\generate / prompt / chat accept sampler flags BEFORE the n value:
@@ -80,6 +81,21 @@ pub fn main(init: std.process.Init) !void {
         }
         const n_new = try std.fmt.parseInt(usize, args[3], 10);
         try runGemma4Generate(gpa, arena, io, args[2], n_new, args[4..], out, err);
+        return;
+    }
+
+    // gemma4-trace-decode <model.litertlm> <max_new> <token_id> [token_id ...]:
+    // Per-position diagnostic dump for bisecting calibration drift. At
+    // each step prints hidden-state L2 (pre + post final norm) and the
+    // top-5 logits with token IDs + values.
+    if (std.mem.eql(u8, args[1], "gemma4-trace-decode")) {
+        if (args.len < 5) {
+            try err.writeAll("usage: vantablack gemma4-trace-decode <model.litertlm> <max_new> <token_id> [token_id ...]\n");
+            try err.flush();
+            return error.MissingArgs;
+        }
+        const n_new = try std.fmt.parseInt(usize, args[3], 10);
+        try runGemma4TraceDecode(gpa, arena, io, args[2], n_new, args[4..], out, err);
         return;
     }
 
@@ -663,6 +679,107 @@ fn runGemma4Generate(
     try out.writeAll("]\n");
     try out.flush();
 }
+
+fn runGemma4TraceDecode(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: Io,
+    input_path: []const u8,
+    n_new: usize,
+    prompt_args: []const []const u8,
+    out: *Io.Writer,
+    err: *Io.Writer,
+) !void {
+    _ = err;
+    const abs_path = if (std.fs.path.isAbsolute(input_path))
+        try arena.dupe(u8, input_path)
+    else blk: {
+        const cwd = try std.process.currentPathAlloc(io, arena);
+        break :blk try std.fs.path.resolve(arena, &.{ cwd, input_path });
+    };
+    const file = try Io.Dir.openFileAbsolute(io, abs_path, .{ .allow_directory = false });
+    defer file.close(io);
+    const len = try file.length(io);
+    const len_us: usize = std.math.cast(usize, len) orelse return error.FileTooLarge;
+    const mapped = try std.posix.mmap(null, len_us, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    defer std.posix.munmap(mapped);
+
+    var bundle = try vantablack.litertlm.Bundle.init(gpa, mapped);
+    defer bundle.deinit();
+    var model = try vantablack.gemma4_model.initFromLitertlm(gpa, &bundle);
+    defer model.deinit();
+
+    const prompt = try arena.alloc(u32, prompt_args.len);
+    for (prompt_args, 0..) |s, i| prompt[i] = try std.fmt.parseInt(u32, s, 10);
+
+    const max_seq: usize = prompt.len + n_new + 4;
+    var cache = try model.initKvCache(gpa, max_seq);
+    defer cache.deinit();
+
+    const hidden = try gpa.alloc(f32, model.config.hidden);
+    defer gpa.free(hidden);
+    const h_copy = try gpa.alloc(f32, model.config.hidden);
+    defer gpa.free(h_copy);
+    const logits = try gpa.alloc(f32, model.config.vocab_size);
+    defer gpa.free(logits);
+
+    try out.print("gemma4-trace-decode: prompt_len={d} n_new={d}\n\n", .{ prompt.len, n_new });
+
+    var pos: usize = 0;
+    while (pos < prompt.len + n_new) : (pos += 1) {
+        const tid: u32 = if (pos < prompt.len) prompt[pos] else blk: {
+            // Use last-predicted argmax as the next input token.
+            // (Set on the previous iteration.)
+            break :blk last_pred[0];
+        };
+        try model.step(gpa, tid, pos, &cache, hidden);
+
+        // L2 pre-norm.
+        var ss_pre: f32 = 0;
+        for (hidden) |v| ss_pre += v * v;
+        const l2_pre: f32 = @sqrt(ss_pre);
+
+        @memcpy(h_copy, hidden);
+        model.applyFinalNorm(h_copy);
+
+        var ss_post: f32 = 0;
+        for (h_copy) |v| ss_post += v * v;
+        const l2_post: f32 = @sqrt(ss_post);
+
+        try model.lmHead(h_copy, logits);
+        model.applyFinalSoftCap(logits);
+
+        // Top-5 argmax.
+        const TopEntry = struct { tok: u32, v: f32 };
+        var top = [_]TopEntry{.{ .tok = 0, .v = -std.math.floatMax(f32) }} ** 5;
+        for (logits, 0..) |v, i| {
+            if (v > top[4].v) {
+                top[4] = .{ .tok = @intCast(i), .v = v };
+                var j: usize = 4;
+                while (j > 0 and top[j].v > top[j - 1].v) : (j -= 1) {
+                    const tmp = top[j];
+                    top[j] = top[j - 1];
+                    top[j - 1] = tmp;
+                }
+            }
+        }
+        last_pred[0] = top[0].tok;
+
+        const role = if (pos < prompt.len) "prefill" else "decode ";
+        try out.print(
+            "pos={d:>3} {s} in={d:>6} L2_pre={d:.2} L2_post={d:.2} top5=[",
+            .{ pos, role, tid, l2_pre, l2_post },
+        );
+        for (top, 0..) |e, i| {
+            if (i > 0) try out.writeAll(", ");
+            try out.print("{d}({d:.3})", .{ e.tok, e.v });
+        }
+        try out.writeAll("]\n");
+    }
+    try out.flush();
+}
+
+var last_pred: [1]u32 = .{0};
 
 fn runGemma4Predict(
     gpa: std.mem.Allocator,
