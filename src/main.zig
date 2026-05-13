@@ -17,6 +17,7 @@ const usage =
     \\  vantablack gemma4-config <m.litertlm>               load a Gemma 4 .litertlm into Gemma4Model + print inferred config
     \\  vantablack gemma4-embed <m.litertlm> <token_id>     lookup embedding for token_id (INT2 dequant smoke test)
     \\  vantablack gemma4-step  <m.litertlm> <token_id>     embed + layer-0 Q projection forward smoke test
+    \\  vantablack gemma4-layer0 <m.litertlm> <token_id>    full single-token forward through layer 0 (no KV history)
     \\  vantablack tokenize-litertlm <m.litertlm> <text>    encode text using HF tokenizer embedded in a .litertlm
     \\
     \\generate / prompt / chat accept sampler flags BEFORE the n value:
@@ -62,6 +63,21 @@ pub fn main(init: std.process.Init) !void {
             return error.MissingArgs;
         }
         try runTokenizeLitertlm(gpa, arena, io, args[2], args[3], out, err);
+        return;
+    }
+
+    // gemma4-layer0 <model.litertlm> <token_id>: minimum-viable end-to-
+    // end single-token forward through layer 0 (no KV history,
+    // no per-layer norms, no Q/K-norm, no PLE residual yet).
+    // Smoke-tests every CPU kernel chain on real weights.
+    if (std.mem.eql(u8, args[1], "gemma4-layer0")) {
+        if (args.len < 4) {
+            try err.writeAll("usage: vantablack gemma4-layer0 <model.litertlm> <token_id>\n");
+            try err.flush();
+            return error.MissingArgs;
+        }
+        const tid = try std.fmt.parseInt(u32, args[3], 10);
+        try runGemma4Layer0(gpa, arena, io, args[2], tid, out, err);
         return;
     }
 
@@ -547,6 +563,44 @@ fn runTokenizeLitertlm(
         try out.print("{d}", .{id});
     }
     try out.writeByte('\n');
+    try out.flush();
+}
+
+fn runGemma4Layer0(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: Io,
+    input_path: []const u8,
+    token_id: u32,
+    out: *Io.Writer,
+    err: *Io.Writer,
+) !void {
+    _ = err;
+    const abs_path = if (std.fs.path.isAbsolute(input_path))
+        try arena.dupe(u8, input_path)
+    else blk: {
+        const cwd = try std.process.currentPathAlloc(io, arena);
+        break :blk try std.fs.path.resolve(arena, &.{ cwd, input_path });
+    };
+    const file = try Io.Dir.openFileAbsolute(io, abs_path, .{ .allow_directory = false });
+    defer file.close(io);
+    const len = try file.length(io);
+    const len_us: usize = std.math.cast(usize, len) orelse return error.FileTooLarge;
+    const mapped = try std.posix.mmap(null, len_us, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    defer std.posix.munmap(mapped);
+
+    var bundle = try vantablack.litertlm.Bundle.init(gpa, mapped);
+    defer bundle.deinit();
+    var model = try vantablack.gemma4_model.initFromLitertlm(gpa, &bundle);
+    defer model.deinit();
+
+    const hidden = model.config.hidden;
+    const h = try gpa.alloc(f32, hidden);
+    defer gpa.free(h);
+
+    try out.print("forwardLayer0SingleToken (token {d}, pos 0)\n", .{token_id});
+    try model.forwardLayer0SingleToken(gpa, token_id, h);
+    try summarize(out, "  hidden_after_L0", h);
     try out.flush();
 }
 

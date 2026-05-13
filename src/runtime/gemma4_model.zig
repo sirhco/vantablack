@@ -181,6 +181,101 @@ pub const Gemma4Model = struct {
         try projectInt8Generic(t, ple_in, hidden_out);
     }
 
+    /// Single-token layer-0 forward — minimum-viable end-to-end forward
+    /// step on the real Gemma 4 weights. No KV cache (only attends to
+    /// the current token), no per-layer norms (TBD — likely fused into
+    /// matmul scales), no Q/K-norm, no PLE residual yet. Position 0.
+    ///
+    /// Pipeline:
+    ///   hidden = embed(token_id)
+    ///   q = projectQ(hidden); k = projectK(hidden); v = projectV(hidden)
+    ///   rope(q, pos=0) ; rope(k, pos=0)
+    ///   attn_in = self-attend(q, k, v)   // seq_len = 1
+    ///   hidden += projectAttnO(attn_in)
+    ///   gate = projectMlpGate(hidden); up = projectMlpUp(hidden)
+    ///   swiglu(gate, up)
+    ///   hidden += projectMlpDown(gate)
+    ///
+    /// Returns the updated hidden state (caller-owned buffer).
+    pub fn forwardLayer0SingleToken(
+        self: *const Gemma4Model,
+        allocator: std.mem.Allocator,
+        token_id: u32,
+        hidden_out: []f32,
+    ) !void {
+        const math = @import("../kernels/math.zig");
+        if (hidden_out.len != self.config.hidden) return error.ShapeMismatch;
+
+        const q_dim: usize = @as(usize, self.config.n_q_heads) * self.config.head_dim;
+        const kv_dim: usize = @as(usize, self.config.n_kv_heads) * self.config.head_dim;
+        const ffn_dim: usize = self.config.ffn_dim_per_layer[0];
+
+        // Stage 1: embed lookup.
+        try self.lookupEmbedding(token_id, hidden_out);
+
+        // Stage 2: Q/K/V projections.
+        const q = try allocator.alloc(f32, q_dim);
+        defer allocator.free(q);
+        const k = try allocator.alloc(f32, kv_dim);
+        defer allocator.free(k);
+        const v = try allocator.alloc(f32, kv_dim);
+        defer allocator.free(v);
+        try self.projectQ(hidden_out, 0, q);
+        try self.projectK(hidden_out, 0, k);
+        try self.projectV(hidden_out, 0, v);
+
+        // Stage 3: RoPE on Q + K (position 0, head-by-head).
+        // Uses the Llama-style interleaved-pair RoPE for v1. Gemma 4
+        // actually uses neox half-rotation — swap to `ropeHalf` once
+        // verified.
+        const head_dim: usize = self.config.head_dim;
+        const rope_base: f32 = 10000.0; // standard Llama default; Gemma 4 may differ
+        var h: usize = 0;
+        while (h < self.config.n_q_heads) : (h += 1) {
+            math.rope(q[h * head_dim ..][0..head_dim], 0, rope_base);
+        }
+        h = 0;
+        while (h < self.config.n_kv_heads) : (h += 1) {
+            math.rope(k[h * head_dim ..][0..head_dim], 0, rope_base);
+        }
+
+        // Stage 4: self-attention against this token only (seq=1).
+        // For seq=1, the attention output is just V weighted by softmax
+        // over a single score, which is always 1 → output = V (GQA
+        // expansion).
+        const attn_in = try allocator.alloc(f32, q_dim);
+        defer allocator.free(attn_in);
+        // Each Q head reads from V head `(h * n_kv_heads) / n_q_heads`.
+        var qh: usize = 0;
+        while (qh < self.config.n_q_heads) : (qh += 1) {
+            const kv_h = (qh * self.config.n_kv_heads) / self.config.n_q_heads;
+            const v_src = v[kv_h * head_dim ..][0..head_dim];
+            const out_h = attn_in[qh * head_dim ..][0..head_dim];
+            @memcpy(out_h, v_src);
+        }
+
+        // Stage 5: attn.o projection + residual.
+        const attn_out = try allocator.alloc(f32, self.config.hidden);
+        defer allocator.free(attn_out);
+        try self.projectAttnO(attn_in, 0, attn_out);
+        math.addInto(hidden_out, attn_out);
+
+        // Stage 6: MLP gate + up + SwiGLU.
+        const gate = try allocator.alloc(f32, ffn_dim);
+        defer allocator.free(gate);
+        const up = try allocator.alloc(f32, ffn_dim);
+        defer allocator.free(up);
+        try self.projectMlpGate(hidden_out, 0, gate);
+        try self.projectMlpUp(hidden_out, 0, up);
+        math.swiglu(gate, up); // gate = silu(gate) * up
+
+        // Stage 7: MLP down + residual.
+        const ffn_out = try allocator.alloc(f32, self.config.hidden);
+        defer allocator.free(ffn_out);
+        try self.projectMlpDown(gate, 0, ffn_out);
+        math.addInto(hidden_out, ffn_out);
+    }
+
     fn projectInt8Generic(t: *const tflite.Tensor, x: []const f32, y: []f32) !void {
         if (t.shape.len < 2) return error.ShapeMismatch;
         const m: usize = @intCast(t.shape[0]);

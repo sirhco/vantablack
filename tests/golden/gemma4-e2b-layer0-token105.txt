@@ -1,0 +1,2 @@
+forwardLayer0SingleToken (token 105, pos 0)
+  hidden_after_L0[1536]  min=-0.16302  max=0.16819  mean=-0.000296  L2=1.8615  first3=[0.02212,-0.05183,-0.03917]
