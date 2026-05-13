@@ -258,7 +258,9 @@ pub const Gemma4Model = struct {
         // actually uses neox half-rotation — swap to `ropeHalf` once
         // verified.
         const head_dim: usize = self.config.head_dim;
-        const rope_base: f32 = 10000.0; // standard Llama default; Gemma 4 may differ
+        // Gemma 2/3/4 use 1e6 for the RoPE base (Llama default is 1e4).
+        // At pos=0 this is a no-op; matters once KV history exists.
+        const rope_base: f32 = 1_000_000.0; // standard Llama default; Gemma 4 may differ
         var h: usize = 0;
         while (h < self.config.n_q_heads) : (h += 1) {
             math.ropeHalf(q[h * head_dim ..][0..head_dim], 0, rope_base);
@@ -325,7 +327,9 @@ pub const Gemma4Model = struct {
         if (hidden_out.len != self.config.hidden) return error.ShapeMismatch;
 
         const head_dim: usize = self.config.head_dim;
-        const rope_base: f32 = 10000.0;
+        // Gemma 2/3/4 use 1e6 for the RoPE base (Llama default is 1e4).
+        // At pos=0 this is a no-op; matters once KV history exists.
+        const rope_base: f32 = 1_000_000.0;
 
         try self.lookupEmbedding(token_id, hidden_out);
 
@@ -471,11 +475,8 @@ pub const Gemma4Model = struct {
     ///   gate_out[ple_dim] = projectPleGate(hidden_out)
     ///   gated[ple_dim] = ple_in * gelu(gate_out)        // approximate
     ///   residual[hidden] = projectPleProj(gated)
+    ///   residual = post_per_layer_input_norm(residual)   // when available
     ///   hidden_out += residual
-    ///
-    /// Activation choice (`gelu`) is best-guess until verified against
-    /// the actual `ple_gate_activation` op in section 10. Skip the
-    /// post_per_layer_input_norm step until we have its scale.
     fn ple_scratch_residual_add(
         self: *const Gemma4Model,
         allocator: std.mem.Allocator,
@@ -495,8 +496,6 @@ pub const Gemma4Model = struct {
         try self.lookupPerLayerEmbedding(token_id, layer_idx, ple_in);
         try self.projectPleGate(hidden_out, layer_idx, gate_out);
 
-        // ple_in[i] *= gelu_approx(gate_out[i])
-        // gelu(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
         var i: usize = 0;
         while (i < ple_dim) : (i += 1) {
             const x = gate_out[i];
@@ -506,6 +505,13 @@ pub const Gemma4Model = struct {
             ple_in[i] *= g;
         }
         try self.projectPleProj(ple_in, layer_idx, residual);
+
+        // post_per_layer_input_norm damps the PLE residual before add.
+        const layer = self.layers[layer_idx];
+        if (layer.norm_post_per_layer) |w_t| {
+            const w_f32: []const f32 = @as([*]const f32, @ptrCast(@alignCast(w_t.data.ptr)))[0..self.config.hidden];
+            math.rmsNormGemma(residual, w_f32, 1.0e-6);
+        }
         math.addInto(hidden_out, residual);
     }
 
